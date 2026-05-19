@@ -1,0 +1,73 @@
+valetudo_vacuum_coordinator:
+  name: Downstairs Vacuum Coordinator
+  vacuum_entity: vacuum.valetudo_robot
+  people:
+    - person.person_one
+    - person.person_two
+  away_delay: 300
+  min_battery: 40
+  segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set
+  status_flag_entity: sensor.valetudo_robot_status_flag
+  dock_status_entity: sensor.valetudo_robot_dock_status
+  error_entity: sensor.valetudo_robot_error
+  current_area_entity: sensor.valetudo_robot_current_statistics_area
+  current_time_entity: sensor.valetudo_robot_current_statistics_time
+  estimated_segment_entity: sensor.valetudo_robot_estimated_segment
+
+  # Optional: only keep these if the option names match your Valetudo select entities.
+  mode_entity: select.valetudo_robot_mode
+  mode_vacuum_option: vacuum
+  mode_mop_option: vacuum_and_mop
+  water_entity: select.valetudo_robot_water
+  water_mop_option: high
+
+  # Optional: if these entities are not exposed in HA, omit them. Valetudo error text
+  # still blocks known clean-water, dirty-water, detergent, and dock errors.
+  fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component
+  dirty_water_entity: sensor.valetudo_robot_wastewater_dock_component
+  detergent_entity: sensor.valetudo_robot_detergent_dock_component
+  dustbag_entity: sensor.valetudo_robot_dustbag_dock_component
+
+  allow_vacuum_only_when_mop_blocked: false
+  cancel_any_away_run_on_arrival: true
+  manual_tracking: true
+  track_manual_when_paused: true
+
+  rooms:
+    - id: room_one
+      name: Room One
+      segment_id: "1"
+      min_duration: 120
+      min_area: 0
+    - id: room_two
+      name: Room Two
+      segment_id: "2"
+      min_duration: 120
+      min_area: 0
+    - id: room_three
+      name: Room Three
+      segment_id: "3"
+      min_duration: 180
+      min_area: 0
+    - id: room_four
+      name: Room Four
+      segment_id: "4"
+      min_duration: 90
+      min_area: 0
+    - id: room_five
+      name: Room Five
+      segment_id: "5"
+      min_duration: 120
+      min_area: 0
+    - id: room_six
+      name: Room Six
+      segment_id: "6"
+      mop_required: true
+      min_duration: 120
+      min_area: 0
+    - id: room_seven
+      name: Room Seven
+      segment_id: "7"
+      mop_required: true
+      min_duration: 90
+      min_area: 0

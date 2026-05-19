@@ -1,0 +1,80 @@
+start_session:
+  name: Start cleaning session
+  description: Start an away-session room cleaning cycle if preflight conditions pass.
+  fields:
+    coordinator:
+      name: Coordinator
+      description: Optional coordinator id when multiple coordinators are configured.
+      selector:
+        text:
+
+cancel_session:
+  name: Cancel cleaning session
+  description: Cancel the current session and return the vacuum to the dock when needed.
+  fields:
+    coordinator:
+      name: Coordinator
+      selector:
+        text:
+    reason:
+      name: Reason
+      default: service
+      selector:
+        text:
+
+set_paused:
+  name: Set coordinator pause
+  description: Pause or resume automatic cleaning behavior.
+  fields:
+    coordinator:
+      name: Coordinator
+      selector:
+        text:
+    paused:
+      name: Paused
+      required: true
+      selector:
+        boolean:
+    reason:
+      name: Reason
+      default: service
+      selector:
+        text:
+
+mark_room_cleaned:
+  name: Mark room cleaned
+  description: Manually credit a room as successfully cleaned.
+  fields:
+    coordinator:
+      name: Coordinator
+      selector:
+        text:
+    room_id:
+      name: Room ID
+      required: true
+      selector:
+        text:
+    vacuum:
+      name: Vacuumed
+      default: true
+      selector:
+        boolean:
+    mop:
+      name: Mopped
+      default: true
+      selector:
+        boolean:
+
+reset_room:
+  name: Reset room ledger
+  description: Clear persisted cleaning history for one room.
+  fields:
+    coordinator:
+      name: Coordinator
+      selector:
+        text:
+    room_id:
+      name: Room ID
+      required: true
+      selector:
+        text:

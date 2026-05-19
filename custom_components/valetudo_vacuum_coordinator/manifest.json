@@ -1,0 +1,11 @@
+{
+  "domain": "valetudo_vacuum_coordinator",
+  "name": "Valetudo Vacuum Coordinator",
+  "documentation": "https://github.com/SFenton/valetudo-vacuum-coordinator",
+  "issue_tracker": "https://github.com/SFenton/valetudo-vacuum-coordinator/issues",
+  "dependencies": ["mqtt"],
+  "codeowners": ["@sfenton"],
+  "requirements": [],
+  "version": "0.1.0",
+  "iot_class": "local_push"
+}

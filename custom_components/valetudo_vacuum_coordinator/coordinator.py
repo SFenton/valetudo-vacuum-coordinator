@@ -1,0 +1,675 @@
+"""Coordinator for away-only Valetudo room cleaning."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime
+import json
+import logging
+import re
+from typing import Any
+
+from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.core import Event, HomeAssistant, State, callback
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
+
+from .const import (
+    CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED,
+    CONF_BATTERY_ENTITY,
+    CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL,
+    CONF_CURRENT_AREA_ENTITY,
+    CONF_CURRENT_TIME_ENTITY,
+    CONF_DETERGENT_ENTITY,
+    CONF_DIRTY_WATER_ENTITY,
+    CONF_DOCK_STATUS_ENTITY,
+    CONF_DUSTBAG_ENTITY,
+    CONF_ERROR_ENTITY,
+    CONF_ESTIMATED_SEGMENT_ENTITY,
+    CONF_FRESH_WATER_ENTITY,
+    CONF_MANUAL_TRACKING,
+    CONF_MIN_BATTERY,
+    CONF_MODE_ENTITY,
+    CONF_MODE_MOP_OPTION,
+    CONF_MODE_VACUUM_OPTION,
+    CONF_MOP_ATTACHMENT_ENTITY,
+    CONF_STATUS_FLAG_ENTITY,
+    CONF_TRACK_MANUAL_WHEN_PAUSED,
+    CONF_WATER_ENTITY,
+    CONF_WATER_MOP_OPTION,
+    DOMAIN,
+    STATE_ERROR,
+    STATE_IDLE,
+    STATE_PAUSED,
+    STATE_RUNNING,
+    STATE_WAITING,
+    STORE_KEY,
+    STORE_VERSION,
+)
+from .logic import (
+    ActiveRun,
+    ResourceState,
+    RoomConfig,
+    RoomLedger,
+    SessionState,
+    evaluate_run_success,
+    is_error_clear,
+    manual_rooms_to_credit,
+    mark_failure,
+    mark_success,
+    normalize_state,
+    parse_float,
+    select_next_room,
+    utcnow_iso,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+_READY_VACUUM_STATES = {"docked", "idle"}
+_BUSY_DOCK_STATES = {"cleaning", "drying", "emptying", "pause"}
+_UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
+
+
+class ValetudoVacuumCoordinator:
+    """Coordinate away-only room cleaning for one Valetudo vacuum."""
+
+    def __init__(
+        self,
+        *,
+        hass: HomeAssistant,
+        name: str,
+        vacuum_entity: str,
+        people_entities: list[str],
+        segment_command_topic: str,
+        rooms: list[RoomConfig],
+        config: dict[str, Any],
+    ) -> None:
+        """Initialize the coordinator."""
+        self.hass = hass
+        self.name = name
+        self.coordinator_id = _slugify(name)
+        self.vacuum_entity = vacuum_entity
+        self.people_entities = people_entities
+        self.segment_command_topic = segment_command_topic
+        self.rooms = rooms
+        self.room_by_id = {room.room_id: room for room in rooms}
+        self.room_by_segment = {room.segment_id: room for room in rooms}
+        self.room_by_name = {room.name.lower(): room for room in rooms}
+        self.config = config
+
+        self.ledgers: dict[str, RoomLedger] = {room.room_id: RoomLedger() for room in rooms}
+        self.paused = False
+        self.pause_reason: str | None = None
+        self.session: SessionState | None = None
+        self.active_run: ActiveRun | None = None
+        self.manual_run: ActiveRun | None = None
+        self.last_error: str | None = None
+
+        self._listeners: list[Callable[[], None]] = []
+        self._unsubscribers: list[Callable[[], None]] = []
+        self._away_timer_cancel: Callable[[], None] | None = None
+        self._store = Store(hass, STORE_VERSION, f"{STORE_KEY}.{self.coordinator_id}")
+
+    async def async_setup(self) -> None:
+        """Load persisted state and attach listeners."""
+        await self._async_load_store()
+        entities_to_watch = set(self.people_entities)
+        for entity_id in self._configured_sensor_entities():
+            if entity_id:
+                entities_to_watch.add(entity_id)
+
+        self._unsubscribers.append(
+            async_track_state_change_event(
+                self.hass,
+                list(entities_to_watch),
+                self._handle_state_change_event,
+            )
+        )
+        self._schedule_away_timer_if_needed()
+        self._notify_listeners()
+
+    @callback
+    def async_add_listener(self, update_callback: Callable[[], None]) -> Callable[[], None]:
+        """Add a listener for entity updates."""
+        self._listeners.append(update_callback)
+
+        def remove_listener() -> None:
+            if update_callback in self._listeners:
+                self._listeners.remove(update_callback)
+
+        return remove_listener
+
+    @property
+    def state(self) -> str:
+        """Return a user-facing coordinator state."""
+        if self.paused:
+            return STATE_PAUSED
+        if self.active_run:
+            return STATE_RUNNING
+        if not is_error_clear(self.error_state):
+            return STATE_ERROR
+        if self.session and self.session.active:
+            return STATE_WAITING
+        return STATE_IDLE
+
+    @property
+    def active_room(self) -> RoomConfig | None:
+        """Return the currently commanded room, if any."""
+        if not self.active_run or not self.active_run.room_id:
+            return None
+        return self.room_by_id.get(self.active_run.room_id)
+
+    @property
+    def pending_rooms(self) -> list[RoomConfig]:
+        """Return rooms not yet consumed in the current session."""
+        attempted = set(self.session.attempted_room_ids if self.session else [])
+        return [room for room in self.rooms if room.enabled and room.room_id not in attempted]
+
+    @property
+    def error_state(self) -> str | None:
+        """Return the current Valetudo error sensor state."""
+        return self._state(self.config.get(CONF_ERROR_ENTITY))
+
+    async def async_start_session(self, reason: str = "auto") -> None:
+        """Start a new away cleaning session if possible."""
+        if self.paused:
+            _LOGGER.info("Not starting %s because coordinator is paused", self.name)
+            return
+        if not self._all_people_away():
+            _LOGGER.info("Not starting %s because not all tracked people are away", self.name)
+            return
+        if self.session and self.session.active:
+            await self._async_maybe_start_next_room()
+            return
+
+        self.session = SessionState(session_id=utcnow_iso(), started_at=utcnow_iso())
+        _LOGGER.info("Starting Valetudo away-cleaning session %s (%s)", self.session.session_id, reason)
+        await self._async_save_store()
+        self._notify_listeners()
+        await self._async_maybe_start_next_room()
+
+    async def async_cancel_session(self, reason: str) -> None:
+        """Cancel the active away session and active run."""
+        had_active_session = bool(self.session and self.session.active)
+        had_active_run = self.active_run is not None
+
+        if self.session:
+            self.session.cancelled = True
+            self.session.active = False
+            self.session.active_room_id = None
+
+        if self.active_run:
+            self.active_run.cancelled = True
+            if self.active_run.room_id:
+                ledger = self.ledgers.setdefault(self.active_run.room_id, RoomLedger())
+                mark_failure(ledger, utcnow_iso(), reason)
+            self.active_run = None
+
+        if had_active_session or had_active_run:
+            await self._async_return_to_dock_or_stop_resumable(reason)
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def async_set_paused(self, paused: bool, reason: str | None = None) -> None:
+        """Pause or resume automatic cleaning behavior."""
+        self.paused = paused
+        self.pause_reason = reason if paused else None
+        self._cancel_away_timer()
+        if paused:
+            await self.async_cancel_session(reason or "paused")
+        else:
+            self._schedule_away_timer_if_needed()
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def async_mark_room_cleaned(self, room_id: str, *, mop: bool, vacuum: bool = True) -> None:
+        """Manually mark a room as cleaned."""
+        self._require_room(room_id)
+        ledger = self.ledgers.setdefault(room_id, RoomLedger())
+        mark_success(ledger, utcnow_iso(), mop=mop, vacuum=vacuum)
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def async_reset_room(self, room_id: str) -> None:
+        """Reset one room ledger."""
+        self._require_room(room_id)
+        self.ledgers[room_id] = RoomLedger()
+        await self._async_save_store()
+        self._notify_listeners()
+
+    @callback
+    def _handle_state_change_event(self, event: Event) -> None:
+        """Schedule handling for HA state changes."""
+        self.hass.async_create_task(self._async_handle_state_change_event(event))
+
+    async def _async_handle_state_change_event(self, event: Event) -> None:
+        """Handle a monitored Home Assistant state change."""
+        entity_id = event.data.get("entity_id")
+        new_state: State | None = event.data.get("new_state")
+        if new_state is None:
+            return
+
+        now = dt_util.utcnow()
+        if entity_id in self.people_entities:
+            await self._async_handle_presence_change()
+            return
+
+        self._observe_active_run(entity_id, new_state, now)
+        self._observe_manual_run(entity_id, new_state, now)
+
+        if entity_id == self.vacuum_entity:
+            await self._async_handle_vacuum_state(new_state.state, now)
+            return
+        if entity_id == self.config.get(CONF_DOCK_STATUS_ENTITY):
+            await self._async_maybe_start_next_room()
+            return
+        if entity_id == self.config.get(CONF_ERROR_ENTITY) and not is_error_clear(new_state.state):
+            self.last_error = new_state.state
+            if self.active_run:
+                await self._async_finish_active_run(success_override=False, failure_reason=new_state.state)
+            self._notify_listeners()
+            return
+        if entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY):
+            await self._async_maybe_start_next_room()
+
+    async def _async_handle_presence_change(self) -> None:
+        """React to someone leaving or arriving."""
+        if self._all_people_away():
+            self._schedule_away_timer_if_needed()
+            return
+
+        self._cancel_away_timer()
+        if self.session and self.session.active and self.config.get(CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL):
+            await self.async_cancel_session("Tracked person arrived home")
+
+    def _schedule_away_timer_if_needed(self) -> None:
+        """Schedule the configured away grace period."""
+        if self.paused or not self._all_people_away():
+            return
+        if self._away_timer_cancel is not None:
+            return
+
+        away_delay = int(self.config.get("away_delay", 300))
+
+        def timer_finished(_now: datetime) -> None:
+            self._away_timer_cancel = None
+            self.hass.async_create_task(self.async_start_session(reason="away timer"))
+
+        self._away_timer_cancel = async_call_later(self.hass, away_delay, timer_finished)
+        self._notify_listeners()
+
+    def _cancel_away_timer(self) -> None:
+        """Cancel pending away timer."""
+        if self._away_timer_cancel is not None:
+            self._away_timer_cancel()
+            self._away_timer_cancel = None
+
+    async def _async_handle_vacuum_state(self, vacuum_state: str, now: datetime) -> None:
+        """React to vacuum entity state."""
+        normalized_state = normalize_state(vacuum_state)
+        if normalized_state == "cleaning":
+            if self.active_run:
+                self.active_run.observed_cleaning = True
+            elif self._manual_tracking_allowed():
+                self._start_manual_run(now)
+
+        if normalized_state == "returning" and self.active_run:
+            self.active_run.observed_cleaning = True
+
+        if normalized_state in {"docked", "idle"}:
+            if self.active_run and self._status_flag() != "resumable":
+                await self._async_finish_active_run()
+            elif self.manual_run:
+                await self._async_finish_manual_run(now)
+            else:
+                await self._async_maybe_start_next_room()
+
+    def _observe_active_run(self, entity_id: str, new_state: State, now: datetime) -> None:
+        """Update active commanded run observations."""
+        if not self.active_run:
+            return
+        if entity_id == self.vacuum_entity and new_state.state == "cleaning":
+            self.active_run.observed_cleaning = True
+        elif entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY) and new_state.state == "segment":
+            self.active_run.observed_segment_cleaning = True
+        elif entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
+            self.active_run.observe_estimated_room(self._room_id_from_estimated(new_state.state), now)
+
+    def _observe_manual_run(self, entity_id: str, new_state: State, now: datetime) -> None:
+        """Update active manual run observations."""
+        if not self.manual_run:
+            return
+        if entity_id == self.vacuum_entity and new_state.state == "cleaning":
+            self.manual_run.observed_cleaning = True
+        elif entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY) and new_state.state == "segment":
+            self.manual_run.observed_segment_cleaning = True
+        elif entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
+            self.manual_run.observe_estimated_room(self._room_id_from_estimated(new_state.state), now)
+
+    async def _async_maybe_start_next_room(self) -> None:
+        """Start the next room when the session and Valetudo state allow it."""
+        if self.paused or not self.session or not self.session.active or self.active_run:
+            self._notify_listeners()
+            return
+        if not self._all_people_away():
+            await self.async_cancel_session("Tracked person arrived home")
+            return
+        if not self._vacuum_ready_for_next_room():
+            self._notify_listeners()
+            return
+
+        selection, skipped = select_next_room(
+            self.rooms,
+            self.ledgers,
+            set(self.session.attempted_room_ids),
+            self._resource_state(),
+            bool(self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)),
+        )
+
+        for room, reason in skipped:
+            ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
+            mark_failure(ledger, utcnow_iso(), f"Skipped: {reason}")
+            self.session.mark_skipped(room.room_id)
+
+        if selection is None:
+            self.session.active = False
+            self.session.active_room_id = None
+            await self._async_save_store()
+            self._notify_listeners()
+            return
+
+        await self._async_start_room(selection.room, vacuum_only=selection.vacuum_only)
+
+    async def _async_start_room(self, room: RoomConfig, *, vacuum_only: bool) -> None:
+        """Command Valetudo to clean one segment."""
+        if not self.session:
+            return
+
+        self.session.mark_attempted(room.room_id)
+        self.session.active_room_id = room.room_id
+        self.active_run = ActiveRun(
+            room_id=room.room_id,
+            segment_id=room.segment_id,
+            session_id=self.session.session_id,
+            started_at=utcnow_iso(),
+            start_area=parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+            start_time=parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+            vacuum_only=vacuum_only,
+        )
+        if self._status_flag() == "segment":
+            self.active_run.observed_segment_cleaning = True
+
+        try:
+            await self._async_apply_mode(vacuum_only=vacuum_only)
+            await self.hass.services.async_call(
+                "mqtt",
+                "publish",
+                {
+                    "topic": self.segment_command_topic,
+                    "payload": json.dumps(
+                        {"segment_ids": [room.segment_id], "iterations": 1, "customOrder": True}
+                    ),
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Failed to start Valetudo segment clean for %s", room.name)
+            mark_failure(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), str(err))
+            self.active_run = None
+            self.session.active_room_id = None
+
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def _async_apply_mode(self, *, vacuum_only: bool) -> None:
+        """Apply optional Valetudo cleaning mode selects."""
+        mode_entity = self.config.get(CONF_MODE_ENTITY)
+        if not mode_entity:
+            return
+        await self.hass.services.async_call(
+            "select",
+            "select_option",
+            {
+                ATTR_ENTITY_ID: mode_entity,
+                "option": self.config.get(
+                    CONF_MODE_VACUUM_OPTION if vacuum_only else CONF_MODE_MOP_OPTION
+                ),
+            },
+            blocking=True,
+        )
+
+        water_entity = self.config.get(CONF_WATER_ENTITY)
+        if water_entity and not vacuum_only:
+            await self.hass.services.async_call(
+                "select",
+                "select_option",
+                {ATTR_ENTITY_ID: water_entity, "option": self.config.get(CONF_WATER_MOP_OPTION)},
+                blocking=False,
+            )
+
+    async def _async_finish_active_run(
+        self,
+        *,
+        success_override: bool | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Finalize the active commanded run."""
+        run = self.active_run
+        if not run or not run.room_id:
+            return
+
+        room = self.room_by_id[run.room_id]
+        run.finalize_estimated_room(dt_util.utcnow())
+        ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
+
+        if success_override is None:
+            success, reason = evaluate_run_success(
+                room,
+                run,
+                parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+                parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+                self.error_state,
+            )
+        else:
+            success = success_override
+            reason = failure_reason
+
+        if success:
+            mark_success(ledger, utcnow_iso(), mop=room.mop_required and not run.vacuum_only)
+            if self.session:
+                self.session.mark_completed(room.room_id)
+        else:
+            mark_failure(ledger, utcnow_iso(), reason)
+
+        self.active_run = None
+        if self.session:
+            self.session.active_room_id = None
+
+        await self._async_save_store()
+        self._notify_listeners()
+        await self._async_maybe_start_next_room()
+
+    def _start_manual_run(self, now: datetime) -> None:
+        """Begin observing a manual segment run."""
+        if self.manual_run:
+            return
+        self.manual_run = ActiveRun(
+            room_id=None,
+            segment_id=None,
+            session_id=None,
+            started_at=now.isoformat(),
+            start_area=parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+            start_time=parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+            manual=True,
+        )
+        if self._status_flag() == "segment":
+            self.manual_run.observed_segment_cleaning = True
+        self._notify_listeners()
+
+    async def _async_finish_manual_run(self, now: datetime) -> None:
+        """Credit rooms observed during a manual run."""
+        run = self.manual_run
+        if not run:
+            return
+
+        run.finalize_estimated_room(now)
+        if is_error_clear(self.error_state):
+            for room in manual_rooms_to_credit(self.rooms, run):
+                mark_success(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), mop=room.mop_required)
+
+        self.manual_run = None
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def _async_return_to_dock_or_stop_resumable(self, reason: str) -> None:
+        """Cancel a moving or resumable Valetudo task."""
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state == "docked" and self._status_flag() == "resumable":
+            await self.hass.services.async_call(
+                "vacuum",
+                "stop",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=False,
+            )
+            return
+
+        if vacuum_state not in {"docked", "idle"}:
+            _LOGGER.info("Returning %s to dock because %s", self.vacuum_entity, reason)
+            await self.hass.services.async_call(
+                "vacuum",
+                "return_to_base",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=False,
+            )
+
+    def _vacuum_ready_for_next_room(self) -> bool:
+        """Return whether dispatching another segment is safe."""
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state not in _READY_VACUUM_STATES:
+            return False
+        if self._status_flag() == "resumable":
+            return False
+
+        dock_status = normalize_state(self._state(self.config.get(CONF_DOCK_STATUS_ENTITY)))
+        if dock_status and dock_status.lower() in _BUSY_DOCK_STATES:
+            return False
+
+        battery = parse_float(self._state(self.config.get(CONF_BATTERY_ENTITY)))
+        if battery is not None and battery < float(self.config.get(CONF_MIN_BATTERY)):
+            return False
+        return True
+
+    def _resource_state(self) -> ResourceState:
+        """Return current Valetudo resource state."""
+        mop_state = normalize_state(self._state(self.config.get(CONF_MOP_ATTACHMENT_ENTITY)))
+        if mop_state in _UNKNOWN_OR_CLEAR_STATES:
+            mop_attached = None
+        else:
+            mop_attached = mop_state.lower() not in {"off", "false", "detached", "missing", "not_attached"}
+
+        return ResourceState(
+            error=self.error_state,
+            fresh_water=self._state(self.config.get(CONF_FRESH_WATER_ENTITY)),
+            dirty_water=self._state(self.config.get(CONF_DIRTY_WATER_ENTITY)),
+            detergent=self._state(self.config.get(CONF_DETERGENT_ENTITY)),
+            dustbag=self._state(self.config.get(CONF_DUSTBAG_ENTITY)),
+            mop_attached=mop_attached,
+        )
+
+    def _manual_tracking_allowed(self) -> bool:
+        """Return whether manual run tracking is enabled."""
+        if not self.config.get(CONF_MANUAL_TRACKING):
+            return False
+        if self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY) is None:
+            return False
+        return not self.paused or bool(self.config.get(CONF_TRACK_MANUAL_WHEN_PAUSED))
+
+    def _all_people_away(self) -> bool:
+        """Return True when every tracked person is not_home."""
+        for entity_id in self.people_entities:
+            if normalize_state(self._state(entity_id)) != "not_home":
+                return False
+        return True
+
+    def _status_flag(self) -> str | None:
+        """Return the normalized Valetudo status flag."""
+        status_flag = normalize_state(self._state(self.config.get(CONF_STATUS_FLAG_ENTITY)))
+        return status_flag.lower() if status_flag else None
+
+    def _room_id_from_estimated(self, estimated_value: Any) -> str | None:
+        """Map estimated segment sensor state to a configured room id."""
+        normalized = normalize_state(estimated_value)
+        if not normalized:
+            return None
+        if normalized in self.room_by_id:
+            return normalized
+        if normalized in self.room_by_segment:
+            return self.room_by_segment[normalized].room_id
+        room = self.room_by_name.get(normalized.lower())
+        return room.room_id if room else None
+
+    def _state(self, entity_id: str | None) -> str | None:
+        """Return a Home Assistant state string."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        return state.state if state else None
+
+    def _configured_sensor_entities(self) -> list[str | None]:
+        """Return entities the coordinator should listen to."""
+        return [
+            self.vacuum_entity,
+            self.config.get(CONF_STATUS_FLAG_ENTITY),
+            self.config.get(CONF_DOCK_STATUS_ENTITY),
+            self.config.get(CONF_ERROR_ENTITY),
+            self.config.get(CONF_BATTERY_ENTITY),
+            self.config.get(CONF_CURRENT_AREA_ENTITY),
+            self.config.get(CONF_CURRENT_TIME_ENTITY),
+            self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY),
+            self.config.get(CONF_FRESH_WATER_ENTITY),
+            self.config.get(CONF_DIRTY_WATER_ENTITY),
+            self.config.get(CONF_DETERGENT_ENTITY),
+            self.config.get(CONF_DUSTBAG_ENTITY),
+            self.config.get(CONF_MOP_ATTACHMENT_ENTITY),
+        ]
+
+    async def _async_load_store(self) -> None:
+        """Load persisted pause state and room ledgers."""
+        stored = await self._store.async_load()
+        if not isinstance(stored, dict):
+            return
+
+        self.paused = bool(stored.get("paused", False))
+        self.pause_reason = stored.get("pause_reason")
+        stored_rooms = stored.get("rooms", {})
+        if isinstance(stored_rooms, dict):
+            for room in self.rooms:
+                self.ledgers[room.room_id] = RoomLedger.from_dict(stored_rooms.get(room.room_id))
+
+    async def _async_save_store(self) -> None:
+        """Persist pause state and room ledgers."""
+        await self._store.async_save(
+            {
+                "paused": self.paused,
+                "pause_reason": self.pause_reason,
+                "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
+            }
+        )
+
+    def _require_room(self, room_id: str) -> None:
+        """Raise if the room id is not configured."""
+        if room_id not in self.room_by_id:
+            raise ValueError(f"Unknown room_id: {room_id}")
+
+    @callback
+    def _notify_listeners(self) -> None:
+        """Notify Home Assistant entities."""
+        for update_callback in list(self._listeners):
+            update_callback()
+
+
+def _slugify(value: str) -> str:
+    """Return a stable id fragment."""
+    slug = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    return slug or DOMAIN
