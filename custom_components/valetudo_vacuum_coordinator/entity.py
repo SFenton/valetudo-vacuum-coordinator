@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant.core import CALLBACK_TYPE, callback
 from homeassistant.helpers.entity import DeviceInfo, Entity
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .coordinator import ValetudoVacuumCoordinator
@@ -14,7 +15,7 @@ from .coordinator import ValetudoVacuumCoordinator
 class ValetudoCoordinatorEntity(Entity):
     """Base entity bound to a coordinator."""
 
-    _attr_has_entity_name = True
+    _attr_has_entity_name = False
 
     def __init__(
         self,
@@ -25,8 +26,11 @@ class ValetudoCoordinatorEntity(Entity):
         """Initialize the entity."""
         self.coordinator = coordinator
         self._attr_translation_key = translation_key
-        self._attr_name = name_suffix
+        self._attr_name = f"{coordinator.name} {name_suffix}"
         self._attr_unique_id = f"{coordinator.coordinator_id}_{translation_key}"
+        self._attr_suggested_object_id = (
+            f"{coordinator.coordinator_id}_{_slugify(name_suffix)}"
+        )
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -41,11 +45,30 @@ class ValetudoCoordinatorEntity(Entity):
     async def async_added_to_hass(self) -> None:
         """Subscribe entity updates to coordinator notifications."""
         self.async_on_remove(self.coordinator.async_add_listener(self._handle_update))
+        self._migrate_short_entity_id()
 
     @callback
     def _handle_update(self) -> None:
         """Write updated entity state."""
         self.async_write_ha_state()
+
+    @callback
+    def _migrate_short_entity_id(self) -> None:
+        """Rename overly generic entity IDs created by early versions."""
+        if self.entity_id is None or self.suggested_object_id is None:
+            return
+        domain, object_id = self.entity_id.split(".", 1)
+        if object_id.startswith(self.coordinator.coordinator_id):
+            return
+
+        registry = er.async_get(self.hass)
+        try:
+            registry.async_update_entity(
+                self.entity_id,
+                new_entity_id=f"{domain}.{self.suggested_object_id}",
+            )
+        except ValueError:
+            return
 
 
 def get_coordinator_from_discovery(
@@ -57,3 +80,8 @@ def get_coordinator_from_discovery(
         raise ValueError("discovery_info is required")
     coordinator_id = discovery_info["coordinator_id"]
     return hass_data[DOMAIN][coordinator_id]
+
+
+def _slugify(value: str) -> str:
+    """Create a Home Assistant object-id fragment."""
+    return "_".join(value.lower().split())
