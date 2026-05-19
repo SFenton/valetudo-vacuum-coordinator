@@ -55,7 +55,8 @@ class ValetudoCoordinatorEntity(Entity):
     @callback
     def _migrate_short_entity_id(self) -> None:
         """Rename overly generic entity IDs created by early versions."""
-        if self.entity_id is None or self.suggested_object_id is None:
+        suggested_object_id = self._attr_suggested_object_id
+        if self.entity_id is None or suggested_object_id is None:
             return
         domain, object_id = self.entity_id.split(".", 1)
         if object_id.startswith(self.coordinator.coordinator_id):
@@ -65,7 +66,7 @@ class ValetudoCoordinatorEntity(Entity):
         try:
             registry.async_update_entity(
                 self.entity_id,
-                new_entity_id=f"{domain}.{self.suggested_object_id}",
+                new_entity_id=f"{domain}.{suggested_object_id}",
             )
         except ValueError:
             return
