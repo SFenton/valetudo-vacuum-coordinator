@@ -59,6 +59,7 @@ from .logic import (
     mark_failure,
     mark_success,
     normalize_state,
+    parse_datetime,
     parse_float,
     select_next_room,
     utcnow_iso,
@@ -67,8 +68,9 @@ from .logic import (
 _LOGGER = logging.getLogger(__name__)
 
 _READY_VACUUM_STATES = {"docked", "idle"}
-_BUSY_DOCK_STATES = {"cleaning", "drying", "emptying", "pause"}
+_BUSY_DOCK_STATES = {"cleaning", "emptying", "pause"}
 _UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
+_UNKNOWN_PERSON_STATES = {None, "", "unknown", "unavailable"}
 
 
 class ValetudoVacuumCoordinator:
@@ -101,6 +103,7 @@ class ValetudoVacuumCoordinator:
         self.ledgers: dict[str, RoomLedger] = {room.room_id: RoomLedger() for room in rooms}
         self.paused = False
         self.pause_reason: str | None = None
+        self.away_since: str | None = None
         self.session: SessionState | None = None
         self.active_run: ActiveRun | None = None
         self.manual_run: ActiveRun | None = None
@@ -126,6 +129,12 @@ class ValetudoVacuumCoordinator:
                 self._handle_state_change_event,
             )
         )
+        if self._all_people_away() and self.away_since is None:
+            self.away_since = self._latest_person_away_since()
+            await self._async_save_store()
+        elif self._any_tracked_person_home():
+            self.away_since = None
+            await self._async_save_store()
         self._schedule_away_timer_if_needed()
         self._notify_listeners()
 
@@ -219,6 +228,8 @@ class ValetudoVacuumCoordinator:
         if paused:
             await self.async_cancel_session(reason or "paused")
         else:
+            if self._all_people_away() and self.away_since is None:
+                self.away_since = self._latest_person_away_since()
             self._schedule_away_timer_if_needed()
         await self._async_save_store()
         self._notify_listeners()
@@ -276,12 +287,18 @@ class ValetudoVacuumCoordinator:
     async def _async_handle_presence_change(self) -> None:
         """React to someone leaving or arriving."""
         if self._all_people_away():
+            if self.away_since is None:
+                self.away_since = self._latest_person_away_since()
+                await self._async_save_store()
             self._schedule_away_timer_if_needed()
             return
 
+        self.away_since = None
         self._cancel_away_timer()
         if self.session and self.session.active and self.config.get(CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL):
             await self.async_cancel_session("Tracked person arrived home")
+        else:
+            await self._async_save_store()
 
     def _schedule_away_timer_if_needed(self) -> None:
         """Schedule the configured away grace period."""
@@ -311,19 +328,11 @@ class ValetudoVacuumCoordinator:
     def _remaining_away_delay_seconds(self) -> int | None:
         """Return seconds left before the tracked people have been away long enough."""
         away_delay = int(self.config.get("away_delay", 300))
-        latest_away_since: datetime | None = None
-
-        for entity_id in self.people_entities:
-            state = self.hass.states.get(entity_id)
-            if state is None or normalize_state(state.state) != "not_home":
-                return None
-            if latest_away_since is None or state.last_changed > latest_away_since:
-                latest_away_since = state.last_changed
-
-        if latest_away_since is None:
+        away_since = parse_datetime(self.away_since)
+        if away_since is None:
             return away_delay
 
-        elapsed = (dt_util.utcnow() - latest_away_since).total_seconds()
+        elapsed = (dt_util.utcnow() - away_since).total_seconds()
         return max(0, int(away_delay - elapsed))
 
     def _cancel_away_timer(self) -> None:
@@ -613,11 +622,36 @@ class ValetudoVacuumCoordinator:
         return not self.paused or bool(self.config.get(CONF_TRACK_MANUAL_WHEN_PAUSED))
 
     def _all_people_away(self) -> bool:
-        """Return True when every tracked person is not_home."""
+        """Return True when every tracked person is away from home."""
         for entity_id in self.people_entities:
-            if normalize_state(self._state(entity_id)) != "not_home":
+            if not self._person_is_away(entity_id):
                 return False
         return True
+
+    def _person_is_away(self, entity_id: str) -> bool:
+        """Return whether a tracked person is away from home."""
+        state = normalize_state(self._state(entity_id))
+        normalized = state.lower() if state else None
+        return normalized not in _UNKNOWN_PERSON_STATES and normalized != "home"
+
+    def _any_tracked_person_home(self) -> bool:
+        """Return whether any tracked person is explicitly home."""
+        for entity_id in self.people_entities:
+            state = normalize_state(self._state(entity_id))
+            if state is not None and state.lower() == "home":
+                return True
+        return False
+
+    def _latest_person_away_since(self) -> str:
+        """Return the latest last-changed time among away tracked people."""
+        latest_away_since: datetime | None = None
+        for entity_id in self.people_entities:
+            state = self.hass.states.get(entity_id)
+            if state is None or not self._person_is_away(entity_id):
+                continue
+            if latest_away_since is None or state.last_changed > latest_away_since:
+                latest_away_since = state.last_changed
+        return (latest_away_since or dt_util.utcnow()).isoformat()
 
     def _status_flag(self) -> str | None:
         """Return the normalized Valetudo status flag."""
@@ -669,6 +703,7 @@ class ValetudoVacuumCoordinator:
 
         self.paused = bool(stored.get("paused", False))
         self.pause_reason = stored.get("pause_reason")
+        self.away_since = stored.get("away_since")
         stored_rooms = stored.get("rooms", {})
         if isinstance(stored_rooms, dict):
             for room in self.rooms:
@@ -680,6 +715,7 @@ class ValetudoVacuumCoordinator:
             {
                 "paused": self.paused,
                 "pause_reason": self.pause_reason,
+                "away_since": self.away_since,
                 "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
             }
         )
