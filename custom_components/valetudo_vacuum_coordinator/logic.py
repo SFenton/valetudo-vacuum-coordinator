@@ -324,13 +324,13 @@ def evaluate_run_success(
 
     start_time = run.start_time
     if start_time is not None and end_time is not None:
-        duration_delta = max(0.0, end_time - start_time)
+        duration_delta = counter_delta(start_time, end_time)
         if duration_delta < room.min_duration:
             return False, f"Cleaned for {duration_delta:.0f}s, below {room.min_duration}s threshold"
 
     start_area = run.start_area
     if room.min_area > 0 and start_area is not None and end_area is not None:
-        area_delta = max(0.0, end_area - start_area)
+        area_delta = counter_delta(start_area, end_area)
         if area_delta < room.min_area:
             return False, f"Cleaned area {area_delta:.1f}, below {room.min_area:.1f} threshold"
 
@@ -340,6 +340,13 @@ def evaluate_run_success(
             return False, f"Estimated in-room dwell {dwell:.0f}s, below {room.min_estimated_dwell}s threshold"
 
     return True, None
+
+
+def counter_delta(start_value: float, end_value: float) -> float:
+    """Return a delta for counters that may reset at the start of a run."""
+    if end_value >= start_value:
+        return end_value - start_value
+    return max(0.0, end_value)
 
 
 def manual_rooms_to_credit(

@@ -196,6 +196,37 @@ def test_run_success_accepts_completed_segment_run():
     assert reason is None
 
 
+def test_run_success_accepts_reset_current_statistics():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_duration=120,
+        min_area=1000,
+    )
+    run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=900,
+        start_area=10000,
+    )
+    run.observed_cleaning = True
+    run.observed_segment_cleaning = True
+
+    ok, reason = logic.evaluate_run_success(
+        room,
+        run,
+        end_area=7750,
+        end_time=360,
+        error="No error",
+    )
+
+    assert ok is True
+    assert reason is None
+
+
 def test_manual_rooms_to_credit_requires_estimated_dwell():
     room_one = logic.RoomConfig(
         room_id="room_one",
