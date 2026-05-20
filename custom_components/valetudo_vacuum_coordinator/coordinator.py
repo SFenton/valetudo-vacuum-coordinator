@@ -287,17 +287,44 @@ class ValetudoVacuumCoordinator:
         """Schedule the configured away grace period."""
         if self.paused or not self._all_people_away():
             return
+        if self.session and self.session.active:
+            return
         if self._away_timer_cancel is not None:
             return
 
-        away_delay = int(self.config.get("away_delay", 300))
+        remaining_delay = self._remaining_away_delay_seconds()
+        if remaining_delay is None:
+            return
+        if remaining_delay <= 0:
+            self.hass.async_create_task(
+                self.async_start_session(reason="away delay already elapsed")
+            )
+            return
 
         def timer_finished(_now: datetime) -> None:
             self._away_timer_cancel = None
             self.hass.async_create_task(self.async_start_session(reason="away timer"))
 
-        self._away_timer_cancel = async_call_later(self.hass, away_delay, timer_finished)
+        self._away_timer_cancel = async_call_later(self.hass, remaining_delay, timer_finished)
         self._notify_listeners()
+
+    def _remaining_away_delay_seconds(self) -> int | None:
+        """Return seconds left before the tracked people have been away long enough."""
+        away_delay = int(self.config.get("away_delay", 300))
+        latest_away_since: datetime | None = None
+
+        for entity_id in self.people_entities:
+            state = self.hass.states.get(entity_id)
+            if state is None or normalize_state(state.state) != "not_home":
+                return None
+            if latest_away_since is None or state.last_changed > latest_away_since:
+                latest_away_since = state.last_changed
+
+        if latest_away_since is None:
+            return away_delay
+
+        elapsed = (dt_util.utcnow() - latest_away_since).total_seconds()
+        return max(0, int(away_delay - elapsed))
 
     def _cancel_away_timer(self) -> None:
         """Cancel pending away timer."""
