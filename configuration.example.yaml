@@ -23,6 +23,10 @@ valetudo_vacuum_coordinator:
   water_entity: select.valetudo_robot_water
   water_mop_option: high
 
+  # Optional: send one final away auto-clean summary through this notify service.
+  notify_service: notify.household
+  notification_url: /at-a-glance/living-room#robot-vacuum
+
   # Optional: if these entities are not exposed in HA, omit them. Valetudo error text
   # still blocks known clean-water, dirty-water, detergent, and dock errors.
   fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component

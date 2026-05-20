@@ -12,6 +12,8 @@ from .const import (
     ATTR_ACTIVE_ROOM,
     ATTR_CANCELLED,
     ATTR_COMPLETED_ROOMS,
+    ATTR_FAILED_REASONS,
+    ATTR_FAILED_ROOMS,
     ATTR_LAST_FAILED_REASON,
     ATTR_LAST_MOPPED,
     ATTR_LAST_SUCCESSFUL_CLEAN,
@@ -19,8 +21,13 @@ from .const import (
     ATTR_PENDING_ROOMS,
     ATTR_ROOM_ID,
     ATTR_SESSION_ID,
+    ATTR_SKIPPED_REASONS,
     ATTR_SKIPPED_ROOMS,
+    ATTR_NEEDS_HELP,
+    ATTR_NOTIFICATION_SENT,
     ATTR_SUCCESSFUL_COUNT,
+    ATTR_TERMINAL_MESSAGE,
+    ATTR_TERMINAL_REASON,
     ATTR_VACUUM_ONLY,
 )
 from .entity import ValetudoCoordinatorEntity, get_coordinator_from_discovery
@@ -67,6 +74,13 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_ACTIVE_ROOM: self.coordinator.active_room.name if self.coordinator.active_room else None,
             ATTR_COMPLETED_ROOMS: session.completed_room_ids if session else [],
             ATTR_SKIPPED_ROOMS: session.skipped_room_ids if session else [],
+            ATTR_FAILED_ROOMS: session.failed_room_ids if session else [],
+            ATTR_SKIPPED_REASONS: session.skipped_room_reasons if session else {},
+            ATTR_FAILED_REASONS: session.failed_room_reasons if session else {},
+            ATTR_TERMINAL_REASON: session.terminal_reason if session else None,
+            ATTR_TERMINAL_MESSAGE: session.terminal_message if session else None,
+            ATTR_NEEDS_HELP: session.needs_help if session else False,
+            ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
         }
 
 

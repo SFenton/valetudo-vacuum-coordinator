@@ -23,13 +23,10 @@ MOP_RESOURCE_ERROR_KEYWORDS = (
     "mop dock tray full",
 )
 
-NAVIGATION_FAILURE_KEYWORDS = (
+RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
     "cannot reach",
     "cannot arrive",
     "cannot navigate",
-    "trapped",
-    "stuck",
-    "blocked",
 )
 
 
@@ -144,6 +141,50 @@ class ActiveRun:
         self.last_estimated_room_id = None
         self.last_estimated_changed_at = None
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ActiveRun | None":
+        """Build an active run from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            room_id=data.get("room_id"),
+            segment_id=data.get("segment_id"),
+            session_id=data.get("session_id"),
+            started_at=data.get("started_at") or utcnow_iso(),
+            start_area=parse_float(data.get("start_area")),
+            start_time=parse_float(data.get("start_time")),
+            manual=bool(data.get("manual", False)),
+            vacuum_only=bool(data.get("vacuum_only", False)),
+            cancelled=bool(data.get("cancelled", False)),
+            observed_cleaning=bool(data.get("observed_cleaning", False)),
+            observed_segment_cleaning=bool(data.get("observed_segment_cleaning", False)),
+            last_estimated_room_id=data.get("last_estimated_room_id"),
+            last_estimated_changed_at=data.get("last_estimated_changed_at"),
+            estimated_dwell_seconds={
+                str(room_id): float(seconds)
+                for room_id, seconds in (data.get("estimated_dwell_seconds") or {}).items()
+            },
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize active run state to JSON-safe data."""
+        return {
+            "room_id": self.room_id,
+            "segment_id": self.segment_id,
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "start_area": self.start_area,
+            "start_time": self.start_time,
+            "manual": self.manual,
+            "vacuum_only": self.vacuum_only,
+            "cancelled": self.cancelled,
+            "observed_cleaning": self.observed_cleaning,
+            "observed_segment_cleaning": self.observed_segment_cleaning,
+            "last_estimated_room_id": self.last_estimated_room_id,
+            "last_estimated_changed_at": self.last_estimated_changed_at,
+            "estimated_dwell_seconds": self.estimated_dwell_seconds,
+        }
+
 
 @dataclass(slots=True)
 class SessionState:
@@ -156,7 +197,14 @@ class SessionState:
     attempted_room_ids: list[str] = field(default_factory=list)
     completed_room_ids: list[str] = field(default_factory=list)
     skipped_room_ids: list[str] = field(default_factory=list)
+    failed_room_ids: list[str] = field(default_factory=list)
+    skipped_room_reasons: dict[str, str] = field(default_factory=dict)
+    failed_room_reasons: dict[str, str] = field(default_factory=dict)
     active_room_id: str | None = None
+    terminal_reason: str | None = None
+    terminal_message: str | None = None
+    needs_help: bool = False
+    notification_sent: bool = False
 
     def mark_attempted(self, room_id: str) -> None:
         """Record that a room has consumed its one attempt for this session."""
@@ -170,16 +218,172 @@ class SessionState:
             self.completed_room_ids.append(room_id)
         self.active_room_id = None
 
-    def mark_skipped(self, room_id: str) -> None:
+    def mark_skipped(self, room_id: str, reason: str | None = None) -> None:
         """Record a skipped room for this session."""
         self.mark_attempted(room_id)
         if room_id not in self.skipped_room_ids:
             self.skipped_room_ids.append(room_id)
+        if reason:
+            self.skipped_room_reasons[room_id] = reason
+
+    def mark_failed(self, room_id: str, reason: str | None = None) -> None:
+        """Record a failed room for this session."""
+        self.mark_attempted(room_id)
+        if room_id not in self.failed_room_ids:
+            self.failed_room_ids.append(room_id)
+        if reason:
+            self.failed_room_reasons[room_id] = reason
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SessionState | None":
+        """Build session state from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            session_id=data.get("session_id") or utcnow_iso(),
+            started_at=data.get("started_at") or utcnow_iso(),
+            active=bool(data.get("active", True)),
+            cancelled=bool(data.get("cancelled", False)),
+            attempted_room_ids=list(data.get("attempted_room_ids") or []),
+            completed_room_ids=list(data.get("completed_room_ids") or []),
+            skipped_room_ids=list(data.get("skipped_room_ids") or []),
+            failed_room_ids=list(data.get("failed_room_ids") or []),
+            skipped_room_reasons=dict(data.get("skipped_room_reasons") or {}),
+            failed_room_reasons=dict(data.get("failed_room_reasons") or {}),
+            active_room_id=data.get("active_room_id"),
+            terminal_reason=data.get("terminal_reason"),
+            terminal_message=data.get("terminal_message"),
+            needs_help=bool(data.get("needs_help", False)),
+            notification_sent=bool(data.get("notification_sent", False)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize session state to JSON-safe data."""
+        return {
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "active": self.active,
+            "cancelled": self.cancelled,
+            "attempted_room_ids": self.attempted_room_ids,
+            "completed_room_ids": self.completed_room_ids,
+            "skipped_room_ids": self.skipped_room_ids,
+            "failed_room_ids": self.failed_room_ids,
+            "skipped_room_reasons": self.skipped_room_reasons,
+            "failed_room_reasons": self.failed_room_reasons,
+            "active_room_id": self.active_room_id,
+            "terminal_reason": self.terminal_reason,
+            "terminal_message": self.terminal_message,
+            "needs_help": self.needs_help,
+            "notification_sent": self.notification_sent,
+        }
+
+
+@dataclass(slots=True)
+class AutoCleanSummary:
+    """Human-facing summary for an auto-clean session."""
+
+    title: str
+    message: str
 
 
 def utcnow_iso() -> str:
     """Return an ISO timestamp in UTC."""
     return datetime.now(UTC).isoformat()
+
+
+def format_room_list(room_names: list[str]) -> str:
+    """Format room names as a human-readable list."""
+    if not room_names:
+        return ""
+    if len(room_names) == 1:
+        return room_names[0]
+    if len(room_names) == 2:
+        return f"{room_names[0]} and {room_names[1]}"
+    return f"{', '.join(room_names[:-1])}, and {room_names[-1]}"
+
+
+def room_count_label(count: int) -> str:
+    """Return a room-count label."""
+    return f"{count} {'Room' if count == 1 else 'Rooms'}"
+
+
+def friendly_failure_reason(reason: str | None) -> str:
+    """Normalize a technical failure reason for summary notifications."""
+    normalized = (normalize_state(reason) or "an unknown error").strip()
+    lowered = normalized.lower()
+    if "cannot reach target" in lowered:
+        return "it could not reach the room"
+    if "cannot navigate to the dock" in lowered or "cannot reach dock" in lowered:
+        return "it cannot reach the dock"
+    if "clean water" in lowered or "water tank empty" in lowered:
+        return "the clean water tank is empty"
+    if "dirty tank" in lowered or "dirty water" in lowered or "wastewater" in lowered:
+        return "the dirty water tank is full"
+    if "detergent" in lowered or "cleaning liquid" in lowered or "fortified liquid" in lowered:
+        return "the detergent is empty"
+    if "dustbag" in lowered or "dust bag" in lowered:
+        return "the dock dustbag needs attention"
+    return normalized[0].lower() + normalized[1:] if normalized else "an unknown error"
+
+
+def build_auto_clean_summary(
+    *,
+    vacuum_name: str,
+    completed_room_names: list[str],
+    skipped_room_reasons: dict[str, str],
+    failed_room_reasons: dict[str, str],
+    terminal_reason: str | None,
+    terminal_message: str | None = None,
+    needs_help: bool = False,
+    all_rooms_cleaned: bool = False,
+    total_room_count: int | None = None,
+) -> AutoCleanSummary | None:
+    """Build the one notification for an auto-clean session."""
+    completed_count = len(completed_room_names)
+    friendly_terminal = friendly_failure_reason(terminal_message)
+
+    if needs_help:
+        if completed_count:
+            return AutoCleanSummary(
+                title=f"{vacuum_name} · Needs Help",
+                message=(
+                    f"While you were away, {vacuum_name} cleaned {format_room_list(completed_room_names)}, "
+                    f"then stopped because {friendly_terminal}. Check the robot and dock path."
+                ),
+            )
+        return AutoCleanSummary(
+            title=f"{vacuum_name} · Needs Help",
+            message=f"{vacuum_name} stopped before any room finished because {friendly_terminal}.",
+        )
+
+    if completed_count == 0:
+        if terminal_reason == "returned_home" or terminal_reason == "cancelled":
+            return None
+        if terminal_reason == "blocked":
+            return AutoCleanSummary(
+                title=f"{vacuum_name} · Auto-Clean Blocked",
+                message=f"Auto-clean could not start because {friendly_terminal}.",
+            )
+        return None
+
+    if all_rooms_cleaned:
+        count = total_room_count or completed_count
+        return AutoCleanSummary(
+            title=f"{vacuum_name} · Auto-Clean Complete",
+            message=f"While you were away, {vacuum_name} cleaned all {room_count_label(count).lower()}.",
+        )
+
+    message = f"While you were away, {vacuum_name} cleaned {format_room_list(completed_room_names)}."
+    reason_groups: dict[str, list[str]] = {}
+    for room_name, reason in {**skipped_room_reasons, **failed_room_reasons}.items():
+        reason_groups.setdefault(friendly_failure_reason(reason), []).append(room_name)
+    for reason, room_names in reason_groups.items():
+        message += f" It skipped {format_room_list(room_names)} because {reason}."
+
+    return AutoCleanSummary(
+        title=f"{vacuum_name} · Auto-Cleaned {room_count_label(completed_count)}",
+        message=message,
+    )
 
 
 def parse_datetime(value: str | None) -> datetime | None:
@@ -294,13 +498,20 @@ def cleaning_block_reason(resources: ResourceState) -> str | None:
     if dustbag is not None and dustbag.lower() in {"full", "missing", "unknown", "unavailable"}:
         return f"dustbag is {dustbag}"
 
-    if not is_error_clear(resources.error) and not error_contains_any(
-        resources.error, MOP_RESOURCE_ERROR_KEYWORDS
-    ):
-        return normalize_state(resources.error)
+    normalized_error = normalize_state(resources.error)
+    recoverable_navigation = (
+        error_contains_any(normalized_error, RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS)
+        and "dock" not in normalized_error.lower()
+        if normalized_error
+        else False
+    )
 
-    if error_contains_any(resources.error, NAVIGATION_FAILURE_KEYWORDS):
-        return normalize_state(resources.error)
+    if (
+        not is_error_clear(normalized_error)
+        and not error_contains_any(normalized_error, MOP_RESOURCE_ERROR_KEYWORDS)
+        and not recoverable_navigation
+    ):
+        return normalized_error
 
     return None
 

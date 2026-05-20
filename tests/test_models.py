@@ -113,6 +113,57 @@ def test_dustbag_error_blocks_all_pending_rooms():
     ]
 
 
+def test_recoverable_navigation_error_does_not_block_next_room():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
+    ]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        {"room_one"},
+        logic.ResourceState(error="Cannot reach target"),
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_two"
+    assert skipped == []
+
+
+def test_intervention_navigation_error_blocks_pending_rooms():
+    rooms = [logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1")]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        set(),
+        logic.ResourceState(error="Robot is stuck"),
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert selection is None
+    assert [(room.room_id, reason) for room, reason in skipped] == [("room_one", "Robot is stuck")]
+
+
+def test_dock_navigation_error_blocks_pending_rooms():
+    rooms = [logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1")]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        set(),
+        logic.ResourceState(error="Cannot navigate to the dock"),
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert selection is None
+    assert [(room.room_id, reason) for room, reason in skipped] == [
+        ("room_one", "Cannot navigate to the dock")
+    ]
+
+
 def test_run_success_rejects_resumable_docked_state():
     room = logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1")
     run = logic.ActiveRun(
@@ -264,3 +315,89 @@ def test_mark_success_updates_attempted_and_counts():
     assert ledger.last_vacuumed == "2026-05-19T12:00:00+00:00"
     assert ledger.last_mopped == "2026-05-19T12:00:00+00:00"
     assert ledger.successful_count == 1
+
+
+def test_auto_clean_summary_skips_return_home_without_completed_rooms():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=[],
+        skipped_room_reasons={},
+        failed_room_reasons={},
+        terminal_reason="returned_home",
+    )
+
+    assert summary is None
+
+
+def test_auto_clean_summary_reports_partial_success_and_skips():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=["Guest Bathroom", "Dining Room", "Hallway"],
+        skipped_room_reasons={"Kitchen": "Mop Dock Clean Water Tank empty"},
+        failed_room_reasons={"Guest Room": "Cannot reach target"},
+        terminal_reason="complete",
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Auto-Cleaned 3 Rooms"
+    assert summary.message == (
+        "While you were away, Main Floor Vacuum cleaned Guest Bathroom, Dining Room, and Hallway. "
+        "It skipped Kitchen because the clean water tank is empty. "
+        "It skipped Guest Room because it could not reach the room."
+    )
+
+
+def test_auto_clean_summary_reports_blocked_before_start():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=[],
+        skipped_room_reasons={},
+        failed_room_reasons={},
+        terminal_reason="blocked",
+        terminal_message="Mop Dock Clean Water Tank empty",
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Auto-Clean Blocked"
+    assert summary.message == "Auto-clean could not start because the clean water tank is empty."
+
+
+def test_auto_clean_summary_reports_needs_help():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=["Guest Bathroom", "Dining Room"],
+        skipped_room_reasons={},
+        failed_room_reasons={},
+        terminal_reason="needs_help",
+        terminal_message="Cannot navigate to the dock",
+        needs_help=True,
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Needs Help"
+    assert summary.message == (
+        "While you were away, Main Floor Vacuum cleaned Guest Bathroom and Dining Room, "
+        "then stopped because it cannot reach the dock. Check the robot and dock path."
+    )
+
+
+def test_session_state_round_trips_terminal_details():
+    session = logic.SessionState(
+        session_id="session",
+        started_at="2026-05-20T10:00:00+00:00",
+        active=False,
+        terminal_reason="complete",
+        notification_sent=True,
+    )
+    session.mark_completed("room_one")
+    session.mark_skipped("room_two", "clean water empty")
+    session.mark_failed("room_three", "Cannot reach target")
+
+    restored = logic.SessionState.from_dict(session.to_dict())
+
+    assert restored is not None
+    assert restored.completed_room_ids == ["room_one"]
+    assert restored.skipped_room_reasons == {"room_two": "clean water empty"}
+    assert restored.failed_room_reasons == {"room_three": "Cannot reach target"}
+    assert restored.terminal_reason == "complete"
+    assert restored.notification_sent is True

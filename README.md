@@ -37,6 +37,8 @@ valetudo_vacuum_coordinator:
   mode_mop_option: vacuum_and_mop
   water_entity: select.valetudo_robot_water
   water_mop_option: high
+  notify_service: notify.household
+  notification_url: /at-a-glance/living-room#robot-vacuum
   fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component
   dirty_water_entity: sensor.valetudo_robot_wastewater_dock_component
   detergent_entity: sensor.valetudo_robot_detergent_dock_component
@@ -62,8 +64,13 @@ See [configuration.example.yaml](configuration.example.yaml) for a fuller generi
 
 - Pause switch: toggle this on when guests are staying over or when you do not want automatic away cleaning.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
+- Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
 - Session sensors: state, current room, queue summary.
 - Per-room sensors: last successful clean timestamp and successful clean count.
+
+## Auto-Clean Notifications
+
+Set `notify_service` to enable one final summary notification per away auto-clean session. Normal per-room completion and recoverable error notifications should be suppressed while the auto-cleaning binary sensor is on. The integration sends no summary if someone comes home before any room completes.
 
 ## Notes
 
