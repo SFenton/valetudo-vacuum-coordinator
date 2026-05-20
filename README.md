@@ -15,7 +15,7 @@ After installation, add YAML configuration, restart Home Assistant, and check th
 
 ## Example Configuration
 
-Adjust the entity IDs, MQTT topic, Valetudo select option names, and segment IDs for your own Home Assistant and Valetudo setup. If a listed optional entity does not exist in your HA instance, remove that line.
+Adjust the entity IDs, MQTT topic, Valetudo select option names, and segment IDs for your own Home Assistant and Valetudo setup. MQTT topics are case-sensitive; use the exact Valetudo MQTT identifier from the MQTT device registry or Valetudo settings, even when Home Assistant entity IDs are lowercase. If a listed optional entity does not exist in your HA instance, remove that line.
 
 ```yaml
 valetudo_vacuum_coordinator:

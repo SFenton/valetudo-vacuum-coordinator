@@ -6,6 +6,8 @@ valetudo_vacuum_coordinator:
     - person.person_two
   away_delay: 300
   min_battery: 40
+
+  # MQTT topics are case-sensitive; replace `robot` with the exact Valetudo MQTT identifier.
   segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set
   status_flag_entity: sensor.valetudo_robot_status_flag
   dock_status_entity: sensor.valetudo_robot_dock_status
