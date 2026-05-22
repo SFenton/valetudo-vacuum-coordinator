@@ -44,7 +44,7 @@ def test_pick_next_room_prefers_oldest_success():
 
     assert selection is not None
     assert selection.room.room_id == "room_two"
-    assert selection.vacuum_only is False
+    assert selection.vacuum_only is True
     assert skipped == []
 
 
@@ -71,6 +71,23 @@ def test_mop_resource_blocks_mop_room():
     reason = logic.mop_block_reason(room, resources)
 
     assert reason == "dirty water is full"
+
+
+def test_mop_ready_room_uses_mop_mode():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        mop_required=True,
+    )
+
+    selection, skipped = logic.select_next_room(
+        [room], {}, set(), logic.ResourceState(), allow_vacuum_only_when_mop_blocked=False
+    )
+
+    assert selection is not None
+    assert selection.vacuum_only is False
+    assert skipped == []
 
 
 def test_mop_block_can_fall_back_to_vacuum_only():

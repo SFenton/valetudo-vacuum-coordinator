@@ -482,7 +482,7 @@ def select_next_room(
     for room in pending_rooms:
         reason = mop_block_reason(room, resources)
         if reason is None:
-            return RoomSelection(room=room), skipped
+            return RoomSelection(room=room, vacuum_only=not room.mop_required), skipped
 
         if allow_vacuum_only_when_mop_blocked:
             return RoomSelection(room=room, vacuum_only=True, mop_block_reason=reason), skipped
