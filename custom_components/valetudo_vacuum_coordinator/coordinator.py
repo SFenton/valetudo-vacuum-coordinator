@@ -51,12 +51,14 @@ from .const import (
 )
 from .logic import (
     ActiveRun,
+    MOP_RESOURCE_ERROR_KEYWORDS,
     ResourceState,
     RoomConfig,
     RoomLedger,
     SessionState,
     build_auto_clean_summary,
     evaluate_run_success,
+    error_contains_any,
     is_error_clear,
     manual_rooms_to_credit,
     mark_failure,
@@ -302,16 +304,18 @@ class ValetudoVacuumCoordinator:
                 await self._async_finish_active_run(
                     success_override=False,
                     failure_reason=new_state.state,
-                    continue_session=not needs_help,
+                    continue_session=False,
                 )
+                await self._async_return_to_dock_or_stop_resumable(new_state.state)
                 if needs_help and self.session:
                     self.session.active = False
                     self.session.terminal_reason = "needs_help"
                     self.session.terminal_message = new_state.state
                     self.session.needs_help = True
-                    await self._async_return_to_dock_or_stop_resumable(new_state.state)
                     await self._async_save_store()
                     await self._async_maybe_send_auto_clean_summary()
+                else:
+                    await self._async_maybe_start_next_room()
             self._notify_listeners()
             return
         if entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY):
@@ -672,25 +676,16 @@ class ValetudoVacuumCoordinator:
             keyword in lowered for keyword in ("cannot reach", "cannot arrive", "cannot navigate")
         ):
             return True
-        if any(
-            keyword in lowered
-            for keyword in (
-                "clean water",
-                "freshwater",
-                "water tank empty",
-                "dirty tank",
-                "dirty water",
-                "wastewater",
-                "detergent",
-                "cleaning liquid",
-                "fortified liquid",
-            )
-        ):
+        if self._error_is_mop_resource(normalized):
             return False
         return not any(
             keyword in lowered
             for keyword in ("cannot reach", "cannot arrive", "cannot navigate")
         )
+
+    def _error_is_mop_resource(self, error: str | None) -> bool:
+        """Return whether an error is a recoverable mop resource issue."""
+        return error_contains_any(error, MOP_RESOURCE_ERROR_KEYWORDS)
 
     def _start_manual_run(self, now: datetime) -> None:
         """Begin observing a manual segment run."""
@@ -727,6 +722,16 @@ class ValetudoVacuumCoordinator:
     async def _async_return_to_dock_or_stop_resumable(self, reason: str) -> None:
         """Cancel a moving or resumable Valetudo task."""
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state == "error" and self._error_is_mop_resource(reason):
+            _LOGGER.info("Stopping %s after dock resource error: %s", self.vacuum_entity, reason)
+            await self.hass.services.async_call(
+                "vacuum",
+                "stop",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=False,
+            )
+            return
+
         if vacuum_state == "docked" and self._status_flag() == "resumable":
             await self.hass.services.async_call(
                 "vacuum",
