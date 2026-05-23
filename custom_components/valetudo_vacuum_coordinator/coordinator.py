@@ -381,6 +381,10 @@ class ValetudoVacuumCoordinator:
     async def _async_handle_vacuum_state(self, vacuum_state: str, now: datetime) -> None:
         """React to vacuum entity state."""
         normalized_state = normalize_state(vacuum_state)
+        if normalized_state == "paused" and self.session and self.session.active and not self.active_run:
+            await self._async_clear_paused_between_rooms()
+            return
+
         if normalized_state == "cleaning":
             if self.active_run:
                 self.active_run.observed_cleaning = True
@@ -749,6 +753,18 @@ class ValetudoVacuumCoordinator:
                 {ATTR_ENTITY_ID: self.vacuum_entity},
                 blocking=False,
             )
+
+    async def _async_clear_paused_between_rooms(self) -> None:
+        """Clear Valetudo's paused state between room attempts."""
+        if self._status_flag() == "resumable":
+            return
+        _LOGGER.info("Stopping %s to clear paused state before next room", self.vacuum_entity)
+        await self.hass.services.async_call(
+            "vacuum",
+            "stop",
+            {ATTR_ENTITY_ID: self.vacuum_entity},
+            blocking=False,
+        )
 
     def _vacuum_ready_for_next_room(self) -> bool:
         """Return whether dispatching another segment is safe."""
