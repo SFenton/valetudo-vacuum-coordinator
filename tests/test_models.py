@@ -90,6 +90,28 @@ def test_mop_ready_room_uses_mop_mode():
     assert skipped == []
 
 
+def test_mop_attachment_sensor_off_does_not_preflight_block_mop_room():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        mop_required=True,
+    )
+
+    selection, skipped = logic.select_next_room(
+        [room],
+        {},
+        set(),
+        logic.ResourceState(mop_attached=False),
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert selection.vacuum_only is False
+    assert skipped == []
+
+
 def test_mop_block_can_fall_back_to_vacuum_only():
     room = logic.RoomConfig(
         room_id="room_one",

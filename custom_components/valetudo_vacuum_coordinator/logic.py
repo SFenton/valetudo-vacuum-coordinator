@@ -509,9 +509,6 @@ def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
     if not room.mop_required:
         return None
 
-    if resources.mop_attached is False:
-        return "Mop attachment is missing"
-
     component_checks = [
         ("fresh water", resources.fresh_water, {"empty", "missing", "unknown", "unavailable"}),
         ("dirty water", resources.dirty_water, {"full", "missing", "unknown", "unavailable"}),
