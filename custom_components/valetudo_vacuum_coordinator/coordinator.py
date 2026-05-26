@@ -720,8 +720,14 @@ class ValetudoVacuumCoordinator:
                 mark_success(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), mop=room.mop_required)
 
         self.manual_run = None
+        self._clear_terminal_session_after_manual_run()
         await self._async_save_store()
         self._notify_listeners()
+
+    def _clear_terminal_session_after_manual_run(self) -> None:
+        """Clear stale away-session outcome details after a manual run completes."""
+        if self.session and not self.session.active and not self.active_run:
+            self.session = None
 
     async def _async_return_to_dock_or_stop_resumable(self, reason: str) -> None:
         """Cancel a moving or resumable Valetudo task."""
