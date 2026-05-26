@@ -358,9 +358,8 @@ def test_auto_clean_summary_reports_partial_success_and_skips():
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Auto-Cleaned 3 Rooms"
     assert summary.message == (
-        "Cleaned Guest Bathroom, Dining Room, and Hallway. "
-        "Skipped Kitchen; the clean water tank is empty. "
-        "Could not clean Guest Room; it could not reach the room."
+        "Main Floor Vacuum cleaned 3 rooms while everyone was away. "
+        "While everyone was away, the vacuum ran into some errors."
     )
 
 
@@ -393,7 +392,8 @@ def test_auto_clean_summary_reports_needs_help():
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Needs Help"
     assert summary.message == (
-        "Cleaned Guest Bathroom and Dining Room, then stopped: it cannot reach the dock."
+        "Main Floor Vacuum cleaned 2 rooms while everyone was away. "
+        "While everyone was away, the vacuum ran into some errors."
     )
 
 
@@ -412,11 +412,24 @@ def test_auto_clean_summary_reports_return_home_compactly():
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Stopped Early"
     assert summary.message == (
-        "Cleaned Guest Room. "
-        "Skipped Master Bathroom; the mop attachment was not detected. "
-        "Could not verify Gym; it only ran 60s. "
-        "Stopped in Master Bedroom when someone came home."
+        "Main Floor Vacuum cleaned Guest Room while everyone was away. "
+        "While everyone was away, the vacuum ran into some errors."
     )
+
+
+def test_while_away_issue_messages_are_detailed_but_compact():
+    messages = logic.build_issue_messages(
+        {"Master Bathroom": "Mop attachment is missing"},
+        {
+            "Gym": "Cleaned for 60s, below 120s threshold",
+            "Master Bedroom": "Tracked person arrived home",
+        },
+    )
+
+    assert messages == [
+        "Could not mop Master Bathroom because the mop attachment was not detected",
+        "Could not clean Gym because it only ran 60s",
+    ]
 
 
 def test_session_state_round_trips_terminal_details():

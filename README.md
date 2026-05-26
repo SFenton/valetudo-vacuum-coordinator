@@ -38,7 +38,7 @@ valetudo_vacuum_coordinator:
   water_entity: select.valetudo_robot_water
   water_mop_option: high
   notify_service: notify.household
-  notification_url: /at-a-glance/living-room#robot-vacuum
+  notification_url: /sfenton-react-dash/living-room#robot-vacuum
   fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component
   dirty_water_entity: sensor.valetudo_robot_wastewater_dock_component
   detergent_entity: sensor.valetudo_robot_detergent_dock_component

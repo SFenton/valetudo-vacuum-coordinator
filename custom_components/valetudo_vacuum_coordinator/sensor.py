@@ -29,8 +29,11 @@ from .const import (
     ATTR_TERMINAL_MESSAGE,
     ATTR_TERMINAL_REASON,
     ATTR_VACUUM_ONLY,
+    ATTR_WHILE_AWAY_CLEANED,
+    ATTR_WHILE_AWAY_ISSUES,
 )
 from .entity import ValetudoCoordinatorEntity, get_coordinator_from_discovery
+from .logic import build_cleaned_messages, build_issue_messages
 
 
 async def async_setup_platform(
@@ -68,6 +71,9 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return session details."""
         session = self.coordinator.session
+        completed_names = self._room_names(session.completed_room_ids if session else [])
+        skipped_reasons = self._room_reasons(session.skipped_room_reasons if session else {})
+        failed_reasons = self._room_reasons(session.failed_room_reasons if session else {})
         return {
             ATTR_SESSION_ID: session.session_id if session else None,
             ATTR_CANCELLED: session.cancelled if session else False,
@@ -81,6 +87,24 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_TERMINAL_MESSAGE: session.terminal_message if session else None,
             ATTR_NEEDS_HELP: session.needs_help if session else False,
             ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
+            ATTR_WHILE_AWAY_CLEANED: build_cleaned_messages(completed_names),
+            ATTR_WHILE_AWAY_ISSUES: build_issue_messages(skipped_reasons, failed_reasons),
+        }
+
+    def _room_names(self, room_ids: list[str]) -> list[str]:
+        """Return friendly room names for room ids."""
+        return [
+            self.coordinator.room_by_id[room_id].name
+            for room_id in room_ids
+            if room_id in self.coordinator.room_by_id
+        ]
+
+    def _room_reasons(self, room_reasons: dict[str, str]) -> dict[str, str]:
+        """Return reason mappings keyed by friendly room name."""
+        return {
+            self.coordinator.room_by_id[room_id].name: reason
+            for room_id, reason in room_reasons.items()
+            if room_id in self.coordinator.room_by_id
         }
 
 

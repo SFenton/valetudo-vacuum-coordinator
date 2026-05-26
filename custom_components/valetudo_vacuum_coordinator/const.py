@@ -88,6 +88,8 @@ ATTR_TERMINAL_REASON = "terminal_reason"
 ATTR_TERMINAL_MESSAGE = "terminal_message"
 ATTR_NEEDS_HELP = "needs_help"
 ATTR_NOTIFICATION_SENT = "notification_sent"
+ATTR_WHILE_AWAY_CLEANED = "while_away_cleaned"
+ATTR_WHILE_AWAY_ISSUES = "while_away_issues"
 ATTR_VACUUM_ONLY = "vacuum_only"
 
 STORE_VERSION = 1

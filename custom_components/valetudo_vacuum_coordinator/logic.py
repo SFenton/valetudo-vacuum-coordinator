@@ -333,6 +333,62 @@ def friendly_failure_reason(reason: str | None) -> str:
     return normalized[0].lower() + normalized[1:] if normalized else "an unknown error"
 
 
+def cleaned_summary_sentence(vacuum_name: str, room_names: list[str]) -> str:
+    """Return a compact notification sentence for cleaned rooms."""
+    if len(room_names) == 1:
+        return f"{vacuum_name} cleaned {room_names[0]} while everyone was away."
+    return f"{vacuum_name} cleaned {room_count_label(len(room_names)).lower()} while everyone was away."
+
+
+def has_reportable_issues(
+    skipped_room_reasons: dict[str, str],
+    failed_room_reasons: dict[str, str],
+    *,
+    needs_help: bool = False,
+) -> bool:
+    """Return whether a session has issues worth mentioning in a notification."""
+    if needs_help or skipped_room_reasons:
+        return True
+    return any(
+        friendly_failure_reason(reason) != "someone came home"
+        for reason in failed_room_reasons.values()
+    )
+
+
+def build_cleaned_messages(room_names: list[str]) -> list[str]:
+    """Return dashboard messages for successfully cleaned rooms."""
+    return [f"Cleaned {room_name}" for room_name in room_names]
+
+
+def build_issue_messages(
+    skipped_room_reasons: dict[str, str],
+    failed_room_reasons: dict[str, str],
+) -> list[str]:
+    """Return dashboard messages for skipped or failed rooms."""
+    messages: list[str] = []
+    for room_name, reason in skipped_room_reasons.items():
+        friendly = friendly_failure_reason(reason)
+        messages.append(f"Could not {issue_action(friendly)} {room_name} because {friendly}")
+    for room_name, reason in failed_room_reasons.items():
+        friendly = friendly_failure_reason(reason)
+        if friendly == "someone came home":
+            continue
+        messages.append(f"Could not clean {room_name} because {friendly}")
+    return messages
+
+
+def issue_action(friendly_reason: str) -> str:
+    """Return the most natural verb for an issue reason."""
+    if friendly_reason in {
+        "the mop attachment was not detected",
+        "the clean water tank is empty",
+        "the dirty water tank is full",
+        "the detergent is empty",
+    }:
+        return "mop"
+    return "clean"
+
+
 def build_auto_clean_summary(
     *,
     vacuum_name: str,
@@ -351,9 +407,16 @@ def build_auto_clean_summary(
 
     if needs_help:
         if completed_count:
+            message = cleaned_summary_sentence(vacuum_name, completed_room_names)
+            if has_reportable_issues(
+                skipped_room_reasons,
+                failed_room_reasons,
+                needs_help=True,
+            ):
+                message += " While everyone was away, the vacuum ran into some errors."
             return AutoCleanSummary(
                 title=f"{vacuum_name} · Needs Help",
-                message=f"Cleaned {format_room_list(completed_room_names)}, then stopped: {friendly_terminal}.",
+                message=message,
             )
         return AutoCleanSummary(
             title=f"{vacuum_name} · Needs Help",
@@ -374,20 +437,12 @@ def build_auto_clean_summary(
         count = total_room_count or completed_count
         return AutoCleanSummary(
             title=f"{vacuum_name} · Auto-Clean Complete",
-            message=f"Cleaned all {room_count_label(count).lower()} while you were away.",
+            message=f"{vacuum_name} cleaned all {room_count_label(count).lower()} while everyone was away.",
         )
 
-    message_parts = [f"Cleaned {format_room_list(completed_room_names)}."]
-    for reason, room_names in group_room_reasons(skipped_room_reasons).items():
-        message_parts.append(f"Skipped {format_room_list(room_names)}; {reason}.")
-    for reason, room_names in group_room_reasons(failed_room_reasons).items():
-        rooms = format_room_list(room_names)
-        if reason == "someone came home":
-            message_parts.append(f"Stopped in {rooms} when someone came home.")
-        elif reason.startswith("it only ran "):
-            message_parts.append(f"Could not verify {rooms}; {reason}.")
-        else:
-            message_parts.append(f"Could not clean {rooms}; {reason}.")
+    message = cleaned_summary_sentence(vacuum_name, completed_room_names)
+    if has_reportable_issues(skipped_room_reasons, failed_room_reasons):
+        message += " While everyone was away, the vacuum ran into some errors."
 
     return AutoCleanSummary(
         title=(
@@ -395,7 +450,7 @@ def build_auto_clean_summary(
             if terminal_reason in {"returned_home", "cancelled"}
             else f"{vacuum_name} · Auto-Cleaned {room_count_label(completed_count)}"
         ),
-        message=" ".join(message_parts),
+        message=message,
     )
 
 
