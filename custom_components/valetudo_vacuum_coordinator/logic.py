@@ -311,10 +311,17 @@ def friendly_failure_reason(reason: str | None) -> str:
     """Normalize a technical failure reason for summary notifications."""
     normalized = (normalize_state(reason) or "an unknown error").strip()
     lowered = normalized.lower()
+    if lowered.startswith("cleaned for ") and "below" in lowered:
+        duration = normalized.split(",", 1)[0][len("Cleaned for ") :].strip()
+        return f"it only ran {duration}"
     if "cannot reach target" in lowered:
         return "it could not reach the room"
     if "cannot navigate to the dock" in lowered or "cannot reach dock" in lowered:
         return "it cannot reach the dock"
+    if "mop attachment is missing" in lowered:
+        return "the mop attachment was not detected"
+    if "tracked person arrived home" in lowered:
+        return "someone came home"
     if "clean water" in lowered or "water tank empty" in lowered:
         return "the clean water tank is empty"
     if "dirty tank" in lowered or "dirty water" in lowered or "wastewater" in lowered:
@@ -346,14 +353,11 @@ def build_auto_clean_summary(
         if completed_count:
             return AutoCleanSummary(
                 title=f"{vacuum_name} · Needs Help",
-                message=(
-                    f"While you were away, {vacuum_name} cleaned {format_room_list(completed_room_names)}, "
-                    f"then stopped because {friendly_terminal}. Check the robot and dock path."
-                ),
+                message=f"Cleaned {format_room_list(completed_room_names)}, then stopped: {friendly_terminal}.",
             )
         return AutoCleanSummary(
             title=f"{vacuum_name} · Needs Help",
-            message=f"{vacuum_name} stopped before any room finished because {friendly_terminal}.",
+            message=f"Stopped before any room finished: {friendly_terminal}.",
         )
 
     if completed_count == 0:
@@ -362,7 +366,7 @@ def build_auto_clean_summary(
         if terminal_reason == "blocked":
             return AutoCleanSummary(
                 title=f"{vacuum_name} · Auto-Clean Blocked",
-                message=f"Auto-clean could not start because {friendly_terminal}.",
+                message=f"Could not start: {friendly_terminal}.",
             )
         return None
 
@@ -370,20 +374,37 @@ def build_auto_clean_summary(
         count = total_room_count or completed_count
         return AutoCleanSummary(
             title=f"{vacuum_name} · Auto-Clean Complete",
-            message=f"While you were away, {vacuum_name} cleaned all {room_count_label(count).lower()}.",
+            message=f"Cleaned all {room_count_label(count).lower()} while you were away.",
         )
 
-    message = f"While you were away, {vacuum_name} cleaned {format_room_list(completed_room_names)}."
-    reason_groups: dict[str, list[str]] = {}
-    for room_name, reason in {**skipped_room_reasons, **failed_room_reasons}.items():
-        reason_groups.setdefault(friendly_failure_reason(reason), []).append(room_name)
-    for reason, room_names in reason_groups.items():
-        message += f" It skipped {format_room_list(room_names)} because {reason}."
+    message_parts = [f"Cleaned {format_room_list(completed_room_names)}."]
+    for reason, room_names in group_room_reasons(skipped_room_reasons).items():
+        message_parts.append(f"Skipped {format_room_list(room_names)}; {reason}.")
+    for reason, room_names in group_room_reasons(failed_room_reasons).items():
+        rooms = format_room_list(room_names)
+        if reason == "someone came home":
+            message_parts.append(f"Stopped in {rooms} when someone came home.")
+        elif reason.startswith("it only ran "):
+            message_parts.append(f"Could not verify {rooms}; {reason}.")
+        else:
+            message_parts.append(f"Could not clean {rooms}; {reason}.")
 
     return AutoCleanSummary(
-        title=f"{vacuum_name} · Auto-Cleaned {room_count_label(completed_count)}",
-        message=message,
+        title=(
+            f"{vacuum_name} · Stopped Early"
+            if terminal_reason in {"returned_home", "cancelled"}
+            else f"{vacuum_name} · Auto-Cleaned {room_count_label(completed_count)}"
+        ),
+        message=" ".join(message_parts),
     )
+
+
+def group_room_reasons(room_reasons: dict[str, str]) -> dict[str, list[str]]:
+    """Group room names by friendly failure reason."""
+    reason_groups: dict[str, list[str]] = {}
+    for room_name, reason in room_reasons.items():
+        reason_groups.setdefault(friendly_failure_reason(reason), []).append(room_name)
+    return reason_groups
 
 
 def parse_datetime(value: str | None) -> datetime | None:

@@ -358,9 +358,9 @@ def test_auto_clean_summary_reports_partial_success_and_skips():
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Auto-Cleaned 3 Rooms"
     assert summary.message == (
-        "While you were away, Main Floor Vacuum cleaned Guest Bathroom, Dining Room, and Hallway. "
-        "It skipped Kitchen because the clean water tank is empty. "
-        "It skipped Guest Room because it could not reach the room."
+        "Cleaned Guest Bathroom, Dining Room, and Hallway. "
+        "Skipped Kitchen; the clean water tank is empty. "
+        "Could not clean Guest Room; it could not reach the room."
     )
 
 
@@ -376,7 +376,7 @@ def test_auto_clean_summary_reports_blocked_before_start():
 
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Auto-Clean Blocked"
-    assert summary.message == "Auto-clean could not start because the clean water tank is empty."
+    assert summary.message == "Could not start: the clean water tank is empty."
 
 
 def test_auto_clean_summary_reports_needs_help():
@@ -393,8 +393,29 @@ def test_auto_clean_summary_reports_needs_help():
     assert summary is not None
     assert summary.title == "Main Floor Vacuum · Needs Help"
     assert summary.message == (
-        "While you were away, Main Floor Vacuum cleaned Guest Bathroom and Dining Room, "
-        "then stopped because it cannot reach the dock. Check the robot and dock path."
+        "Cleaned Guest Bathroom and Dining Room, then stopped: it cannot reach the dock."
+    )
+
+
+def test_auto_clean_summary_reports_return_home_compactly():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=["Guest Room"],
+        skipped_room_reasons={"Master Bathroom": "Mop attachment is missing"},
+        failed_room_reasons={
+            "Gym": "Cleaned for 60s, below 120s threshold",
+            "Master Bedroom": "Tracked person arrived home",
+        },
+        terminal_reason="returned_home",
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Stopped Early"
+    assert summary.message == (
+        "Cleaned Guest Room. "
+        "Skipped Master Bathroom; the mop attachment was not detected. "
+        "Could not verify Gym; it only ran 60s. "
+        "Stopped in Master Bedroom when someone came home."
     )
 
 
