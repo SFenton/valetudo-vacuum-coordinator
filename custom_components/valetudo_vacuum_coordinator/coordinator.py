@@ -51,7 +51,7 @@ from .const import (
 )
 from .logic import (
     ActiveRun,
-    MOP_RESOURCE_ERROR_KEYWORDS,
+    RECOVERABLE_MOP_ERROR_KEYWORDS,
     ResourceState,
     RoomConfig,
     RoomLedger,
@@ -689,7 +689,7 @@ class ValetudoVacuumCoordinator:
 
     def _error_is_mop_resource(self, error: str | None) -> bool:
         """Return whether an error is a recoverable mop resource issue."""
-        return error_contains_any(error, MOP_RESOURCE_ERROR_KEYWORDS)
+        return error_contains_any(error, RECOVERABLE_MOP_ERROR_KEYWORDS)
 
     def _start_manual_run(self, now: datetime) -> None:
         """Begin observing a manual segment run."""

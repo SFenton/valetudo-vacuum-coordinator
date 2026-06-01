@@ -23,6 +23,18 @@ MOP_RESOURCE_ERROR_KEYWORDS = (
     "mop dock tray full",
 )
 
+# Recoverable mop-dock / self-wash-base hardware errors that block mopping but
+# still allow plain vacuuming. Dreame X40 Ultra firmware error 120 is a mop-pad
+# mounting / washboard-seating condition at the self-wash base; neither Valetudo
+# nor the dreame-vacuum integration map it, so it surfaces as "Unknown error 120".
+MOP_HARDWARE_ERROR_KEYWORDS = (
+    "unknown error 120",
+)
+
+# Any mop error that should be treated as recoverable: skip mop-required rooms,
+# fall back to vacuum-only, and never trigger a hard stop / help notification.
+RECOVERABLE_MOP_ERROR_KEYWORDS = MOP_RESOURCE_ERROR_KEYWORDS + MOP_HARDWARE_ERROR_KEYWORDS
+
 RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
     "cannot reach",
     "cannot arrive",
@@ -518,7 +530,7 @@ def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
         if state is not None and normalize_state(state).lower() in bad_values:
             return f"{label} is {state}"
 
-    if error_contains_any(resources.error, MOP_RESOURCE_ERROR_KEYWORDS):
+    if error_contains_any(resources.error, RECOVERABLE_MOP_ERROR_KEYWORDS):
         return normalize_state(resources.error)
 
     return None
@@ -581,7 +593,7 @@ def cleaning_block_reason(resources: ResourceState) -> str | None:
 
     if (
         not is_error_clear(normalized_error)
-        and not error_contains_any(normalized_error, MOP_RESOURCE_ERROR_KEYWORDS)
+        and not error_contains_any(normalized_error, RECOVERABLE_MOP_ERROR_KEYWORDS)
         and not recoverable_navigation
     ):
         return normalized_error

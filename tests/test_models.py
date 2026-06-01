@@ -73,6 +73,40 @@ def test_mop_resource_blocks_mop_room():
     assert reason == "dirty water is full"
 
 
+def test_unknown_error_120_blocks_mop_room_but_allows_vacuum():
+    """Dreame X40 error 120 is a recoverable mop-pad mounting issue.
+
+    It must block mop-required rooms while still allowing plain vacuuming, and it
+    must not trip the general cleaning block.
+    """
+    mop_room = logic.RoomConfig(
+        room_id="room_one", name="Room One", segment_id="1", mop_required=True
+    )
+    resources = logic.ResourceState(error="Unknown error 120")
+
+    assert logic.mop_block_reason(mop_room, resources) == "Unknown error 120"
+    assert logic.cleaning_block_reason(resources) is None
+
+
+def test_unknown_error_120_does_not_block_vacuum_only_room():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+    ]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        set(),
+        logic.ResourceState(error="Unknown error 120"),
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert selection.vacuum_only is True
+    assert skipped == []
+
+
 def test_mop_ready_room_uses_mop_mode():
     room = logic.RoomConfig(
         room_id="room_one",
