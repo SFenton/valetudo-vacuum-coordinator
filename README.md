@@ -35,8 +35,12 @@ valetudo_vacuum_coordinator:
   mode_entity: select.valetudo_robot_mode
   mode_vacuum_option: vacuum
   mode_mop_option: vacuum_and_mop
+  fan_entity: select.valetudo_robot_fan
+  fan_auto_clean_option: max
+  passes_entity: input_select.valetudo_robot_cleaning_passes
+  auto_clean_iterations: 2
   water_entity: select.valetudo_robot_water
-  water_mop_option: high
+  water_mop_option: max
   notify_service: notify.household
   notification_url: /sfenton-react-dash/living-room#robot-vacuum
   fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component

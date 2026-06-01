@@ -390,6 +390,19 @@ def test_mark_success_updates_attempted_and_counts():
     assert ledger.successful_count == 1
 
 
+def test_auto_clean_settings_snapshot_round_trips():
+    snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_then_mop",
+        fan="turbo",
+        water="medium",
+        passes="1",
+    )
+
+    restored = logic.AutoCleanSettingsSnapshot.from_dict(snapshot.to_dict())
+
+    assert restored == snapshot
+
+
 def test_auto_clean_summary_skips_return_home_without_completed_rooms():
     summary = logic.build_auto_clean_summary(
         vacuum_name="Main Floor Vacuum",

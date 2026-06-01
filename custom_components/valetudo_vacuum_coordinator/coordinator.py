@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED,
+    CONF_AUTO_CLEAN_ITERATIONS,
     CONF_BATTERY_ENTITY,
     CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL,
     CONF_CURRENT_AREA_ENTITY,
@@ -27,6 +28,8 @@ from .const import (
     CONF_DUSTBAG_ENTITY,
     CONF_ERROR_ENTITY,
     CONF_ESTIMATED_SEGMENT_ENTITY,
+    CONF_FAN_AUTO_CLEAN_OPTION,
+    CONF_FAN_ENTITY,
     CONF_FRESH_WATER_ENTITY,
     CONF_MANUAL_TRACKING,
     CONF_MIN_BATTERY,
@@ -36,6 +39,7 @@ from .const import (
     CONF_MOP_ATTACHMENT_ENTITY,
     CONF_NOTIFICATION_URL,
     CONF_NOTIFY_SERVICE,
+    CONF_PASSES_ENTITY,
     CONF_STATUS_FLAG_ENTITY,
     CONF_TRACK_MANUAL_WHEN_PAUSED,
     CONF_WATER_ENTITY,
@@ -51,6 +55,7 @@ from .const import (
 )
 from .logic import (
     ActiveRun,
+    AutoCleanSettingsSnapshot,
     RECOVERABLE_MOP_ERROR_KEYWORDS,
     ResourceState,
     RoomConfig,
@@ -112,6 +117,7 @@ class ValetudoVacuumCoordinator:
         self.session: SessionState | None = None
         self.active_run: ActiveRun | None = None
         self.manual_run: ActiveRun | None = None
+        self.settings_snapshot: AutoCleanSettingsSnapshot | None = None
         self.last_error: str | None = None
 
         self._listeners: list[Callable[[], None]] = []
@@ -209,6 +215,7 @@ class ValetudoVacuumCoordinator:
 
         self.session = SessionState(session_id=utcnow_iso(), started_at=utcnow_iso())
         _LOGGER.info("Starting Valetudo away-cleaning session %s (%s)", self.session.session_id, reason)
+        await self._async_prepare_auto_clean_settings()
         await self._async_save_store()
         self._notify_listeners()
         await self._async_maybe_start_next_room()
@@ -493,7 +500,11 @@ class ValetudoVacuumCoordinator:
                 {
                     "topic": self.segment_command_topic,
                     "payload": json.dumps(
-                        {"segment_ids": [room.segment_id], "iterations": 1, "customOrder": True}
+                        {
+                            "segment_ids": [room.segment_id],
+                            "iterations": int(self.config.get(CONF_AUTO_CLEAN_ITERATIONS, 2)),
+                            "customOrder": True,
+                        }
                     ),
                 },
                 blocking=True,
@@ -619,8 +630,64 @@ class ValetudoVacuumCoordinator:
         self.session.notification_sent = True
         if summary:
             await self._async_send_notification(summary.title, summary.message)
+        await self._async_restore_auto_clean_settings()
         await self._async_save_store()
         self._notify_listeners()
+
+    async def _async_prepare_auto_clean_settings(self) -> None:
+        """Snapshot current user settings and apply auto-clean settings."""
+        if self.settings_snapshot is None:
+            self.settings_snapshot = AutoCleanSettingsSnapshot(
+                mode=self._restorable_state(self.config.get(CONF_MODE_ENTITY)),
+                fan=self._restorable_state(self.config.get(CONF_FAN_ENTITY)),
+                water=self._restorable_state(self.config.get(CONF_WATER_ENTITY)),
+                passes=self._restorable_state(self.config.get(CONF_PASSES_ENTITY)),
+            )
+        await self._async_select_option(
+            self.config.get(CONF_PASSES_ENTITY),
+            str(self.config.get(CONF_AUTO_CLEAN_ITERATIONS, 2)),
+        )
+        await self._async_select_option(
+            self.config.get(CONF_FAN_ENTITY),
+            self.config.get(CONF_FAN_AUTO_CLEAN_OPTION),
+        )
+        await self._async_select_option(
+            self.config.get(CONF_WATER_ENTITY),
+            self.config.get(CONF_WATER_MOP_OPTION),
+        )
+
+    async def _async_restore_auto_clean_settings(self) -> None:
+        """Restore user settings captured before the auto-clean session."""
+        if self.settings_snapshot is None:
+            return
+        snapshot = self.settings_snapshot
+        self.settings_snapshot = None
+        await self._async_select_option(self.config.get(CONF_MODE_ENTITY), snapshot.mode)
+        await self._async_select_option(self.config.get(CONF_FAN_ENTITY), snapshot.fan)
+        await self._async_select_option(self.config.get(CONF_WATER_ENTITY), snapshot.water)
+        await self._async_select_option(self.config.get(CONF_PASSES_ENTITY), snapshot.passes)
+
+    async def _async_select_option(self, entity_id: str | None, option: str | None) -> None:
+        """Select an option on a select or input_select entity when available."""
+        if not entity_id or option in _UNKNOWN_OR_CLEAR_STATES:
+            return
+        domain = entity_id.split(".", 1)[0]
+        if domain not in {"select", "input_select"}:
+            return
+        try:
+            await self.hass.services.async_call(
+                domain,
+                "select_option",
+                {ATTR_ENTITY_ID: entity_id, "option": option},
+                blocking=True,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Could not select %s on %s", option, entity_id, exc_info=True)
+
+    def _restorable_state(self, entity_id: str | None) -> str | None:
+        """Return a setting value safe to restore later."""
+        state = normalize_state(self._state(entity_id))
+        return None if state in _UNKNOWN_OR_CLEAR_STATES else state
 
     async def _async_send_notification(self, title: str, message: str) -> None:
         """Send a notification through the configured Home Assistant notify service."""
@@ -900,6 +967,7 @@ class ValetudoVacuumCoordinator:
         self.session = SessionState.from_dict(stored.get("session"))
         self.active_run = ActiveRun.from_dict(stored.get("active_run"))
         self.manual_run = ActiveRun.from_dict(stored.get("manual_run"))
+        self.settings_snapshot = AutoCleanSettingsSnapshot.from_dict(stored.get("settings_snapshot"))
         stored_rooms = stored.get("rooms", {})
         if isinstance(stored_rooms, dict):
             for room in self.rooms:
@@ -915,6 +983,7 @@ class ValetudoVacuumCoordinator:
                 "session": self.session.to_dict() if self.session else None,
                 "active_run": self.active_run.to_dict() if self.active_run else None,
                 "manual_run": self.manual_run.to_dict() if self.manual_run else None,
+                "settings_snapshot": self.settings_snapshot.to_dict() if self.settings_snapshot else None,
                 "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
             }
         )

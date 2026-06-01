@@ -23,16 +23,12 @@ MOP_RESOURCE_ERROR_KEYWORDS = (
     "mop dock tray full",
 )
 
-# Recoverable mop-dock / self-wash-base hardware errors that block mopping but
-# still allow plain vacuuming. Dreame X40 Ultra firmware error 120 is a mop-pad
-# mounting / washboard-seating condition at the self-wash base; neither Valetudo
-# nor the dreame-vacuum integration map it, so it surfaces as "Unknown error 120".
+# Dreame X40 Ultra firmware error 120 is in the mop-dock/self-wash-base cluster,
+# but neither Valetudo nor the dreame-vacuum integration map it, so it surfaces as "Unknown error 120".
 MOP_HARDWARE_ERROR_KEYWORDS = (
     "unknown error 120",
 )
 
-# Any mop error that should be treated as recoverable: skip mop-required rooms,
-# fall back to vacuum-only, and never trigger a hard stop / help notification.
 RECOVERABLE_MOP_ERROR_KEYWORDS = MOP_RESOURCE_ERROR_KEYWORDS + MOP_HARDWARE_ERROR_KEYWORDS
 
 RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
@@ -195,6 +191,37 @@ class ActiveRun:
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
             "estimated_dwell_seconds": self.estimated_dwell_seconds,
+        }
+
+
+@dataclass(slots=True)
+class AutoCleanSettingsSnapshot:
+    """User cleaning settings captured before an auto-clean session mutates them."""
+
+    mode: str | None = None
+    fan: str | None = None
+    water: str | None = None
+    passes: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AutoCleanSettingsSnapshot | None":
+        """Build a settings snapshot from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            mode=data.get("mode"),
+            fan=data.get("fan"),
+            water=data.get("water"),
+            passes=data.get("passes"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize settings snapshot state to JSON-safe data."""
+        return {
+            "mode": self.mode,
+            "fan": self.fan,
+            "water": self.water,
+            "passes": self.passes,
         }
 
 
