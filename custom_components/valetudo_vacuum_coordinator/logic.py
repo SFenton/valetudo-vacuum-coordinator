@@ -60,6 +60,8 @@ class RoomLedger:
     last_successful_clean: str | None = None
     last_vacuumed: str | None = None
     last_mopped: str | None = None
+    last_auto_cleaned: str | None = None
+    last_auto_cleaned_day: str | None = None
     last_attempted: str | None = None
     last_failed_reason: str | None = None
     successful_count: int = 0
@@ -74,6 +76,8 @@ class RoomLedger:
             last_successful_clean=data.get("last_successful_clean"),
             last_vacuumed=data.get("last_vacuumed"),
             last_mopped=data.get("last_mopped"),
+            last_auto_cleaned=data.get("last_auto_cleaned"),
+            last_auto_cleaned_day=data.get("last_auto_cleaned_day"),
             last_attempted=data.get("last_attempted"),
             last_failed_reason=data.get("last_failed_reason"),
             successful_count=int(data.get("successful_count", 0) or 0),
@@ -85,6 +89,8 @@ class RoomLedger:
             "last_successful_clean": self.last_successful_clean,
             "last_vacuumed": self.last_vacuumed,
             "last_mopped": self.last_mopped,
+            "last_auto_cleaned": self.last_auto_cleaned,
+            "last_auto_cleaned_day": self.last_auto_cleaned_day,
             "last_attempted": self.last_attempted,
             "last_failed_reason": self.last_failed_reason,
             "successful_count": self.successful_count,
@@ -493,6 +499,21 @@ def build_auto_clean_summary(
     )
 
 
+def no_selection_terminal_reason(
+    *,
+    completed_room_ids: list[str],
+    skipped_room_ids: list[str],
+    failed_room_ids: list[str],
+    current_skipped_count: int,
+) -> str:
+    """Return the terminal reason when room selection has no next candidate."""
+    if completed_room_ids:
+        return "complete"
+    if skipped_room_ids or failed_room_ids or current_skipped_count:
+        return "blocked"
+    return "complete"
+
+
 def group_room_reasons(room_reasons: dict[str, str]) -> dict[str, list[str]]:
     """Group room names by friendly failure reason."""
     reason_groups: dict[str, list[str]] = {}
@@ -571,12 +592,18 @@ def room_sort_key(room: RoomConfig, ledger: dict[str, RoomLedger]) -> tuple[int,
     return (1, room_ledger.last_successful_clean, room.name)
 
 
+def room_auto_cleaned_on(ledger: RoomLedger, auto_clean_day: str | None) -> bool:
+    """Return whether a room already consumed its auto-clean slot for a day."""
+    return bool(auto_clean_day and ledger.last_auto_cleaned_day == auto_clean_day)
+
+
 def select_next_room(
     rooms: list[RoomConfig],
     ledger: dict[str, RoomLedger],
     attempted_room_ids: set[str],
     resources: ResourceState,
     allow_vacuum_only_when_mop_blocked: bool,
+    auto_clean_day: str | None = None,
 ) -> tuple[RoomSelection | None, list[tuple[RoomConfig, str]]]:
     """Select the next eligible room and return any skipped rooms with reasons."""
     skipped: list[tuple[RoomConfig, str]] = []
@@ -585,6 +612,7 @@ def select_next_room(
         room
         for room in sorted((item for item in rooms if item.enabled), key=lambda item: room_sort_key(item, ledger))
         if room.room_id not in attempted_room_ids
+        and not room_auto_cleaned_on(ledger.get(room.room_id, RoomLedger()), auto_clean_day)
     ]
 
     general_block_reason = cleaning_block_reason(resources)
@@ -688,7 +716,15 @@ def manual_rooms_to_credit(
     return credited
 
 
-def mark_success(ledger: RoomLedger, when: str, mop: bool, vacuum: bool = True) -> None:
+def mark_success(
+    ledger: RoomLedger,
+    when: str,
+    mop: bool,
+    vacuum: bool = True,
+    *,
+    auto_clean: bool = False,
+    auto_clean_day: str | None = None,
+) -> None:
     """Update a room ledger after a successful clean."""
     ledger.last_attempted = when
     ledger.last_successful_clean = when
@@ -696,8 +732,17 @@ def mark_success(ledger: RoomLedger, when: str, mop: bool, vacuum: bool = True) 
         ledger.last_vacuumed = when
     if mop:
         ledger.last_mopped = when
+    if auto_clean:
+        ledger.last_auto_cleaned = when
+        ledger.last_auto_cleaned_day = auto_clean_day or auto_clean_date_from_timestamp(when)
     ledger.last_failed_reason = None
     ledger.successful_count += 1
+
+
+def auto_clean_date_from_timestamp(value: str | None) -> str | None:
+    """Return an ISO date from a timestamp for legacy callers."""
+    parsed = parse_datetime(value)
+    return parsed.date().isoformat() if parsed else None
 
 
 def mark_failure(ledger: RoomLedger, when: str, reason: str | None) -> None:

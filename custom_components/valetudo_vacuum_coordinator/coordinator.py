@@ -68,9 +68,11 @@ from .logic import (
     manual_rooms_to_credit,
     mark_failure,
     mark_success,
+    no_selection_terminal_reason,
     normalize_state,
     parse_datetime,
     parse_float,
+    room_auto_cleaned_on,
     select_next_room,
     utcnow_iso,
 )
@@ -194,7 +196,16 @@ class ValetudoVacuumCoordinator:
     def pending_rooms(self) -> list[RoomConfig]:
         """Return rooms not yet consumed in the current session."""
         attempted = set(self.session.attempted_room_ids if self.session else [])
-        return [room for room in self.rooms if room.enabled and room.room_id not in attempted]
+        auto_clean_day = self._current_auto_clean_day()
+        return [
+            room
+            for room in self.rooms
+            if room.enabled
+            and room.room_id not in attempted
+            and not room_auto_cleaned_on(
+                self.ledgers.get(room.room_id, RoomLedger()), auto_clean_day
+            )
+        ]
 
     @property
     def error_state(self) -> str | None:
@@ -450,6 +461,7 @@ class ValetudoVacuumCoordinator:
             set(self.session.attempted_room_ids),
             self._resource_state(),
             bool(self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)),
+            self._current_auto_clean_day(),
         )
 
         for room, reason in skipped:
@@ -460,8 +472,11 @@ class ValetudoVacuumCoordinator:
         if selection is None:
             self.session.active = False
             self.session.active_room_id = None
-            self.session.terminal_reason = (
-                "complete" if self.session.completed_room_ids else "blocked"
+            self.session.terminal_reason = no_selection_terminal_reason(
+                completed_room_ids=self.session.completed_room_ids,
+                skipped_room_ids=self.session.skipped_room_ids,
+                failed_room_ids=self.session.failed_room_ids,
+                current_skipped_count=len(skipped),
             )
             self.session.terminal_message = self._first_session_block_reason()
             await self._async_save_store()
@@ -574,7 +589,13 @@ class ValetudoVacuumCoordinator:
             reason = failure_reason
 
         if success:
-            mark_success(ledger, utcnow_iso(), mop=room.mop_required and not run.vacuum_only)
+            mark_success(
+                ledger,
+                utcnow_iso(),
+                mop=room.mop_required and not run.vacuum_only,
+                auto_clean=self.session is not None,
+                auto_clean_day=self._current_auto_clean_day(),
+            )
             if self.session:
                 self.session.mark_completed(room.room_id)
         else:
@@ -929,6 +950,10 @@ class ValetudoVacuumCoordinator:
             return self.room_by_segment[normalized].room_id
         room = self.room_by_name.get(normalized.lower())
         return room.room_id if room else None
+
+    def _current_auto_clean_day(self) -> str:
+        """Return the Home Assistant local date used for daily auto-clean limits."""
+        return dt_util.now().date().isoformat()
 
     def _state(self, entity_id: str | None) -> str | None:
         """Return a Home Assistant state string."""

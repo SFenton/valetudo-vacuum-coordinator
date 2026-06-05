@@ -62,6 +62,81 @@ def test_pick_next_room_skips_attempted_rooms():
     assert selection.room.room_id == "room_two"
 
 
+def test_pick_next_room_skips_rooms_auto_cleaned_today():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
+    ]
+    ledgers = {
+        "room_one": logic.RoomLedger(
+            last_auto_cleaned="2026-06-05T15:00:00+00:00",
+            last_auto_cleaned_day="2026-06-05",
+        )
+    }
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        ledgers,
+        set(),
+        logic.ResourceState(),
+        False,
+        auto_clean_day="2026-06-05",
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_two"
+    assert skipped == []
+
+
+def test_pick_next_room_allows_previous_day_auto_clean_in_new_session():
+    room = logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1")
+    ledgers = {
+        "room_one": logic.RoomLedger(
+            last_auto_cleaned="2026-06-04T23:30:00+00:00",
+            last_auto_cleaned_day="2026-06-04",
+        )
+    }
+
+    selection, skipped = logic.select_next_room(
+        [room],
+        ledgers,
+        set(),
+        logic.ResourceState(),
+        False,
+        auto_clean_day="2026-06-05",
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert skipped == []
+
+
+def test_pick_next_room_cross_midnight_session_keeps_attempted_rooms_consumed():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
+    ]
+    ledgers = {
+        "room_one": logic.RoomLedger(
+            last_auto_cleaned="2026-06-04T23:30:00+00:00",
+            last_auto_cleaned_day="2026-06-04",
+        )
+    }
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        ledgers,
+        {"room_one"},
+        logic.ResourceState(),
+        False,
+        auto_clean_day="2026-06-05",
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_two"
+    assert skipped == []
+
+
 def test_mop_resource_blocks_mop_room():
     room = logic.RoomConfig(
         room_id="room_one", name="Room One", segment_id="1", mop_required=True
@@ -387,7 +462,24 @@ def test_mark_success_updates_attempted_and_counts():
     assert ledger.last_successful_clean == "2026-05-19T12:00:00+00:00"
     assert ledger.last_vacuumed == "2026-05-19T12:00:00+00:00"
     assert ledger.last_mopped == "2026-05-19T12:00:00+00:00"
+    assert ledger.last_auto_cleaned is None
+    assert ledger.last_auto_cleaned_day is None
     assert ledger.successful_count == 1
+
+
+def test_mark_success_records_auto_clean_day_only_for_auto_clean():
+    ledger = logic.RoomLedger()
+
+    logic.mark_success(
+        ledger,
+        "2026-06-06T01:15:00+00:00",
+        mop=False,
+        auto_clean=True,
+        auto_clean_day="2026-06-05",
+    )
+
+    assert ledger.last_auto_cleaned == "2026-06-06T01:15:00+00:00"
+    assert ledger.last_auto_cleaned_day == "2026-06-05"
 
 
 def test_auto_clean_settings_snapshot_round_trips():
@@ -483,6 +575,27 @@ def test_auto_clean_summary_reports_return_home_compactly():
     assert summary.message == (
         "Main Floor Vacuum cleaned Guest Room while everyone was away. "
         "While everyone was away, the vacuum ran into some errors."
+    )
+
+
+def test_no_selection_terminal_reason_distinguishes_exhausted_from_failed():
+    assert (
+        logic.no_selection_terminal_reason(
+            completed_room_ids=[],
+            skipped_room_ids=[],
+            failed_room_ids=[],
+            current_skipped_count=0,
+        )
+        == "complete"
+    )
+    assert (
+        logic.no_selection_terminal_reason(
+            completed_room_ids=[],
+            skipped_room_ids=[],
+            failed_room_ids=["room_one"],
+            current_skipped_count=0,
+        )
+        == "blocked"
     )
 
 
