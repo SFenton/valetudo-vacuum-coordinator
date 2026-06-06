@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import re
@@ -61,7 +61,9 @@ from .logic import (
     RoomConfig,
     RoomLedger,
     SessionState,
+    WhileAwayOutcome,
     build_auto_clean_summary,
+    build_while_away_messages,
     evaluate_run_success,
     error_contains_any,
     is_error_clear,
@@ -120,11 +122,13 @@ class ValetudoVacuumCoordinator:
         self.active_run: ActiveRun | None = None
         self.manual_run: ActiveRun | None = None
         self.settings_snapshot: AutoCleanSettingsSnapshot | None = None
+        self.while_away_outcomes: list[WhileAwayOutcome] = []
         self.last_error: str | None = None
 
         self._listeners: list[Callable[[], None]] = []
         self._unsubscribers: list[Callable[[], None]] = []
         self._away_timer_cancel: Callable[[], None] | None = None
+        self._next_day_timer_cancel: Callable[[], None] | None = None
         self._store = Store(hass, STORE_VERSION, f"{STORE_KEY}.{self.coordinator_id}")
 
     async def async_setup(self) -> None:
@@ -149,6 +153,9 @@ class ValetudoVacuumCoordinator:
         elif self._any_tracked_person_home():
             self.away_since = None
             await self._async_save_store()
+        if self._prune_while_away_outcomes_for_day(self._current_auto_clean_day()):
+            await self._async_save_store()
+        self._schedule_next_day_timer_if_needed()
         self._schedule_away_timer_if_needed()
         self._notify_listeners()
 
@@ -206,6 +213,26 @@ class ValetudoVacuumCoordinator:
                 self.ledgers.get(room.room_id, RoomLedger()), auto_clean_day
             )
         ]
+
+    @property
+    def while_away_cleaned_messages(self) -> list[str]:
+        """Return retained while-away cleaned messages for the current day."""
+        cleaned, _issues = build_while_away_messages(
+            self.while_away_outcomes,
+            {room.room_id: room.name for room in self.rooms},
+            self._current_auto_clean_day(),
+        )
+        return cleaned
+
+    @property
+    def while_away_issue_messages(self) -> list[str]:
+        """Return retained while-away issue messages for the current day."""
+        _cleaned, issues = build_while_away_messages(
+            self.while_away_outcomes,
+            {room.room_id: room.name for room in self.rooms},
+            self._current_auto_clean_day(),
+        )
+        return issues
 
     @property
     def error_state(self) -> str | None:
@@ -406,8 +433,14 @@ class ValetudoVacuumCoordinator:
         if normalized_state == "cleaning":
             if self.active_run:
                 self.active_run.observed_cleaning = True
-            elif self._manual_tracking_allowed():
-                self._start_manual_run(now)
+            else:
+                cleared = self._clear_while_away_after_manual_clean_started()
+                if self._manual_tracking_allowed():
+                    self._start_manual_run(now)
+                elif cleared:
+                    self._notify_listeners()
+                if cleared:
+                    await self._async_save_store()
 
         if normalized_state == "returning" and self.active_run:
             self.active_run.observed_cleaning = True
@@ -468,6 +501,7 @@ class ValetudoVacuumCoordinator:
             ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
             mark_failure(ledger, utcnow_iso(), f"Skipped: {reason}")
             self.session.mark_skipped(room.room_id, reason)
+            self._record_while_away_outcome("skipped", room.room_id, reason)
 
         if selection is None:
             self.session.active = False
@@ -528,6 +562,7 @@ class ValetudoVacuumCoordinator:
             _LOGGER.exception("Failed to start Valetudo segment clean for %s", room.name)
             mark_failure(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), str(err))
             self.session.mark_failed(room.room_id, str(err))
+            self._record_while_away_outcome("failed", room.room_id, str(err))
             self.active_run = None
             self.session.active_room_id = None
 
@@ -598,10 +633,12 @@ class ValetudoVacuumCoordinator:
             )
             if self.session:
                 self.session.mark_completed(room.room_id)
+                self._record_while_away_outcome("cleaned", room.room_id)
         else:
             mark_failure(ledger, utcnow_iso(), reason)
             if self.session:
                 self.session.mark_failed(room.room_id, reason)
+                self._record_while_away_outcome("failed", room.room_id, reason)
 
         self.active_run = None
         if self.session:
@@ -817,6 +854,77 @@ class ValetudoVacuumCoordinator:
         if self.session and not self.session.active and not self.active_run:
             self.session = None
 
+    def _clear_while_away_after_manual_clean_started(self) -> bool:
+        """Clear retained away outcome details when a manual clean starts."""
+        changed = False
+        if self.while_away_outcomes:
+            self.while_away_outcomes = []
+            self._cancel_next_day_timer()
+            changed = True
+        if self.session and not self.session.active and not self.active_run:
+            self.session = None
+            changed = True
+        return changed
+
+    def _record_while_away_outcome(
+        self,
+        kind: str,
+        room_id: str,
+        reason: str | None = None,
+    ) -> None:
+        """Record one retained auto-clean outcome for dashboard display."""
+        day = self._current_auto_clean_day()
+        self._prune_while_away_outcomes_for_day(day)
+        self.while_away_outcomes.append(
+            WhileAwayOutcome(day=day, room_id=room_id, kind=kind, reason=reason)
+        )
+        self._schedule_next_day_timer_if_needed()
+
+    def _prune_while_away_outcomes_for_day(self, day: str) -> bool:
+        """Keep only retained outcomes for the requested local day."""
+        retained = [outcome for outcome in self.while_away_outcomes if outcome.day == day]
+        if len(retained) == len(self.while_away_outcomes):
+            return False
+        self.while_away_outcomes = retained
+        if not retained:
+            self._cancel_next_day_timer()
+        return True
+
+    def _schedule_next_day_timer_if_needed(self) -> None:
+        """Schedule a rollover refresh for retained while-away messages."""
+        if not self.while_away_outcomes or self._next_day_timer_cancel is not None:
+            return
+
+        def timer_finished(_now: datetime) -> None:
+            self._next_day_timer_cancel = None
+            self.hass.async_create_task(self._async_handle_next_day_rollover())
+
+        self._next_day_timer_cancel = async_call_later(
+            self.hass, self._seconds_until_next_auto_clean_day(), timer_finished
+        )
+
+    async def _async_handle_next_day_rollover(self) -> None:
+        """Drop stale retained outcomes when the local day changes."""
+        changed = self._prune_while_away_outcomes_for_day(self._current_auto_clean_day())
+        if changed:
+            await self._async_save_store()
+            self._notify_listeners()
+        self._schedule_next_day_timer_if_needed()
+
+    def _seconds_until_next_auto_clean_day(self) -> int:
+        """Return seconds until just after the next Home Assistant local midnight."""
+        now = dt_util.now()
+        next_day = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=1, microsecond=0
+        )
+        return max(1, int((next_day - now).total_seconds()))
+
+    def _cancel_next_day_timer(self) -> None:
+        """Cancel any pending retained-outcome day rollover."""
+        if self._next_day_timer_cancel is not None:
+            self._next_day_timer_cancel()
+            self._next_day_timer_cancel = None
+
     async def _async_return_to_dock_or_stop_resumable(self, reason: str) -> None:
         """Cancel a moving or resumable Valetudo task."""
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
@@ -993,6 +1101,16 @@ class ValetudoVacuumCoordinator:
         self.active_run = ActiveRun.from_dict(stored.get("active_run"))
         self.manual_run = ActiveRun.from_dict(stored.get("manual_run"))
         self.settings_snapshot = AutoCleanSettingsSnapshot.from_dict(stored.get("settings_snapshot"))
+        stored_outcomes = stored.get("while_away_outcomes", [])
+        if isinstance(stored_outcomes, list):
+            self.while_away_outcomes = [
+                outcome
+                for outcome in (
+                    WhileAwayOutcome.from_dict(item)
+                    for item in stored_outcomes
+                )
+                if outcome is not None
+            ]
         stored_rooms = stored.get("rooms", {})
         if isinstance(stored_rooms, dict):
             for room in self.rooms:
@@ -1009,6 +1127,7 @@ class ValetudoVacuumCoordinator:
                 "active_run": self.active_run.to_dict() if self.active_run else None,
                 "manual_run": self.manual_run.to_dict() if self.manual_run else None,
                 "settings_snapshot": self.settings_snapshot.to_dict() if self.settings_snapshot else None,
+                "while_away_outcomes": [outcome.to_dict() for outcome in self.while_away_outcomes],
                 "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
             }
         )

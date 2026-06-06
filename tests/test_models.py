@@ -482,6 +482,68 @@ def test_mark_success_records_auto_clean_day_only_for_auto_clean():
     assert ledger.last_auto_cleaned_day == "2026-06-05"
 
 
+def test_while_away_outcome_round_trips():
+    outcome = logic.WhileAwayOutcome(
+        day="2026-06-05",
+        room_id="room_one",
+        kind="failed",
+        reason="Cannot reach target",
+    )
+
+    restored = logic.WhileAwayOutcome.from_dict(outcome.to_dict())
+
+    assert restored == outcome
+
+
+def test_while_away_messages_filter_to_requested_day():
+    outcomes = [
+        logic.WhileAwayOutcome(day="2026-06-04", room_id="room_one", kind="cleaned"),
+        logic.WhileAwayOutcome(day="2026-06-05", room_id="room_two", kind="cleaned"),
+        logic.WhileAwayOutcome(
+            day="2026-06-05",
+            room_id="room_three",
+            kind="skipped",
+            reason="Mop attachment is missing",
+        ),
+        logic.WhileAwayOutcome(
+            day="2026-06-04",
+            room_id="room_four",
+            kind="failed",
+            reason="Cannot reach target",
+        ),
+    ]
+
+    cleaned, issues = logic.build_while_away_messages(
+        outcomes,
+        {
+            "room_one": "Yesterday Room",
+            "room_two": "Today Room",
+            "room_three": "Today Mop Room",
+            "room_four": "Yesterday Failed Room",
+        },
+        "2026-06-05",
+    )
+
+    assert cleaned == ["Cleaned Today Room"]
+    assert issues == ["Could not mop Today Mop Room because the mop attachment was not detected"]
+
+
+def test_while_away_messages_treat_cross_midnight_completion_as_today():
+    outcomes = [
+        logic.WhileAwayOutcome(day="2026-06-04", room_id="room_one", kind="cleaned"),
+        logic.WhileAwayOutcome(day="2026-06-05", room_id="room_two", kind="cleaned"),
+    ]
+
+    cleaned, issues = logic.build_while_away_messages(
+        outcomes,
+        {"room_one": "Before Midnight", "room_two": "After Midnight"},
+        "2026-06-05",
+    )
+
+    assert cleaned == ["Cleaned After Midnight"]
+    assert issues == []
+
+
 def test_auto_clean_settings_snapshot_round_trips():
     snapshot = logic.AutoCleanSettingsSnapshot(
         mode="vacuum_then_mop",

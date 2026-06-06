@@ -232,6 +232,66 @@ class AutoCleanSettingsSnapshot:
 
 
 @dataclass(slots=True)
+class WhileAwayOutcome:
+    """One retained while-away outcome for dashboard display."""
+
+    day: str
+    room_id: str
+    kind: str
+    reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "WhileAwayOutcome | None":
+        """Build an outcome from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        day = normalize_state(data.get("day"))
+        room_id = normalize_state(data.get("room_id"))
+        kind = normalize_state(data.get("kind"))
+        if not day or not room_id or kind not in {"cleaned", "skipped", "failed"}:
+            return None
+        return cls(day=day, room_id=room_id, kind=kind, reason=data.get("reason"))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize outcome state to JSON-safe data."""
+        return {
+            "day": self.day,
+            "room_id": self.room_id,
+            "kind": self.kind,
+            "reason": self.reason,
+        }
+
+
+def build_while_away_messages(
+    outcomes: list[WhileAwayOutcome],
+    room_names_by_id: dict[str, str],
+    day: str,
+) -> tuple[list[str], list[str]]:
+    """Build dashboard while-away messages for one local day."""
+    cleaned_room_names: list[str] = []
+    skipped_reasons: dict[str, str] = {}
+    failed_reasons: dict[str, str] = {}
+
+    for outcome in outcomes:
+        if outcome.day != day:
+            continue
+        room_name = room_names_by_id.get(outcome.room_id)
+        if not room_name:
+            continue
+        if outcome.kind == "cleaned":
+            if room_name not in cleaned_room_names:
+                cleaned_room_names.append(room_name)
+        elif outcome.kind == "skipped":
+            skipped_reasons[room_name] = outcome.reason or "Unknown issue"
+        elif outcome.kind == "failed":
+            failed_reasons[room_name] = outcome.reason or "Unknown failure"
+
+    return build_cleaned_messages(cleaned_room_names), build_issue_messages(
+        skipped_reasons, failed_reasons
+    )
+
+
+@dataclass(slots=True)
 class SessionState:
     """State for one away-session cleaning cycle."""
 
