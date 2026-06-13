@@ -38,6 +38,15 @@ RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
 )
 
 
+def schedule_hass_task(hass: Any, coroutine: Any) -> None:
+    """Schedule a coroutine from either the event loop or a timer thread."""
+    create_task = getattr(hass, "create_task", None)
+    if create_task is not None:
+        create_task(coroutine)
+        return
+    hass.async_create_task(coroutine)
+
+
 @dataclass(slots=True)
 class RoomConfig:
     """Configuration for one Valetudo map segment."""

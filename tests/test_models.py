@@ -661,6 +661,43 @@ def test_no_selection_terminal_reason_distinguishes_exhausted_from_failed():
     )
 
 
+def test_schedule_hass_task_prefers_thread_safe_create_task():
+    class FakeHass:
+        def __init__(self):
+            self.created = []
+            self.async_created = []
+
+        def create_task(self, coroutine):
+            self.created.append(coroutine)
+
+        def async_create_task(self, coroutine):
+            self.async_created.append(coroutine)
+
+    coroutine = object()
+    hass = FakeHass()
+
+    logic.schedule_hass_task(hass, coroutine)
+
+    assert hass.created == [coroutine]
+    assert hass.async_created == []
+
+
+def test_schedule_hass_task_falls_back_to_async_create_task():
+    class FakeHass:
+        def __init__(self):
+            self.async_created = []
+
+        def async_create_task(self, coroutine):
+            self.async_created.append(coroutine)
+
+    coroutine = object()
+    hass = FakeHass()
+
+    logic.schedule_hass_task(hass, coroutine)
+
+    assert hass.async_created == [coroutine]
+
+
 def test_while_away_issue_messages_are_detailed_but_compact():
     messages = logic.build_issue_messages(
         {"Master Bathroom": "Mop attachment is missing"},

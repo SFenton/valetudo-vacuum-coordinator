@@ -75,6 +75,7 @@ from .logic import (
     parse_datetime,
     parse_float,
     room_auto_cleaned_on,
+    schedule_hass_task,
     select_next_room,
     utcnow_iso,
 )
@@ -395,14 +396,12 @@ class ValetudoVacuumCoordinator:
         if remaining_delay is None:
             return
         if remaining_delay <= 0:
-            self.hass.async_create_task(
-                self.async_start_session(reason="away delay already elapsed")
-            )
+            schedule_hass_task(self.hass, self.async_start_session(reason="away delay already elapsed"))
             return
 
         def timer_finished(_now: datetime) -> None:
             self._away_timer_cancel = None
-            self.hass.async_create_task(self.async_start_session(reason="away timer"))
+            schedule_hass_task(self.hass, self.async_start_session(reason="away timer"))
 
         self._away_timer_cancel = async_call_later(self.hass, remaining_delay, timer_finished)
         self._notify_listeners()
@@ -897,7 +896,7 @@ class ValetudoVacuumCoordinator:
 
         def timer_finished(_now: datetime) -> None:
             self._next_day_timer_cancel = None
-            self.hass.async_create_task(self._async_handle_next_day_rollover())
+            schedule_hass_task(self.hass, self._async_handle_next_day_rollover())
 
         self._next_day_timer_cancel = async_call_later(
             self.hass, self._seconds_until_next_auto_clean_day(), timer_finished
