@@ -343,6 +343,9 @@ class ValetudoVacuumCoordinator:
         if entity_id == self.config.get(CONF_DOCK_STATUS_ENTITY):
             await self._async_maybe_start_next_room()
             return
+        if entity_id == self.config.get(CONF_BATTERY_ENTITY):
+            await self._async_maybe_start_next_room()
+            return
         if entity_id == self.config.get(CONF_ERROR_ENTITY) and not is_error_clear(new_state.state):
             self.last_error = new_state.state
             if self.active_run:
