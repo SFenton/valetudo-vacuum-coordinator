@@ -29,7 +29,7 @@ valetudo_vacuum_coordinator:
 
   # Optional: send one final away auto-clean summary through this notify service.
   notify_service: notify.household
-  notification_url: /sfenton-react-dash/living-room#robot-vacuum
+  notification_url: /sfenton-react-dash/home?path=living-room#robot-vacuum
 
   # Optional: if these entities are not exposed in HA, omit them. Valetudo error text
   # still blocks known clean-water, dirty-water, detergent, and dock errors.
@@ -47,6 +47,7 @@ valetudo_vacuum_coordinator:
     - id: room_one
       name: Room One
       segment_id: "1"
+      manual_credit_entity: input_boolean.room_one_selected
       min_duration: 120
       min_area: 0
     - id: room_two

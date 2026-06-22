@@ -35,6 +35,11 @@ RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
     "cannot reach",
     "cannot arrive",
     "cannot navigate",
+    "unknown error 95",
+    "easy-to-fall",
+    "fall hazard",
+    "robot_stuck_on_ramp",
+    "stuck on ramp",
 )
 
 
@@ -60,6 +65,7 @@ class RoomConfig:
     min_area: float = 0.0
     min_estimated_dwell: int = 30
     require_estimated_segment: bool = False
+    manual_credit_entity: str | None = None
 
 
 @dataclass(slots=True)
@@ -145,6 +151,7 @@ class ActiveRun:
     last_estimated_room_id: str | None = None
     last_estimated_changed_at: str | None = None
     estimated_dwell_seconds: dict[str, float] = field(default_factory=dict)
+    manual_credit_room_ids: list[str] | None = None
 
     def observe_estimated_room(self, room_id: str | None, observed_at: datetime) -> None:
         """Accumulate dwell time for estimated room updates."""
@@ -187,6 +194,11 @@ class ActiveRun:
                 str(room_id): float(seconds)
                 for room_id, seconds in (data.get("estimated_dwell_seconds") or {}).items()
             },
+            manual_credit_room_ids=(
+                [str(room_id) for room_id in data["manual_credit_room_ids"]]
+                if isinstance(data.get("manual_credit_room_ids"), list)
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -206,6 +218,7 @@ class ActiveRun:
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
             "estimated_dwell_seconds": self.estimated_dwell_seconds,
+            "manual_credit_room_ids": self.manual_credit_room_ids,
         }
 
 
@@ -290,10 +303,14 @@ def build_while_away_messages(
         if outcome.kind == "cleaned":
             if room_name not in cleaned_room_names:
                 cleaned_room_names.append(room_name)
+            skipped_reasons.pop(room_name, None)
+            failed_reasons.pop(room_name, None)
         elif outcome.kind == "skipped":
-            skipped_reasons[room_name] = outcome.reason or "Unknown issue"
+            if room_name not in cleaned_room_names:
+                skipped_reasons[room_name] = outcome.reason or "Unknown issue"
         elif outcome.kind == "failed":
-            failed_reasons[room_name] = outcome.reason or "Unknown failure"
+            if room_name not in cleaned_room_names:
+                failed_reasons[room_name] = outcome.reason or "Unknown failure"
 
     return build_cleaned_messages(cleaned_room_names), build_issue_messages(
         skipped_reasons, failed_reasons
@@ -314,6 +331,10 @@ class SessionState:
     failed_room_ids: list[str] = field(default_factory=list)
     skipped_room_reasons: dict[str, str] = field(default_factory=dict)
     failed_room_reasons: dict[str, str] = field(default_factory=dict)
+    retry_room_ids: list[str] = field(default_factory=list)
+    retried_room_ids: list[str] = field(default_factory=list)
+    pending_recovery_room_id: str | None = None
+    pending_recovery_reason: str | None = None
     active_room_id: str | None = None
     terminal_reason: str | None = None
     terminal_message: str | None = None
@@ -330,6 +351,7 @@ class SessionState:
         self.mark_attempted(room_id)
         if room_id not in self.completed_room_ids:
             self.completed_room_ids.append(room_id)
+        self._remove_room_issue(room_id)
         self.active_room_id = None
 
     def mark_skipped(self, room_id: str, reason: str | None = None) -> None:
@@ -348,6 +370,47 @@ class SessionState:
         if reason:
             self.failed_room_reasons[room_id] = reason
 
+    def begin_recovering(self, room_id: str, reason: str | None) -> None:
+        """Track a failed room that can be retried after the robot docks cleanly."""
+        self.pending_recovery_room_id = room_id
+        self.pending_recovery_reason = reason
+
+    def can_retry_room(self, room_id: str) -> bool:
+        """Return whether the session can retry a recoverable room failure."""
+        return room_id not in self.retried_room_ids and room_id not in self.retry_room_ids
+
+    def queue_retry(self, room_id: str) -> None:
+        """Queue a room for one retry at the back of the current session."""
+        if room_id not in self.retry_room_ids and room_id not in self.retried_room_ids:
+            self.retry_room_ids.append(room_id)
+
+    def mark_retry_started(self, room_id: str) -> None:
+        """Record that a queued retry has started so it is not retried forever."""
+        if room_id in self.retry_room_ids:
+            self.retry_room_ids.remove(room_id)
+        if room_id not in self.retried_room_ids:
+            self.retried_room_ids.append(room_id)
+
+    def resolve_recoverable_failure(self, room_id: str, *, queue_retry: bool = True) -> None:
+        """Clear a recovered failure and optionally queue the room for retry."""
+        self._remove_room_issue(room_id)
+        if queue_retry:
+            self.queue_retry(room_id)
+        if self.pending_recovery_room_id == room_id:
+            self.pending_recovery_room_id = None
+            self.pending_recovery_reason = None
+
+    def _remove_room_issue(self, room_id: str) -> None:
+        """Remove failed/skipped issue bookkeeping for a room."""
+        if room_id in self.failed_room_ids:
+            self.failed_room_ids.remove(room_id)
+        if room_id in self.skipped_room_ids:
+            self.skipped_room_ids.remove(room_id)
+        self.failed_room_reasons.pop(room_id, None)
+        self.skipped_room_reasons.pop(room_id, None)
+        if room_id in self.retry_room_ids:
+            self.retry_room_ids.remove(room_id)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SessionState | None":
         """Build session state from stored JSON."""
@@ -364,6 +427,10 @@ class SessionState:
             failed_room_ids=list(data.get("failed_room_ids") or []),
             skipped_room_reasons=dict(data.get("skipped_room_reasons") or {}),
             failed_room_reasons=dict(data.get("failed_room_reasons") or {}),
+            retry_room_ids=list(data.get("retry_room_ids") or []),
+            retried_room_ids=list(data.get("retried_room_ids") or []),
+            pending_recovery_room_id=data.get("pending_recovery_room_id"),
+            pending_recovery_reason=data.get("pending_recovery_reason"),
             active_room_id=data.get("active_room_id"),
             terminal_reason=data.get("terminal_reason"),
             terminal_message=data.get("terminal_message"),
@@ -384,6 +451,10 @@ class SessionState:
             "failed_room_ids": self.failed_room_ids,
             "skipped_room_reasons": self.skipped_room_reasons,
             "failed_room_reasons": self.failed_room_reasons,
+            "retry_room_ids": self.retry_room_ids,
+            "retried_room_ids": self.retried_room_ids,
+            "pending_recovery_room_id": self.pending_recovery_room_id,
+            "pending_recovery_reason": self.pending_recovery_reason,
             "active_room_id": self.active_room_id,
             "terminal_reason": self.terminal_reason,
             "terminal_message": self.terminal_message,
@@ -430,6 +501,8 @@ def friendly_failure_reason(reason: str | None) -> str:
         return f"it only ran {duration}"
     if "cannot reach target" in lowered:
         return "it could not reach the room"
+    if "unknown error 95" in lowered or "easy-to-fall" in lowered or "fall hazard" in lowered:
+        return "it detected a ramp or fall hazard"
     if "cannot navigate to the dock" in lowered or "cannot reach dock" in lowered:
         return "it cannot reach the dock"
     if "mop attachment is missing" in lowered:
@@ -633,6 +706,18 @@ def error_contains_any(error: str | None, keywords: tuple[str, ...]) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def is_recoverable_navigation_error(error: str | None) -> bool:
+    """Return whether a navigation failure can recover after the robot docks."""
+    normalized = normalize_state(error)
+    if not normalized or is_error_clear(normalized):
+        return False
+    lowered = normalized.lower()
+    return (
+        error_contains_any(normalized, RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS)
+        and "dock" not in lowered
+    )
+
+
 def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
     """Return the reason a mop-required room cannot run, if any."""
     if not room.mop_required:
@@ -673,9 +758,11 @@ def select_next_room(
     resources: ResourceState,
     allow_vacuum_only_when_mop_blocked: bool,
     auto_clean_day: str | None = None,
+    retry_room_ids: list[str] | None = None,
 ) -> tuple[RoomSelection | None, list[tuple[RoomConfig, str]]]:
     """Select the next eligible room and return any skipped rooms with reasons."""
     skipped: list[tuple[RoomConfig, str]] = []
+    room_by_id = {room.room_id: room for room in rooms}
 
     pending_rooms = [
         room
@@ -683,6 +770,17 @@ def select_next_room(
         if room.room_id not in attempted_room_ids
         and not room_auto_cleaned_on(ledger.get(room.room_id, RoomLedger()), auto_clean_day)
     ]
+    pending_room_ids = {room.room_id for room in pending_rooms}
+    for room_id in retry_room_ids or []:
+        room = room_by_id.get(room_id)
+        if (
+            room
+            and room.enabled
+            and room.room_id not in pending_room_ids
+            and not room_auto_cleaned_on(ledger.get(room.room_id, RoomLedger()), auto_clean_day)
+        ):
+            pending_rooms.append(room)
+            pending_room_ids.add(room.room_id)
 
     general_block_reason = cleaning_block_reason(resources)
     if general_block_reason:
@@ -708,17 +806,10 @@ def cleaning_block_reason(resources: ResourceState) -> str | None:
         return f"dustbag is {dustbag}"
 
     normalized_error = normalize_state(resources.error)
-    recoverable_navigation = (
-        error_contains_any(normalized_error, RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS)
-        and "dock" not in normalized_error.lower()
-        if normalized_error
-        else False
-    )
-
     if (
         not is_error_clear(normalized_error)
         and not error_contains_any(normalized_error, RECOVERABLE_MOP_ERROR_KEYWORDS)
-        and not recoverable_navigation
+        and not is_recoverable_navigation_error(normalized_error)
     ):
         return normalized_error
 
@@ -776,8 +867,13 @@ def manual_rooms_to_credit(
     """Determine which rooms from a manual run should receive credit."""
     credited: list[RoomConfig] = []
     room_by_id = {room.room_id: room for room in rooms}
+    allowed_room_ids = (
+        set(run.manual_credit_room_ids) if run.manual_credit_room_ids is not None else None
+    )
 
     for room_id, dwell in run.estimated_dwell_seconds.items():
+        if allowed_room_ids is not None and room_id not in allowed_room_ids:
+            continue
         room = room_by_id.get(room_id)
         if room and dwell >= room.min_estimated_dwell:
             credited.append(room)

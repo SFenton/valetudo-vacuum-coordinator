@@ -280,6 +280,68 @@ def test_recoverable_navigation_error_does_not_block_next_room():
     assert skipped == []
 
 
+def test_unknown_error_95_is_recoverable_navigation_error():
+    assert logic.is_recoverable_navigation_error("Unknown error 95") is True
+    assert logic.cleaning_block_reason(logic.ResourceState(error="Unknown error 95")) is None
+
+
+def test_dock_navigation_error_is_not_recoverable_navigation_error():
+    assert logic.is_recoverable_navigation_error("Cannot navigate to the dock") is False
+
+
+def test_retry_rooms_are_selected_after_unattempted_rooms():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
+    ]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        {"room_one"},
+        logic.ResourceState(),
+        allow_vacuum_only_when_mop_blocked=False,
+        retry_room_ids=["room_one"],
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_two"
+    assert skipped == []
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        {"room_one", "room_two"},
+        logic.ResourceState(),
+        allow_vacuum_only_when_mop_blocked=False,
+        retry_room_ids=["room_one"],
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert skipped == []
+
+
+def test_session_recoverable_failure_clear_queues_one_retry():
+    session = logic.SessionState(session_id="session", started_at=logic.utcnow_iso())
+    session.mark_failed("room_one", "Unknown error 95")
+    session.begin_recovering("room_one", "Unknown error 95")
+
+    session.resolve_recoverable_failure("room_one")
+
+    assert session.failed_room_ids == []
+    assert session.failed_room_reasons == {}
+    assert session.pending_recovery_room_id is None
+    assert session.pending_recovery_reason is None
+    assert session.retry_room_ids == ["room_one"]
+
+    session.mark_retry_started("room_one")
+
+    assert session.can_retry_room("room_one") is False
+    assert session.retry_room_ids == []
+    assert session.retried_room_ids == ["room_one"]
+
+
 def test_intervention_navigation_error_blocks_pending_rooms():
     rooms = [logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1")]
 
@@ -453,6 +515,34 @@ def test_manual_rooms_to_credit_requires_estimated_dwell():
     assert [room.room_id for room in credited] == ["room_one"]
 
 
+def test_manual_rooms_to_credit_respects_selected_room_snapshot():
+    room_one = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="9",
+        min_estimated_dwell=30,
+    )
+    room_two = logic.RoomConfig(
+        room_id="room_two",
+        name="Room Two",
+        segment_id="1",
+        min_estimated_dwell=30,
+    )
+    run = logic.ActiveRun(
+        room_id=None,
+        segment_id=None,
+        session_id=None,
+        started_at=logic.utcnow_iso(),
+        manual=True,
+        manual_credit_room_ids=["room_two"],
+    )
+    run.estimated_dwell_seconds = {"room_one": 45, "room_two": 45}
+
+    credited = logic.manual_rooms_to_credit([room_one, room_two], run)
+
+    assert [room.room_id for room in credited] == ["room_two"]
+
+
 def test_mark_success_updates_attempted_and_counts():
     ledger = logic.RoomLedger()
 
@@ -541,6 +631,27 @@ def test_while_away_messages_treat_cross_midnight_completion_as_today():
     )
 
     assert cleaned == ["Cleaned After Midnight"]
+    assert issues == []
+
+
+def test_while_away_messages_drop_room_issue_after_later_clean():
+    outcomes = [
+        logic.WhileAwayOutcome(
+            day="2026-06-05",
+            room_id="room_one",
+            kind="failed",
+            reason="Unknown error 95",
+        ),
+        logic.WhileAwayOutcome(day="2026-06-05", room_id="room_one", kind="cleaned"),
+    ]
+
+    cleaned, issues = logic.build_while_away_messages(
+        outcomes,
+        {"room_one": "Living Room"},
+        "2026-06-05",
+    )
+
+    assert cleaned == ["Cleaned Living Room"]
     assert issues == []
 
 

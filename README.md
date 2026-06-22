@@ -42,7 +42,7 @@ valetudo_vacuum_coordinator:
   water_entity: select.valetudo_robot_water
   water_mop_option: max
   notify_service: notify.household
-  notification_url: /sfenton-react-dash/living-room#robot-vacuum
+  notification_url: /sfenton-react-dash/home?path=living-room#robot-vacuum
   fresh_water_entity: sensor.valetudo_robot_freshwater_dock_component
   dirty_water_entity: sensor.valetudo_robot_wastewater_dock_component
   detergent_entity: sensor.valetudo_robot_detergent_dock_component
@@ -52,6 +52,7 @@ valetudo_vacuum_coordinator:
       name: Room One
       segment_id: "1"
       mop_required: true
+      manual_credit_entity: input_boolean.room_one_selected
       min_duration: 120
       min_area: 0
     - id: room_two
@@ -67,6 +68,7 @@ See [configuration.example.yaml](configuration.example.yaml) for a fuller generi
 ## Entities
 
 - Pause switch: toggle this on when guests are staying over or when you do not want automatic away cleaning.
+- Per-room auto-clean disabled switches: toggle a room on here to exclude it from future away auto-clean sessions without changing manual selected-room cleaning.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
 - Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
 - Session sensors: state, current room, queue summary.
@@ -79,6 +81,8 @@ Set `notify_service` to enable one final summary notification per away auto-clea
 ## Notes
 
 Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration also uses the Status Flag, Dock Status, Error, Current Statistics, Estimated Segment, and optional Dock Component sensors.
+
+Manual clean tracking credits rooms from Valetudo estimated-segment dwell. If a room has `manual_credit_entity`, a manual run snapshots selected rooms at start and only credits selected rooms that were also observed long enough. This keeps transit segments from being marked clean when a Home Assistant dashboard launches a selected-room run.
 
 Binary sensors are read-only in Home Assistant, so the pause control is exposed as both a toggleable pause switch and a read-only pause binary sensor.
 

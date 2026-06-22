@@ -53,6 +53,7 @@ CONF_ROOM_MIN_DURATION = "min_duration"
 CONF_ROOM_MIN_AREA = "min_area"
 CONF_ROOM_MIN_ESTIMATED_DWELL = "min_estimated_dwell"
 CONF_ROOM_REQUIRE_ESTIMATED_SEGMENT = "require_estimated_segment"
+CONF_ROOM_MANUAL_CREDIT_ENTITY = "manual_credit_entity"
 
 DEFAULT_AWAY_DELAY = 300
 DEFAULT_MIN_BATTERY = 40

@@ -46,6 +46,7 @@ from .const import (
     CONF_ROOM_MIN_AREA,
     CONF_ROOM_MIN_DURATION,
     CONF_ROOM_MIN_ESTIMATED_DWELL,
+    CONF_ROOM_MANUAL_CREDIT_ENTITY,
     CONF_ROOM_MOP_REQUIRED,
     CONF_ROOM_NAME,
     CONF_ROOM_REQUIRE_ESTIMATED_SEGMENT,
@@ -98,6 +99,7 @@ ROOM_SCHEMA = vol.Schema(
             default=DEFAULT_ROOM_MIN_ESTIMATED_DWELL,
         ): cv.positive_int,
         vol.Optional(CONF_ROOM_REQUIRE_ESTIMATED_SEGMENT, default=False): cv.boolean,
+        vol.Optional(CONF_ROOM_MANUAL_CREDIT_ENTITY): cv.entity_id,
     }
 )
 
@@ -215,6 +217,7 @@ def _build_rooms(raw_rooms: Iterable[dict[str, Any]]) -> list[RoomConfig]:
             min_area=raw_room[CONF_ROOM_MIN_AREA],
             min_estimated_dwell=raw_room[CONF_ROOM_MIN_ESTIMATED_DWELL],
             require_estimated_segment=raw_room[CONF_ROOM_REQUIRE_ESTIMATED_SEGMENT],
+            manual_credit_entity=raw_room.get(CONF_ROOM_MANUAL_CREDIT_ENTITY),
         )
         for raw_room in raw_rooms
     ]

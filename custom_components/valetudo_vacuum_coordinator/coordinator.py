@@ -66,6 +66,7 @@ from .logic import (
     build_while_away_messages,
     evaluate_run_success,
     error_contains_any,
+    is_recoverable_navigation_error,
     is_error_clear,
     manual_rooms_to_credit,
     mark_failure,
@@ -86,6 +87,7 @@ _READY_VACUUM_STATES = {"docked", "idle"}
 _BUSY_DOCK_STATES = {"cleaning", "emptying", "pause"}
 _UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
 _UNKNOWN_PERSON_STATES = {None, "", "unknown", "unavailable"}
+_RESTORE_RECONCILE_DELAY_SECONDS = 15
 
 
 class ValetudoVacuumCoordinator:
@@ -116,6 +118,7 @@ class ValetudoVacuumCoordinator:
         self.config = config
 
         self.ledgers: dict[str, RoomLedger] = {room.room_id: RoomLedger() for room in rooms}
+        self.disabled_room_ids: set[str] = set()
         self.paused = False
         self.pause_reason: str | None = None
         self.away_since: str | None = None
@@ -148,6 +151,14 @@ class ValetudoVacuumCoordinator:
             )
         )
         await self._async_reconcile_restored_session()
+        if self.active_run:
+            self._unsubscribers.append(
+                async_call_later(
+                    self.hass,
+                    _RESTORE_RECONCILE_DELAY_SECONDS,
+                    self._handle_delayed_restore_reconcile,
+                )
+            )
         if self._all_people_away() and self.away_since is None:
             self.away_since = self._latest_person_away_since()
             await self._async_save_store()
@@ -205,15 +216,23 @@ class ValetudoVacuumCoordinator:
         """Return rooms not yet consumed in the current session."""
         attempted = set(self.session.attempted_room_ids if self.session else [])
         auto_clean_day = self._current_auto_clean_day()
-        return [
+        pending = [
             room
             for room in self.rooms
-            if room.enabled
+            if self._room_auto_clean_enabled(room)
             and room.room_id not in attempted
             and not room_auto_cleaned_on(
                 self.ledgers.get(room.room_id, RoomLedger()), auto_clean_day
             )
         ]
+        pending_ids = {room.room_id for room in pending}
+        retry_room_ids = self.session.retry_room_ids if self.session else []
+        for room_id in retry_room_ids:
+            room = self.room_by_id.get(room_id)
+            if room and self._room_auto_clean_enabled(room) and room.room_id not in pending_ids:
+                pending.append(room)
+                pending_ids.add(room.room_id)
+        return pending
 
     @property
     def while_away_cleaned_messages(self) -> list[str]:
@@ -317,10 +336,37 @@ class ValetudoVacuumCoordinator:
         await self._async_save_store()
         self._notify_listeners()
 
+    def is_room_auto_clean_disabled(self, room_id: str) -> bool:
+        """Return whether a room is disabled for away auto-clean sessions."""
+        self._require_room(room_id)
+        return room_id in self.disabled_room_ids
+
+    async def async_set_room_auto_clean_disabled(self, room_id: str, disabled: bool) -> None:
+        """Enable or disable one room for automatic away clean selection."""
+        self._require_room(room_id)
+        was_disabled = room_id in self.disabled_room_ids
+        if disabled == was_disabled:
+            return
+
+        if disabled:
+            self.disabled_room_ids.add(room_id)
+        else:
+            self.disabled_room_ids.discard(room_id)
+
+        await self._async_save_store()
+        self._notify_listeners()
+        if self.session and self.session.active and not self.active_run:
+            await self._async_maybe_start_next_room()
+
     @callback
     def _handle_state_change_event(self, event: Event) -> None:
         """Schedule handling for HA state changes."""
         self.hass.async_create_task(self._async_handle_state_change_event(event))
+
+    @callback
+    def _handle_delayed_restore_reconcile(self, _now: datetime) -> None:
+        """Re-check restored active runs after HA entities have settled."""
+        self.hass.async_create_task(self._async_reconcile_restored_session())
 
     async def _async_handle_state_change_event(self, event: Event) -> None:
         """Handle a monitored Home Assistant state change."""
@@ -330,6 +376,8 @@ class ValetudoVacuumCoordinator:
             return
 
         now = dt_util.utcnow()
+        if self._restore_active_run_observations(now):
+            await self._async_save_store()
         if entity_id in self.people_entities:
             await self._async_handle_presence_change()
             return
@@ -346,26 +394,18 @@ class ValetudoVacuumCoordinator:
         if entity_id == self.config.get(CONF_BATTERY_ENTITY):
             await self._async_maybe_start_next_room()
             return
-        if entity_id == self.config.get(CONF_ERROR_ENTITY) and not is_error_clear(new_state.state):
+        if entity_id == self.config.get(CONF_ERROR_ENTITY):
+            if is_error_clear(new_state.state):
+                if await self._async_recover_pending_room_failure_if_ready():
+                    await self._async_maybe_start_next_room()
+                self._notify_listeners()
+                return
+
             self.last_error = new_state.state
             if self.active_run:
-                needs_help = self._error_needs_help(new_state.state)
-                await self._async_finish_active_run(
-                    success_override=False,
-                    failure_reason=new_state.state,
-                    continue_session=False,
-                )
-                await self._async_return_to_dock_or_stop_resumable(new_state.state)
-                if needs_help and self.session:
-                    self.session.active = False
-                    self.session.terminal_reason = "needs_help"
-                    self.session.terminal_message = new_state.state
-                    self.session.needs_help = True
-                    await self._async_save_store()
-                    await self._async_maybe_send_auto_clean_summary()
-                else:
-                    await self._async_maybe_start_next_room()
-            self._notify_listeners()
+                await self._async_handle_active_run_error(new_state.state)
+            else:
+                self._notify_listeners()
             return
         if entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY):
             await self._async_maybe_start_next_room()
@@ -453,6 +493,9 @@ class ValetudoVacuumCoordinator:
             elif self.manual_run:
                 await self._async_finish_manual_run(now)
             else:
+                if await self._async_recover_pending_room_failure_if_ready():
+                    await self._async_maybe_start_next_room()
+                    return
                 await self._async_maybe_send_auto_clean_summary()
                 await self._async_maybe_start_next_room()
 
@@ -483,6 +526,9 @@ class ValetudoVacuumCoordinator:
         if self.paused or not self.session or not self.session.active or self.active_run:
             self._notify_listeners()
             return
+        if self.session.pending_recovery_room_id and not await self._async_recover_pending_room_failure_if_ready():
+            self._notify_listeners()
+            return
         if not self._all_people_away():
             await self.async_cancel_session("Tracked person arrived home")
             return
@@ -491,12 +537,13 @@ class ValetudoVacuumCoordinator:
             return
 
         selection, skipped = select_next_room(
-            self.rooms,
+            self._auto_clean_rooms(),
             self.ledgers,
             set(self.session.attempted_room_ids),
             self._resource_state(),
             bool(self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)),
             self._current_auto_clean_day(),
+            self.session.retry_room_ids,
         )
 
         for room, reason in skipped:
@@ -527,6 +574,8 @@ class ValetudoVacuumCoordinator:
         if not self.session:
             return
 
+        if room.room_id in self.session.retry_room_ids:
+            self.session.mark_retry_started(room.room_id)
         self.session.mark_attempted(room.room_id)
         self.session.active_room_id = room.room_id
         self.active_run = ActiveRun(
@@ -653,10 +702,80 @@ class ValetudoVacuumCoordinator:
         else:
             await self._async_maybe_send_auto_clean_summary()
 
+    async def _async_handle_active_run_error(self, error: str) -> None:
+        """Finalize an errored active room and decide whether it can recover after docking."""
+        run = self.active_run
+        room_id = run.room_id if run else None
+        can_recover_after_dock = bool(
+            self.session
+            and room_id
+            and is_recoverable_navigation_error(error)
+            and self.session.can_retry_room(room_id)
+        )
+        needs_help = self._error_needs_help(error)
+
+        await self._async_finish_active_run(
+            success_override=False,
+            failure_reason=error,
+            continue_session=False,
+        )
+        if can_recover_after_dock and self.session and room_id:
+            self.session.begin_recovering(room_id, error)
+            await self._async_return_to_dock_or_stop_resumable(error)
+            await self._async_save_store()
+            self._notify_listeners()
+            return
+
+        await self._async_return_to_dock_or_stop_resumable(error)
+        if needs_help and self.session:
+            self.session.active = False
+            self.session.terminal_reason = "needs_help"
+            self.session.terminal_message = error
+            self.session.needs_help = True
+            await self._async_save_store()
+            await self._async_maybe_send_auto_clean_summary()
+        else:
+            await self._async_maybe_start_next_room()
+
+    async def _async_recover_pending_room_failure_if_ready(self) -> bool:
+        """Clear a pending recoverable room failure once the robot has safely docked."""
+        if not self.session or not self.session.pending_recovery_room_id:
+            return False
+        if self.active_run or not self.session.active:
+            return False
+        if not self._vacuum_successfully_docked() or not is_error_clear(self.error_state):
+            return False
+
+        room_id = self.session.pending_recovery_room_id
+        reason = self.session.pending_recovery_reason
+        if room_id not in self.room_by_id:
+            self.session.pending_recovery_room_id = None
+            self.session.pending_recovery_reason = None
+            await self._async_save_store()
+            self._notify_listeners()
+            return True
+
+        self.session.resolve_recoverable_failure(room_id)
+        ledger = self.ledgers.setdefault(room_id, RoomLedger())
+        if reason is None or ledger.last_failed_reason == reason:
+            ledger.last_failed_reason = None
+        self._remove_while_away_failure(room_id, reason)
+        _LOGGER.info(
+            "Recovered %s room %s after %s; queued it for one retry",
+            self.name,
+            room_id,
+            reason or "recoverable failure",
+        )
+        await self._async_save_store()
+        self._notify_listeners()
+        return True
+
     async def _async_reconcile_restored_session(self) -> None:
         """Resume or finalize a persisted auto-clean session after Home Assistant restarts."""
         if not self.session:
             return
+        if self._restore_active_run_observations(dt_util.utcnow()):
+            await self._async_save_store()
         if self.active_run and self._status_flag() != "resumable":
             vacuum_state = normalize_state(self._state(self.vacuum_entity))
             if vacuum_state in _READY_VACUUM_STATES:
@@ -666,6 +785,30 @@ class ValetudoVacuumCoordinator:
             await self._async_maybe_start_next_room()
             return
         await self._async_maybe_send_auto_clean_summary()
+
+    def _restore_active_run_observations(self, now: datetime) -> bool:
+        """Seed active-run observations from current HA state after a restart."""
+        if not self.active_run:
+            return False
+
+        changed = False
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state in {"cleaning", "returning"} and not self.active_run.observed_cleaning:
+            self.active_run.observed_cleaning = True
+            changed = True
+
+        if self._status_flag() == "segment" and not self.active_run.observed_segment_cleaning:
+            self.active_run.observed_segment_cleaning = True
+            changed = True
+
+        estimated_room_id = self._room_id_from_estimated(
+            self._state(self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY))
+        )
+        if estimated_room_id and self.active_run.last_estimated_room_id is None:
+            self.active_run.observe_estimated_room(estimated_room_id, now)
+            changed = True
+
+        return changed
 
     async def _async_maybe_send_auto_clean_summary(self) -> None:
         """Send the one final auto-clean notification when the session is terminal."""
@@ -685,7 +828,7 @@ class ValetudoVacuumCoordinator:
             terminal_message=self.session.terminal_message,
             needs_help=self.session.needs_help,
             all_rooms_cleaned=self._all_enabled_rooms_completed(),
-            total_room_count=len([room for room in self.rooms if room.enabled]),
+            total_room_count=len(self._auto_clean_rooms()),
         )
         self.session.notification_sent = True
         if summary:
@@ -779,7 +922,15 @@ class ValetudoVacuumCoordinator:
         if not self.session:
             return False
         completed = set(self.session.completed_room_ids)
-        return all(room.room_id in completed for room in self.rooms if room.enabled)
+        return all(room.room_id in completed for room in self._auto_clean_rooms())
+
+    def _auto_clean_rooms(self) -> list[RoomConfig]:
+        """Return rooms currently eligible for automatic away cleaning."""
+        return [room for room in self.rooms if self._room_auto_clean_enabled(room)]
+
+    def _room_auto_clean_enabled(self, room: RoomConfig) -> bool:
+        """Return whether a configured room is enabled for automatic away cleaning."""
+        return room.enabled and room.room_id not in self.disabled_room_ids
 
     def _first_session_block_reason(self) -> str | None:
         """Return the first recorded room skip/failure reason for a terminal session."""
@@ -795,6 +946,10 @@ class ValetudoVacuumCoordinator:
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
         return vacuum_state in _READY_VACUUM_STATES and self._status_flag() != "resumable"
 
+    def _vacuum_successfully_docked(self) -> bool:
+        """Return whether the robot reached the dock and is no longer resumable."""
+        return normalize_state(self._state(self.vacuum_entity)) == "docked" and self._status_flag() != "resumable"
+
     def _error_needs_help(self, error: str | None) -> bool:
         """Return whether an error should stop auto-clean and notify for help."""
         normalized = normalize_state(error)
@@ -809,10 +964,9 @@ class ValetudoVacuumCoordinator:
             return True
         if self._error_is_mop_resource(normalized):
             return False
-        return not any(
-            keyword in lowered
-            for keyword in ("cannot reach", "cannot arrive", "cannot navigate")
-        )
+        if is_recoverable_navigation_error(normalized):
+            return False
+        return True
 
     def _error_is_mop_resource(self, error: str | None) -> bool:
         """Return whether an error is a recoverable mop resource issue."""
@@ -830,6 +984,7 @@ class ValetudoVacuumCoordinator:
             start_area=parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
             start_time=parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
             manual=True,
+            manual_credit_room_ids=self._manual_credit_room_ids(),
         )
         if self._status_flag() == "segment":
             self.manual_run.observed_segment_cleaning = True
@@ -856,6 +1011,16 @@ class ValetudoVacuumCoordinator:
         if self.session and not self.session.active and not self.active_run:
             self.session = None
 
+    def _manual_credit_room_ids(self) -> list[str] | None:
+        """Return selected manual-credit room IDs, or None when unrestricted."""
+        selected_room_ids = [
+            room.room_id
+            for room in self.rooms
+            if room.manual_credit_entity
+            and normalize_state(self._state(room.manual_credit_entity)) == "on"
+        ]
+        return selected_room_ids or None
+
     def _clear_while_away_after_manual_clean_started(self) -> bool:
         """Clear retained away outcome details when a manual clean starts."""
         changed = False
@@ -881,6 +1046,22 @@ class ValetudoVacuumCoordinator:
             WhileAwayOutcome(day=day, room_id=room_id, kind=kind, reason=reason)
         )
         self._schedule_next_day_timer_if_needed()
+
+    def _remove_while_away_failure(self, room_id: str, reason: str | None) -> None:
+        """Remove a failed retained outcome after a recoverable failure clears."""
+        retained = [
+            outcome
+            for outcome in self.while_away_outcomes
+            if not (
+                outcome.kind == "failed"
+                and outcome.room_id == room_id
+                and (reason is None or outcome.reason == reason)
+            )
+        ]
+        if len(retained) != len(self.while_away_outcomes):
+            self.while_away_outcomes = retained
+            if not retained:
+                self._cancel_next_day_timer()
 
     def _prune_while_away_outcomes_for_day(self, day: str) -> bool:
         """Keep only retained outcomes for the requested local day."""
@@ -1117,6 +1298,14 @@ class ValetudoVacuumCoordinator:
         if isinstance(stored_rooms, dict):
             for room in self.rooms:
                 self.ledgers[room.room_id] = RoomLedger.from_dict(stored_rooms.get(room.room_id))
+        stored_disabled_room_ids = stored.get("disabled_room_ids", [])
+        if isinstance(stored_disabled_room_ids, list):
+            configured_room_ids = set(self.room_by_id)
+            self.disabled_room_ids = {
+                room_id
+                for room_id in (str(item) for item in stored_disabled_room_ids)
+                if room_id in configured_room_ids
+            }
 
     async def _async_save_store(self) -> None:
         """Persist pause state and room ledgers."""
@@ -1130,6 +1319,7 @@ class ValetudoVacuumCoordinator:
                 "manual_run": self.manual_run.to_dict() if self.manual_run else None,
                 "settings_snapshot": self.settings_snapshot.to_dict() if self.settings_snapshot else None,
                 "while_away_outcomes": [outcome.to_dict() for outcome in self.while_away_outcomes],
+                "disabled_room_ids": sorted(self.disabled_room_ids),
                 "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
             }
         )
