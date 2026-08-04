@@ -42,6 +42,11 @@ RECOVERABLE_NAVIGATION_FAILURE_KEYWORDS = (
     "stuck on ramp",
 )
 
+LOW_BATTERY_ERROR_KEYWORDS = (
+    "low battery",
+    "battery low",
+)
+
 
 def schedule_hass_task(hass: Any, coroutine: Any) -> None:
     """Schedule a coroutine from either the event loop or a timer thread."""
@@ -146,6 +151,7 @@ class ActiveRun:
     manual: bool = False
     vacuum_only: bool = False
     cancelled: bool = False
+    command_published: bool = False
     observed_cleaning: bool = False
     observed_segment_cleaning: bool = False
     last_estimated_room_id: str | None = None
@@ -186,6 +192,7 @@ class ActiveRun:
             manual=bool(data.get("manual", False)),
             vacuum_only=bool(data.get("vacuum_only", False)),
             cancelled=bool(data.get("cancelled", False)),
+            command_published=bool(data.get("command_published", True)),
             observed_cleaning=bool(data.get("observed_cleaning", False)),
             observed_segment_cleaning=bool(data.get("observed_segment_cleaning", False)),
             last_estimated_room_id=data.get("last_estimated_room_id"),
@@ -213,6 +220,7 @@ class ActiveRun:
             "manual": self.manual,
             "vacuum_only": self.vacuum_only,
             "cancelled": self.cancelled,
+            "command_published": self.command_published,
             "observed_cleaning": self.observed_cleaning,
             "observed_segment_cleaning": self.observed_segment_cleaning,
             "last_estimated_room_id": self.last_estimated_room_id,
@@ -332,9 +340,11 @@ class SessionState:
     skipped_room_reasons: dict[str, str] = field(default_factory=dict)
     failed_room_reasons: dict[str, str] = field(default_factory=dict)
     retry_room_ids: list[str] = field(default_factory=list)
+    priority_retry_room_ids: list[str] = field(default_factory=list)
     retried_room_ids: list[str] = field(default_factory=list)
     pending_recovery_room_id: str | None = None
     pending_recovery_reason: str | None = None
+    pending_recovery_priority: bool = False
     active_room_id: str | None = None
     terminal_reason: str | None = None
     terminal_message: str | None = None
@@ -370,35 +380,69 @@ class SessionState:
         if reason:
             self.failed_room_reasons[room_id] = reason
 
-    def begin_recovering(self, room_id: str, reason: str | None) -> None:
+    def begin_recovering(
+        self,
+        room_id: str,
+        reason: str | None,
+        *,
+        priority: bool = False,
+    ) -> None:
         """Track a failed room that can be retried after the robot docks cleanly."""
         self.pending_recovery_room_id = room_id
         self.pending_recovery_reason = reason
+        self.pending_recovery_priority = priority
 
     def can_retry_room(self, room_id: str) -> bool:
         """Return whether the session can retry a recoverable room failure."""
-        return room_id not in self.retried_room_ids and room_id not in self.retry_room_ids
+        return (
+            room_id not in self.retried_room_ids
+            and room_id not in self.retry_room_ids
+            and room_id not in self.priority_retry_room_ids
+        )
 
-    def queue_retry(self, room_id: str) -> None:
-        """Queue a room for one retry at the back of the current session."""
-        if room_id not in self.retry_room_ids and room_id not in self.retried_room_ids:
+    def queue_retry(self, room_id: str, *, priority: bool = False) -> None:
+        """Queue a room for one bounded retry."""
+        if room_id in self.retried_room_ids:
+            return
+        if priority:
+            if room_id in self.retry_room_ids:
+                self.retry_room_ids.remove(room_id)
+            if room_id not in self.priority_retry_room_ids:
+                self.priority_retry_room_ids.append(room_id)
+            return
+        if room_id not in self.retry_room_ids and room_id not in self.priority_retry_room_ids:
             self.retry_room_ids.append(room_id)
 
     def mark_retry_started(self, room_id: str) -> None:
         """Record that a queued retry has started so it is not retried forever."""
-        if room_id in self.retry_room_ids:
-            self.retry_room_ids.remove(room_id)
+        self.discard_retry(room_id)
         if room_id not in self.retried_room_ids:
             self.retried_room_ids.append(room_id)
 
+    def discard_retry(self, room_id: str) -> None:
+        """Remove a queued retry without recording that it started."""
+        if room_id in self.retry_room_ids:
+            self.retry_room_ids.remove(room_id)
+        if room_id in self.priority_retry_room_ids:
+            self.priority_retry_room_ids.remove(room_id)
+
     def resolve_recoverable_failure(self, room_id: str, *, queue_retry: bool = True) -> None:
-        """Clear a recovered failure and optionally queue the room for retry."""
-        self._remove_room_issue(room_id)
+        """Clear recovery waiting state and optionally queue the room for retry."""
+        priority = (
+            self.pending_recovery_priority
+            if self.pending_recovery_room_id == room_id
+            else False
+        )
         if queue_retry:
-            self.queue_retry(room_id)
+            self.queue_retry(room_id, priority=priority)
         if self.pending_recovery_room_id == room_id:
             self.pending_recovery_room_id = None
             self.pending_recovery_reason = None
+            self.pending_recovery_priority = False
+
+    def clear_room_issue(self, room_id: str) -> None:
+        """Clear failure and skip bookkeeping after a retry is published."""
+        self._remove_room_issue(room_id)
 
     def _remove_room_issue(self, room_id: str) -> None:
         """Remove failed/skipped issue bookkeeping for a room."""
@@ -410,6 +454,8 @@ class SessionState:
         self.skipped_room_reasons.pop(room_id, None)
         if room_id in self.retry_room_ids:
             self.retry_room_ids.remove(room_id)
+        if room_id in self.priority_retry_room_ids:
+            self.priority_retry_room_ids.remove(room_id)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SessionState | None":
@@ -428,9 +474,11 @@ class SessionState:
             skipped_room_reasons=dict(data.get("skipped_room_reasons") or {}),
             failed_room_reasons=dict(data.get("failed_room_reasons") or {}),
             retry_room_ids=list(data.get("retry_room_ids") or []),
+            priority_retry_room_ids=list(data.get("priority_retry_room_ids") or []),
             retried_room_ids=list(data.get("retried_room_ids") or []),
             pending_recovery_room_id=data.get("pending_recovery_room_id"),
             pending_recovery_reason=data.get("pending_recovery_reason"),
+            pending_recovery_priority=bool(data.get("pending_recovery_priority", False)),
             active_room_id=data.get("active_room_id"),
             terminal_reason=data.get("terminal_reason"),
             terminal_message=data.get("terminal_message"),
@@ -452,9 +500,11 @@ class SessionState:
             "skipped_room_reasons": self.skipped_room_reasons,
             "failed_room_reasons": self.failed_room_reasons,
             "retry_room_ids": self.retry_room_ids,
+            "priority_retry_room_ids": self.priority_retry_room_ids,
             "retried_room_ids": self.retried_room_ids,
             "pending_recovery_room_id": self.pending_recovery_room_id,
             "pending_recovery_reason": self.pending_recovery_reason,
+            "pending_recovery_priority": self.pending_recovery_priority,
             "active_room_id": self.active_room_id,
             "terminal_reason": self.terminal_reason,
             "terminal_message": self.terminal_message,
@@ -718,6 +768,11 @@ def is_recoverable_navigation_error(error: str | None) -> bool:
     )
 
 
+def is_low_battery_error(error: str | None) -> bool:
+    """Return whether an error is a temporary low-battery interruption."""
+    return error_contains_any(error, LOW_BATTERY_ERROR_KEYWORDS)
+
+
 def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
     """Return the reason a mop-required room cannot run, if any."""
     if not room.mop_required:
@@ -759,15 +814,28 @@ def select_next_room(
     allow_vacuum_only_when_mop_blocked: bool,
     auto_clean_day: str | None = None,
     retry_room_ids: list[str] | None = None,
+    priority_retry_room_ids: list[str] | None = None,
 ) -> tuple[RoomSelection | None, list[tuple[RoomConfig, str]]]:
     """Select the next eligible room and return any skipped rooms with reasons."""
     skipped: list[tuple[RoomConfig, str]] = []
     room_by_id = {room.room_id: room for room in rooms}
 
-    pending_rooms = [
+    priority_rooms = [
+        room_by_id[room_id]
+        for room_id in priority_retry_room_ids or []
+        if room_id in room_by_id
+        and room_by_id[room_id].enabled
+        and not room_auto_cleaned_on(
+            ledger.get(room_id, RoomLedger()),
+            auto_clean_day,
+        )
+    ]
+    priority_room_ids = {room.room_id for room in priority_rooms}
+    pending_rooms = priority_rooms + [
         room
         for room in sorted((item for item in rooms if item.enabled), key=lambda item: room_sort_key(item, ledger))
         if room.room_id not in attempted_room_ids
+        and room.room_id not in priority_room_ids
         and not room_auto_cleaned_on(ledger.get(room.room_id, RoomLedger()), auto_clean_day)
     ]
     pending_room_ids = {room.room_id for room in pending_rooms}

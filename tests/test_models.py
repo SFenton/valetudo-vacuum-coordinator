@@ -322,24 +322,78 @@ def test_retry_rooms_are_selected_after_unattempted_rooms():
     assert skipped == []
 
 
-def test_session_recoverable_failure_clear_queues_one_retry():
+def test_priority_retry_rooms_are_selected_before_unattempted_rooms():
+    rooms = [
+        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
+    ]
+
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        {"room_one"},
+        logic.ResourceState(),
+        allow_vacuum_only_when_mop_blocked=False,
+        priority_retry_room_ids=["room_one"],
+    )
+
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert skipped == []
+
+
+def test_session_recovery_queues_retry_without_clearing_failure():
     session = logic.SessionState(session_id="session", started_at=logic.utcnow_iso())
     session.mark_failed("room_one", "Unknown error 95")
     session.begin_recovering("room_one", "Unknown error 95")
 
     session.resolve_recoverable_failure("room_one")
 
-    assert session.failed_room_ids == []
-    assert session.failed_room_reasons == {}
+    assert session.failed_room_ids == ["room_one"]
+    assert session.failed_room_reasons == {"room_one": "Unknown error 95"}
     assert session.pending_recovery_room_id is None
     assert session.pending_recovery_reason is None
     assert session.retry_room_ids == ["room_one"]
 
     session.mark_retry_started("room_one")
+    session.clear_room_issue("room_one")
 
     assert session.can_retry_room("room_one") is False
     assert session.retry_room_ids == []
     assert session.retried_room_ids == ["room_one"]
+    assert session.failed_room_ids == []
+
+
+def test_session_priority_recovery_round_trips_and_queues_first():
+    session = logic.SessionState(session_id="session", started_at=logic.utcnow_iso())
+    session.mark_failed("room_one", "Low battery")
+    session.begin_recovering("room_one", "Low battery", priority=True)
+
+    restored = logic.SessionState.from_dict(session.to_dict())
+
+    assert restored is not None
+    assert restored.pending_recovery_room_id == "room_one"
+    assert restored.pending_recovery_priority is True
+
+    restored.resolve_recoverable_failure("room_one")
+
+    assert restored.failed_room_ids == ["room_one"]
+    assert restored.pending_recovery_room_id is None
+    assert restored.pending_recovery_priority is False
+    assert restored.priority_retry_room_ids == ["room_one"]
+
+    restored.mark_retry_started("room_one")
+    restored.clear_room_issue("room_one")
+
+    assert restored.priority_retry_room_ids == []
+    assert restored.retried_room_ids == ["room_one"]
+    assert restored.failed_room_ids == []
+
+
+def test_low_battery_error_is_resumable_interruption():
+    assert logic.is_low_battery_error("Low battery") is True
+    assert logic.is_low_battery_error("Battery low") is True
+    assert logic.is_low_battery_error("No error") is False
 
 
 def test_intervention_navigation_error_blocks_pending_rooms():
@@ -541,6 +595,26 @@ def test_manual_rooms_to_credit_respects_selected_room_snapshot():
     credited = logic.manual_rooms_to_credit([room_one, room_two], run)
 
     assert [room.room_id for room in credited] == ["room_two"]
+
+
+def test_active_run_dispatch_phase_round_trips_with_legacy_default():
+    pending = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        command_published=False,
+    )
+
+    restored_pending = logic.ActiveRun.from_dict(pending.to_dict())
+    legacy = pending.to_dict()
+    legacy.pop("command_published")
+    restored_legacy = logic.ActiveRun.from_dict(legacy)
+
+    assert restored_pending is not None
+    assert restored_pending.command_published is False
+    assert restored_legacy is not None
+    assert restored_legacy.command_published is True
 
 
 def test_mark_success_updates_attempted_and_counts():

@@ -29,6 +29,7 @@ valetudo_vacuum_coordinator:
   status_flag_entity: sensor.valetudo_robot_status_flag
   dock_status_entity: sensor.valetudo_robot_dock_status
   error_entity: sensor.valetudo_robot_error
+  battery_entity: sensor.valetudo_robot_battery
   current_area_entity: sensor.valetudo_robot_current_statistics_area
   current_time_entity: sensor.valetudo_robot_current_statistics_time
   estimated_segment_entity: sensor.valetudo_robot_estimated_segment
@@ -80,7 +81,9 @@ Set `notify_service` to enable one final summary notification per away auto-clea
 
 ## Notes
 
-Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration also uses the Status Flag, Dock Status, Error, Current Statistics, Estimated Segment, and optional Dock Component sensors.
+Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration can also use the Status Flag, Dock Status, Error, Battery, Current Statistics, Estimated Segment, and optional Dock Component sensors.
+
+Low-battery recovery requires `battery_entity`. The coordinator immediately sends a blocking `vacuum.stop` to cancel Valetudo's native task, returns the robot to its dock when needed, and waits for a clear error plus `min_battery`. Keep `min_battery` above the robot firmware's native auto-resume threshold; the default is 55%. The coordinator then republishes the same room's segment once as a priority retry without using `vacuum.start` or waiting for a native resumable task. If that room hits low battery again, the failure remains recorded; the coordinator still cancels, docks, and charges the robot before continuing with the remaining rooms.
 
 Manual clean tracking credits rooms from Valetudo estimated-segment dwell. If a room has `manual_credit_entity`, a manual run snapshots selected rooms at start and only credits selected rooms that were also observed long enough. This keeps transit segments from being marked clean when a Home Assistant dashboard launches a selected-room run.
 

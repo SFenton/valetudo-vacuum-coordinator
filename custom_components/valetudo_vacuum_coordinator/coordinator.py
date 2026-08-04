@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import json
@@ -64,13 +65,16 @@ from .logic import (
     WhileAwayOutcome,
     build_auto_clean_summary,
     build_while_away_messages,
+    cleaning_block_reason,
     evaluate_run_success,
     error_contains_any,
+    is_low_battery_error,
     is_recoverable_navigation_error,
     is_error_clear,
     manual_rooms_to_credit,
     mark_failure,
     mark_success,
+    mop_block_reason,
     no_selection_terminal_reason,
     normalize_state,
     parse_datetime,
@@ -88,6 +92,8 @@ _BUSY_DOCK_STATES = {"cleaning", "emptying", "pause"}
 _UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
 _UNKNOWN_PERSON_STATES = {None, "", "unknown", "unavailable"}
 _RESTORE_RECONCILE_DELAY_SECONDS = 15
+_TERMINAL_CLEANUP_RETRY_SECONDS = 30
+_MAX_TERMINAL_CLEANUP_RETRIES = 3
 
 
 class ValetudoVacuumCoordinator:
@@ -133,6 +139,11 @@ class ValetudoVacuumCoordinator:
         self._unsubscribers: list[Callable[[], None]] = []
         self._away_timer_cancel: Callable[[], None] | None = None
         self._next_day_timer_cancel: Callable[[], None] | None = None
+        self._terminal_cleanup_retry_cancel: Callable[[], None] | None = None
+        self._terminal_cleanup_retry_attempts = 0
+        self._event_lock = asyncio.Lock()
+        self._active_run_restored = False
+        self._restored_dispatch_intent_deadline: datetime | None = None
         self._store = Store(hass, STORE_VERSION, f"{STORE_KEY}.{self.coordinator_id}")
 
     async def async_setup(self) -> None:
@@ -150,7 +161,8 @@ class ValetudoVacuumCoordinator:
                 self._handle_state_change_event,
             )
         )
-        await self._async_reconcile_restored_session()
+        async with self._event_lock:
+            await self._async_reconcile_restored_session()
         if self.active_run:
             self._unsubscribers.append(
                 async_call_later(
@@ -200,7 +212,7 @@ class ValetudoVacuumCoordinator:
         """Return whether an away auto-clean session is active or pending summary."""
         if not self.session:
             return False
-        if self.session.notification_sent:
+        if self.session.notification_sent and self.settings_snapshot is None:
             return False
         return bool(self.session.active or self.active_run or self.session.terminal_reason)
 
@@ -216,16 +228,35 @@ class ValetudoVacuumCoordinator:
         """Return rooms not yet consumed in the current session."""
         attempted = set(self.session.attempted_room_ids if self.session else [])
         auto_clean_day = self._current_auto_clean_day()
-        pending = [
+        pending: list[RoomConfig] = []
+        pending_ids: set[str] = set()
+
+        if self.session and self.session.pending_recovery_room_id:
+            room = self.room_by_id.get(self.session.pending_recovery_room_id)
+            if room and self._room_auto_clean_enabled(room):
+                pending.append(room)
+                pending_ids.add(room.room_id)
+
+        priority_retry_room_ids = (
+            self.session.priority_retry_room_ids if self.session else []
+        )
+        for room_id in priority_retry_room_ids:
+            room = self.room_by_id.get(room_id)
+            if room and self._room_auto_clean_enabled(room) and room.room_id not in pending_ids:
+                pending.append(room)
+                pending_ids.add(room.room_id)
+
+        pending.extend(
             room
             for room in self.rooms
             if self._room_auto_clean_enabled(room)
             and room.room_id not in attempted
+            and room.room_id not in pending_ids
             and not room_auto_cleaned_on(
                 self.ledgers.get(room.room_id, RoomLedger()), auto_clean_day
             )
-        ]
-        pending_ids = {room.room_id for room in pending}
+        )
+        pending_ids.update(room.room_id for room in pending)
         retry_room_ids = self.session.retry_room_ids if self.session else []
         for room_id in retry_room_ids:
             room = self.room_by_id.get(room_id)
@@ -261,6 +292,11 @@ class ValetudoVacuumCoordinator:
 
     async def async_start_session(self, reason: str = "auto") -> None:
         """Start a new away cleaning session if possible."""
+        async with self._event_lock:
+            await self._async_start_session(reason)
+
+    async def _async_start_session(self, reason: str) -> None:
+        """Start a new away cleaning session while mutations are serialized."""
         if self.paused:
             _LOGGER.info("Not starting %s because coordinator is paused", self.name)
             return
@@ -271,6 +307,8 @@ class ValetudoVacuumCoordinator:
             await self._async_maybe_start_next_room()
             return
 
+        self._cancel_terminal_cleanup_retry()
+        self._terminal_cleanup_retry_attempts = 0
         self.session = SessionState(session_id=utcnow_iso(), started_at=utcnow_iso())
         _LOGGER.info("Starting Valetudo away-cleaning session %s (%s)", self.session.session_id, reason)
         await self._async_prepare_auto_clean_settings()
@@ -280,13 +318,24 @@ class ValetudoVacuumCoordinator:
 
     async def async_cancel_session(self, reason: str) -> None:
         """Cancel the active away session and active run."""
+        async with self._event_lock:
+            await self._async_cancel_session(reason)
+
+    async def _async_cancel_session(self, reason: str) -> None:
+        """Cancel the active away session while mutations are serialized."""
         had_active_session = bool(self.session and self.session.active)
         had_active_run = self.active_run is not None
+        low_battery_task_already_cancelled = self._has_cancelled_low_battery_failure()
 
         if self.session:
             self.session.cancelled = True
             self.session.active = False
             self.session.active_room_id = None
+            self.session.pending_recovery_room_id = None
+            self.session.pending_recovery_reason = None
+            self.session.pending_recovery_priority = False
+            self.session.retry_room_ids = []
+            self.session.priority_retry_room_ids = []
             self.session.terminal_reason = (
                 "returned_home" if reason == "Tracked person arrived home" else "cancelled"
             )
@@ -300,20 +349,47 @@ class ValetudoVacuumCoordinator:
                 if self.session:
                     self.session.mark_failed(self.active_run.room_id, reason)
             self.active_run = None
+            self._active_run_restored = False
 
-        if had_active_session or had_active_run:
-            await self._async_return_to_dock_or_stop_resumable(reason)
+        skip_duplicate_stop = bool(
+            not had_active_run
+            and low_battery_task_already_cancelled
+            and normalize_state(self._state(self.vacuum_entity)) in _READY_VACUUM_STATES
+            and self._status_flag() != "resumable"
+        )
+        if (had_active_session or had_active_run) and not skip_duplicate_stop:
+            try:
+                await self._async_return_to_dock_or_stop_resumable(
+                    reason,
+                    command_may_be_pending=had_active_run,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "Failed to stop %s while cancelling session",
+                    self.vacuum_entity,
+                )
+                if self.session:
+                    self.session.terminal_reason = "needs_help"
+                    self.session.terminal_message = (
+                        "Vacuum command may still be active after cancellation failed"
+                    )
+                    self.session.needs_help = True
         await self._async_save_store()
         self._notify_listeners()
         await self._async_maybe_send_auto_clean_summary()
 
     async def async_set_paused(self, paused: bool, reason: str | None = None) -> None:
         """Pause or resume automatic cleaning behavior."""
+        async with self._event_lock:
+            await self._async_set_paused(paused, reason)
+
+    async def _async_set_paused(self, paused: bool, reason: str | None) -> None:
+        """Update pause state while mutations are serialized."""
         self.paused = paused
         self.pause_reason = reason if paused else None
         self._cancel_away_timer()
         if paused:
-            await self.async_cancel_session(reason or "paused")
+            await self._async_cancel_session(reason or "paused")
         else:
             if self._all_people_away() and self.away_since is None:
                 self.away_since = self._latest_person_away_since()
@@ -323,18 +399,20 @@ class ValetudoVacuumCoordinator:
 
     async def async_mark_room_cleaned(self, room_id: str, *, mop: bool, vacuum: bool = True) -> None:
         """Manually mark a room as cleaned."""
-        self._require_room(room_id)
-        ledger = self.ledgers.setdefault(room_id, RoomLedger())
-        mark_success(ledger, utcnow_iso(), mop=mop, vacuum=vacuum)
-        await self._async_save_store()
-        self._notify_listeners()
+        async with self._event_lock:
+            self._require_room(room_id)
+            ledger = self.ledgers.setdefault(room_id, RoomLedger())
+            mark_success(ledger, utcnow_iso(), mop=mop, vacuum=vacuum)
+            await self._async_save_store()
+            self._notify_listeners()
 
     async def async_reset_room(self, room_id: str) -> None:
         """Reset one room ledger."""
-        self._require_room(room_id)
-        self.ledgers[room_id] = RoomLedger()
-        await self._async_save_store()
-        self._notify_listeners()
+        async with self._event_lock:
+            self._require_room(room_id)
+            self.ledgers[room_id] = RoomLedger()
+            await self._async_save_store()
+            self._notify_listeners()
 
     def is_room_auto_clean_disabled(self, room_id: str) -> bool:
         """Return whether a room is disabled for away auto-clean sessions."""
@@ -343,6 +421,15 @@ class ValetudoVacuumCoordinator:
 
     async def async_set_room_auto_clean_disabled(self, room_id: str, disabled: bool) -> None:
         """Enable or disable one room for automatic away clean selection."""
+        async with self._event_lock:
+            await self._async_set_room_auto_clean_disabled(room_id, disabled)
+
+    async def _async_set_room_auto_clean_disabled(
+        self,
+        room_id: str,
+        disabled: bool,
+    ) -> None:
+        """Update one room's auto-clean eligibility while mutations are serialized."""
         self._require_room(room_id)
         was_disabled = room_id in self.disabled_room_ids
         if disabled == was_disabled:
@@ -366,10 +453,20 @@ class ValetudoVacuumCoordinator:
     @callback
     def _handle_delayed_restore_reconcile(self, _now: datetime) -> None:
         """Re-check restored active runs after HA entities have settled."""
-        self.hass.async_create_task(self._async_reconcile_restored_session())
+        self.hass.async_create_task(self._async_reconcile_restored_session_serialized())
+
+    async def _async_reconcile_restored_session_serialized(self) -> None:
+        """Reconcile restored state without racing live entity events."""
+        async with self._event_lock:
+            await self._async_reconcile_restored_session()
 
     async def _async_handle_state_change_event(self, event: Event) -> None:
         """Handle a monitored Home Assistant state change."""
+        async with self._event_lock:
+            await self._async_process_state_change_event(event)
+
+    async def _async_process_state_change_event(self, event: Event) -> None:
+        """Process one monitored state change while event handling is serialized."""
         entity_id = event.data.get("entity_id")
         new_state: State | None = event.data.get("new_state")
         if new_state is None:
@@ -382,33 +479,88 @@ class ValetudoVacuumCoordinator:
             await self._async_handle_presence_change()
             return
 
-        self._observe_active_run(entity_id, new_state, now)
-        self._observe_manual_run(entity_id, new_state, now)
+        observations_changed = self._observe_active_run(entity_id, new_state, now)
+        observations_changed = (
+            self._observe_manual_run(entity_id, new_state, now)
+            or observations_changed
+        )
+        if observations_changed:
+            await self._async_save_store()
+
+        if (
+            entity_id == self.config.get(CONF_ERROR_ENTITY)
+            and not is_error_clear(new_state.state)
+        ):
+            self.last_error = new_state.state
+            if self.active_run:
+                await self._async_handle_active_run_error(new_state.state)
+            else:
+                recovery_room_id, recovery_reason = self._recovering_room_for_error()
+                if recovery_room_id and not (
+                    is_low_battery_error(new_state.state)
+                    and is_low_battery_error(recovery_reason)
+                ):
+                    await self._async_handle_pending_recovery_error(new_state.state)
+                else:
+                    self._notify_listeners()
+            return
+
+        if entity_id in {
+            self.vacuum_entity,
+            self.config.get(CONF_STATUS_FLAG_ENTITY),
+            self.config.get(CONF_DOCK_STATUS_ENTITY),
+            self.config.get(CONF_BATTERY_ENTITY),
+            self.config.get(CONF_ERROR_ENTITY),
+        } and self._active_run_restored:
+            if await self._async_reconcile_restored_active_run():
+                return
 
         if entity_id == self.vacuum_entity:
             await self._async_handle_vacuum_state(new_state.state, now)
             return
         if entity_id == self.config.get(CONF_DOCK_STATUS_ENTITY):
             await self._async_maybe_start_next_room()
+            await self._async_maybe_send_auto_clean_summary()
             return
         if entity_id == self.config.get(CONF_BATTERY_ENTITY):
             await self._async_maybe_start_next_room()
+            await self._async_maybe_send_auto_clean_summary()
             return
         if entity_id == self.config.get(CONF_ERROR_ENTITY):
-            if is_error_clear(new_state.state):
-                if await self._async_recover_pending_room_failure_if_ready():
-                    await self._async_maybe_start_next_room()
-                self._notify_listeners()
+            if (
+                self.active_run
+                and self.active_run.observed_cleaning
+                and normalize_state(self._state(self.vacuum_entity))
+                in _READY_VACUUM_STATES
+            ):
+                await self._async_handle_vacuum_state(
+                    self._state(self.vacuum_entity) or "idle",
+                    now,
+                )
                 return
-
-            self.last_error = new_state.state
-            if self.active_run:
-                await self._async_handle_active_run_error(new_state.state)
-            else:
-                self._notify_listeners()
+            await self._async_maybe_start_next_room()
+            await self._async_maybe_send_auto_clean_summary()
+            self._notify_listeners()
             return
         if entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY):
+            if (
+                self.active_run
+                and self.active_run.observed_cleaning
+                and normalize_state(self._state(self.vacuum_entity))
+                in _READY_VACUUM_STATES
+            ):
+                await self._async_handle_vacuum_state(
+                    self._state(self.vacuum_entity) or "idle",
+                    now,
+                )
+                return
             await self._async_maybe_start_next_room()
+            await self._async_maybe_send_auto_clean_summary()
+            return
+        if entity_id in self._resource_sensor_entities():
+            await self._async_maybe_start_next_room()
+            await self._async_maybe_send_auto_clean_summary()
+            self._notify_listeners()
 
     async def _async_handle_presence_change(self) -> None:
         """React to someone leaving or arriving."""
@@ -422,7 +574,7 @@ class ValetudoVacuumCoordinator:
         self.away_since = None
         self._cancel_away_timer()
         if self.session and self.session.active and self.config.get(CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL):
-            await self.async_cancel_session("Tracked person arrived home")
+            await self._async_cancel_session("Tracked person arrived home")
         else:
             await self._async_save_store()
 
@@ -473,9 +625,21 @@ class ValetudoVacuumCoordinator:
             return
 
         if normalized_state == "cleaning":
+            self._active_run_restored = False
             if self.active_run:
                 self.active_run.observed_cleaning = True
             else:
+                if self.session and (
+                    self.session.active
+                    or not self.session.notification_sent
+                    or self.settings_snapshot is not None
+                ):
+                    _LOGGER.debug(
+                        "Ignoring uncommanded cleaning transition while session %s is retained",
+                        self.session.session_id,
+                    )
+                    await self._async_maybe_send_auto_clean_summary()
+                    return
                 cleared = self._clear_while_away_after_manual_clean_started()
                 if self._manual_tracking_allowed():
                     self._start_manual_run(now)
@@ -488,53 +652,146 @@ class ValetudoVacuumCoordinator:
             self.active_run.observed_cleaning = True
 
         if normalized_state in {"docked", "idle"}:
-            if self.active_run and self._status_flag() != "resumable":
-                await self._async_finish_active_run()
+            if self.active_run:
+                if not self._configured_error_is_available():
+                    return
+                if not is_error_clear(self.error_state):
+                    await self._async_handle_active_run_error(
+                        self.error_state or "Unknown error"
+                    )
+                elif (
+                    not self.config.get(CONF_STATUS_FLAG_ENTITY)
+                    or (
+                        self._configured_status_is_available()
+                        and self._status_flag() != "resumable"
+                    )
+                ):
+                    await self._async_finish_active_run()
             elif self.manual_run:
                 await self._async_finish_manual_run(now)
             else:
-                if await self._async_recover_pending_room_failure_if_ready():
-                    await self._async_maybe_start_next_room()
-                    return
                 await self._async_maybe_send_auto_clean_summary()
                 await self._async_maybe_start_next_room()
 
-    def _observe_active_run(self, entity_id: str, new_state: State, now: datetime) -> None:
+    def _observe_active_run(
+        self,
+        entity_id: str,
+        new_state: State,
+        now: datetime,
+    ) -> bool:
         """Update active commanded run observations."""
         if not self.active_run:
-            return
-        if entity_id == self.vacuum_entity and new_state.state == "cleaning":
+            return False
+        if (
+            entity_id == self.vacuum_entity
+            and new_state.state == "cleaning"
+            and not self.active_run.observed_cleaning
+        ):
             self.active_run.observed_cleaning = True
-        elif entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY) and new_state.state == "segment":
+            return True
+        if (
+            entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY)
+            and new_state.state == "segment"
+            and not self.active_run.observed_segment_cleaning
+        ):
             self.active_run.observed_segment_cleaning = True
-        elif entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
+            return True
+        if entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
             self.active_run.observe_estimated_room(self._room_id_from_estimated(new_state.state), now)
+            return True
+        return False
 
-    def _observe_manual_run(self, entity_id: str, new_state: State, now: datetime) -> None:
+    def _observe_manual_run(
+        self,
+        entity_id: str,
+        new_state: State,
+        now: datetime,
+    ) -> bool:
         """Update active manual run observations."""
         if not self.manual_run:
-            return
-        if entity_id == self.vacuum_entity and new_state.state == "cleaning":
+            return False
+        if (
+            entity_id == self.vacuum_entity
+            and new_state.state == "cleaning"
+            and not self.manual_run.observed_cleaning
+        ):
             self.manual_run.observed_cleaning = True
-        elif entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY) and new_state.state == "segment":
+            return True
+        if (
+            entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY)
+            and new_state.state == "segment"
+            and not self.manual_run.observed_segment_cleaning
+        ):
             self.manual_run.observed_segment_cleaning = True
-        elif entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
+            return True
+        if entity_id == self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY):
             self.manual_run.observe_estimated_room(self._room_id_from_estimated(new_state.state), now)
+            return True
+        return False
 
     async def _async_maybe_start_next_room(self) -> None:
         """Start the next room when the session and Valetudo state allow it."""
         if self.paused or not self.session or not self.session.active or self.active_run:
             self._notify_listeners()
             return
-        if self.session.pending_recovery_room_id and not await self._async_recover_pending_room_failure_if_ready():
+        if not self._all_people_away():
+            await self._async_cancel_session("Tracked person arrived home")
+            return
+        if (
+            self.session.pending_recovery_room_id
+            and not await self._async_recover_pending_room_failure_if_ready()
+        ):
             self._notify_listeners()
             return
         if not self._all_people_away():
-            await self.async_cancel_session("Tracked person arrived home")
+            await self._async_cancel_session("Tracked person arrived home")
             return
-        if not self._vacuum_ready_for_next_room():
+        if self.paused or not self.session or not self.session.active or self.active_run:
             self._notify_listeners()
             return
+        if not self._vacuum_ready_for_next_room(
+            ignore_status_flag=self._has_cancelled_low_battery_failure()
+        ):
+            self._notify_listeners()
+            return
+
+        resources = self._resource_state()
+        if cleaning_block_reason(resources):
+            self._notify_listeners()
+            return
+
+        self.session.retry_room_ids = [
+            room_id
+            for room_id in self.session.retry_room_ids
+            if (
+                (room := self.room_by_id.get(room_id))
+                and self._room_auto_clean_enabled(room)
+            )
+        ]
+        self.session.priority_retry_room_ids = [
+            room_id
+            for room_id in self.session.priority_retry_room_ids
+            if (
+                (room := self.room_by_id.get(room_id))
+                and self._room_auto_clean_enabled(room)
+            )
+        ]
+
+        if self.session.priority_retry_room_ids:
+            priority_room = self.room_by_id.get(
+                self.session.priority_retry_room_ids[0]
+            )
+            block_reason = cleaning_block_reason(resources)
+            if priority_room and not block_reason:
+                block_reason = mop_block_reason(priority_room, resources)
+                if (
+                    block_reason
+                    and self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)
+                ):
+                    block_reason = None
+            if block_reason:
+                self._notify_listeners()
+                return
 
         selection, skipped = select_next_room(
             self._auto_clean_rooms(),
@@ -544,17 +801,29 @@ class ValetudoVacuumCoordinator:
             bool(self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)),
             self._current_auto_clean_day(),
             self.session.retry_room_ids,
+            self.session.priority_retry_room_ids,
         )
 
         for room, reason in skipped:
-            ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
-            mark_failure(ledger, utcnow_iso(), f"Skipped: {reason}")
-            self.session.mark_skipped(room.room_id, reason)
-            self._record_while_away_outcome("skipped", room.room_id, reason)
+            _LOGGER.info(
+                "Deferring %s room %s while %s",
+                self.name,
+                room.room_id,
+                reason,
+            )
 
         if selection is None:
+            if skipped:
+                await self._async_save_store()
+                self._notify_listeners()
+                return
             self.session.active = False
             self.session.active_room_id = None
+            self.session.pending_recovery_room_id = None
+            self.session.pending_recovery_reason = None
+            self.session.pending_recovery_priority = False
+            self.session.retry_room_ids = []
+            self.session.priority_retry_room_ids = []
             self.session.terminal_reason = no_selection_terminal_reason(
                 completed_room_ids=self.session.completed_room_ids,
                 skipped_room_ids=self.session.skipped_room_ids,
@@ -569,31 +838,45 @@ class ValetudoVacuumCoordinator:
 
         await self._async_start_room(selection.room, vacuum_only=selection.vacuum_only)
 
-    async def _async_start_room(self, room: RoomConfig, *, vacuum_only: bool) -> None:
+    async def _async_start_room(
+        self,
+        room: RoomConfig,
+        *,
+        vacuum_only: bool,
+    ) -> None:
         """Command Valetudo to clean one segment."""
         if not self.session:
             return
 
-        if room.room_id in self.session.retry_room_ids:
-            self.session.mark_retry_started(room.room_id)
-        self.session.mark_attempted(room.room_id)
-        self.session.active_room_id = room.room_id
-        self.active_run = ActiveRun(
+        session = self.session
+        was_priority_retry = room.room_id in session.priority_retry_room_ids
+        was_retry = room.room_id in session.retry_room_ids
+        session.active_room_id = room.room_id
+        run = ActiveRun(
             room_id=room.room_id,
             segment_id=room.segment_id,
-            session_id=self.session.session_id,
+            session_id=session.session_id,
             started_at=utcnow_iso(),
             start_area=parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
             start_time=parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
             vacuum_only=vacuum_only,
         )
+        self.active_run = run
+        self._active_run_restored = False
+        self._restored_dispatch_intent_deadline = None
         if self._status_flag() == "segment":
-            self.active_run.observed_segment_cleaning = True
+            run.observed_segment_cleaning = True
 
         await self._async_save_store()
 
         try:
             await self._async_apply_mode(vacuum_only=vacuum_only)
+            if not self._dispatch_still_safe(session, run, room):
+                await self._async_abort_tentative_dispatch(
+                    session=session,
+                    run=run,
+                )
+                return
             await self.hass.services.async_call(
                 "mqtt",
                 "publish",
@@ -609,13 +892,104 @@ class ValetudoVacuumCoordinator:
                 },
                 blocking=True,
             )
+            run.command_published = True
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Failed to start Valetudo segment clean for %s", room.name)
-            mark_failure(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), str(err))
-            self.session.mark_failed(room.room_id, str(err))
-            self._record_while_away_outcome("failed", room.room_id, str(err))
             self.active_run = None
-            self.session.active_room_id = None
+            self._active_run_restored = False
+            if self.session is session:
+                session.active_room_id = None
+                failure_reason = f"Could not dispatch {room.name}: {err}"
+                mark_failure(
+                    self.ledgers.setdefault(room.room_id, RoomLedger()),
+                    utcnow_iso(),
+                    failure_reason,
+                )
+                session.mark_failed(room.room_id, failure_reason)
+                self._record_while_away_outcome(
+                    "failed",
+                    room.room_id,
+                    failure_reason,
+                )
+                self._set_needs_help_state(failure_reason)
+            await self._async_save_store()
+            self._notify_listeners()
+            await self._async_maybe_send_auto_clean_summary()
+            return
+
+        self._record_published_run(
+            session,
+            room,
+            was_retry=was_retry,
+            was_priority_retry=was_priority_retry,
+        )
+
+        await self._async_save_store()
+        self._notify_listeners()
+
+    def _record_published_run(
+        self,
+        session: SessionState,
+        room: RoomConfig,
+        *,
+        was_retry: bool,
+        was_priority_retry: bool,
+    ) -> None:
+        """Record a segment command only after MQTT accepts the publish."""
+        if was_retry or was_priority_retry:
+            previous_reason = session.failed_room_reasons.get(room.room_id)
+            session.mark_retry_started(room.room_id)
+            session.clear_room_issue(room.room_id)
+            ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
+            if previous_reason and ledger.last_failed_reason == previous_reason:
+                ledger.last_failed_reason = None
+            self._remove_while_away_failure(room.room_id, previous_reason)
+        session.mark_attempted(room.room_id)
+
+    def _dispatch_still_safe(
+        self,
+        session: SessionState,
+        run: ActiveRun,
+        room: RoomConfig,
+    ) -> bool:
+        """Return whether a tentatively claimed room may still be published."""
+        base_safe = bool(
+            self.session is session
+            and session.active
+            and self.active_run is run
+            and not self.paused
+            and self._all_people_away()
+            and self._room_auto_clean_enabled(room)
+            and self._vacuum_ready_for_next_room(
+                ignore_status_flag=self._has_cancelled_low_battery_failure()
+            )
+        )
+        if not base_safe:
+            return False
+
+        resources = self._resource_state()
+        if cleaning_block_reason(resources):
+            return False
+        return not mop_block_reason(room, resources) or run.vacuum_only
+
+    async def _async_abort_tentative_dispatch(
+        self,
+        *,
+        session: SessionState,
+        run: ActiveRun,
+    ) -> None:
+        """Undo a claimed room when a safety gate changes before publish."""
+        if self.session is not session or self.active_run is not run:
+            return
+
+        self.active_run = None
+        self._active_run_restored = False
+        self._restored_dispatch_intent_deadline = None
+        session.active_room_id = None
+
+        if not self._all_people_away():
+            await self._async_cancel_session("Tracked person arrived home")
+            return
 
         await self._async_save_store()
         self._notify_listeners()
@@ -652,6 +1026,7 @@ class ValetudoVacuumCoordinator:
         success_override: bool | None = None,
         failure_reason: str | None = None,
         continue_session: bool = True,
+        send_summary: bool = True,
     ) -> None:
         """Finalize the active commanded run."""
         run = self.active_run
@@ -663,6 +1038,8 @@ class ValetudoVacuumCoordinator:
         ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
 
         if success_override is None:
+            if not self.config.get(CONF_STATUS_FLAG_ENTITY):
+                run.observed_segment_cleaning = True
             success, reason = evaluate_run_success(
                 room,
                 run,
@@ -692,6 +1069,7 @@ class ValetudoVacuumCoordinator:
                 self._record_while_away_outcome("failed", room.room_id, reason)
 
         self.active_run = None
+        self._active_run_restored = False
         if self.session:
             self.session.active_room_id = None
 
@@ -699,11 +1077,15 @@ class ValetudoVacuumCoordinator:
         self._notify_listeners()
         if continue_session:
             await self._async_maybe_start_next_room()
-        else:
+        elif send_summary:
             await self._async_maybe_send_auto_clean_summary()
 
     async def _async_handle_active_run_error(self, error: str) -> None:
         """Finalize an errored active room and decide whether it can recover after docking."""
+        if is_low_battery_error(error):
+            await self._async_handle_low_battery_active_run_error(error)
+            return
+
         run = self.active_run
         room_id = run.room_id if run else None
         can_recover_after_dock = bool(
@@ -712,79 +1094,388 @@ class ValetudoVacuumCoordinator:
             and is_recoverable_navigation_error(error)
             and self.session.can_retry_room(room_id)
         )
+        if can_recover_after_dock and self.session and room_id:
+            self.session.begin_recovering(room_id, error)
         needs_help = self._error_needs_help(error)
+        if needs_help:
+            self._set_needs_help_state(error)
 
         await self._async_finish_active_run(
             success_override=False,
             failure_reason=error,
             continue_session=False,
+            send_summary=not needs_help,
         )
-        if can_recover_after_dock and self.session and room_id:
-            self.session.begin_recovering(room_id, error)
+        try:
             await self._async_return_to_dock_or_stop_resumable(error)
-            await self._async_save_store()
-            self._notify_listeners()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Failed to return %s after %s", self.vacuum_entity, error)
+            await self._async_mark_needs_help(
+                f"Could not return the vacuum after {error}: {err}"
+            )
             return
 
-        await self._async_return_to_dock_or_stop_resumable(error)
-        if needs_help and self.session:
-            self.session.active = False
-            self.session.terminal_reason = "needs_help"
-            self.session.terminal_message = error
-            self.session.needs_help = True
-            await self._async_save_store()
+        if needs_help:
             await self._async_maybe_send_auto_clean_summary()
-        else:
+            return
+        if not can_recover_after_dock:
             await self._async_maybe_start_next_room()
 
+    async def _async_handle_low_battery_active_run_error(self, error: str) -> None:
+        """Cancel a low-battery native task and wait at the dock before continuing."""
+        run = self.active_run
+        room_id = run.room_id if run else None
+        missing_battery_sensor = not self.config.get(CONF_BATTERY_ENTITY)
+        if self.session and room_id and not missing_battery_sensor:
+            self.session.begin_recovering(room_id, error, priority=True)
+
+        command_error = await self._async_cancel_low_battery_task(error)
+        terminal_message = (
+            "Low-battery recovery requires a configured battery_entity"
+            if missing_battery_sensor
+            else command_error
+        )
+        if terminal_message:
+            self._set_needs_help_state(terminal_message)
+        await self._async_finish_active_run(
+            success_override=False,
+            failure_reason=error,
+            continue_session=False,
+        )
+
+        if terminal_message:
+            return
+        await self._async_maybe_start_next_room()
+
+    async def _async_cancel_low_battery_task(self, reason: str) -> str | None:
+        """Synchronously cancel Valetudo's native task, then send the robot home."""
+        failures: list[str] = []
+        try:
+            await self.hass.services.async_call(
+                "vacuum",
+                "stop",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Failed to stop %s after %s", self.vacuum_entity, reason)
+            failures.append(f"Could not cancel the low-battery task: {err}")
+
+        if normalize_state(self._state(self.vacuum_entity)) != "docked":
+            try:
+                await self.hass.services.async_call(
+                    "vacuum",
+                    "return_to_base",
+                    {ATTR_ENTITY_ID: self.vacuum_entity},
+                    blocking=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Failed to return %s to the dock after %s",
+                    self.vacuum_entity,
+                    reason,
+                )
+                failures.append(f"Could not return the vacuum to the dock: {err}")
+        return "; ".join(failures) or None
+
     async def _async_recover_pending_room_failure_if_ready(self) -> bool:
-        """Clear a pending recoverable room failure once the robot has safely docked."""
+        """Queue or finish a recovery once the robot is safely docked and ready."""
         if not self.session or not self.session.pending_recovery_room_id:
             return False
         if self.active_run or not self.session.active:
             return False
-        if not self._vacuum_successfully_docked() or not is_error_clear(self.error_state):
-            return False
-
         room_id = self.session.pending_recovery_room_id
         reason = self.session.pending_recovery_reason
+        if is_low_battery_error(reason):
+            battery_entity = self.config.get(CONF_BATTERY_ENTITY)
+            if not battery_entity:
+                await self._async_fail_missing_low_battery_sensor()
+                return False
+            battery = parse_float(self._state(battery_entity))
+            if (
+                normalize_state(self._state(self.vacuum_entity)) != "docked"
+                or not self._configured_error_is_clear()
+                or battery is None
+                or battery < float(self.config.get(CONF_MIN_BATTERY))
+            ):
+                return False
+        elif (
+            not self._vacuum_successfully_docked()
+            or not self._configured_error_is_clear()
+        ):
+            return False
+
         if room_id not in self.room_by_id:
             self.session.pending_recovery_room_id = None
             self.session.pending_recovery_reason = None
+            self.session.pending_recovery_priority = False
             await self._async_save_store()
             self._notify_listeners()
             return True
 
-        self.session.resolve_recoverable_failure(room_id)
-        ledger = self.ledgers.setdefault(room_id, RoomLedger())
-        if reason is None or ledger.last_failed_reason == reason:
-            ledger.last_failed_reason = None
-        self._remove_while_away_failure(room_id, reason)
-        _LOGGER.info(
-            "Recovered %s room %s after %s; queued it for one retry",
-            self.name,
-            room_id,
-            reason or "recoverable failure",
-        )
+        should_retry = self.session.can_retry_room(room_id)
+        self.session.resolve_recoverable_failure(room_id, queue_retry=should_retry)
+        if should_retry:
+            _LOGGER.info(
+                "Recovered %s room %s after %s; queued it for one%s retry",
+                self.name,
+                room_id,
+                reason or "recoverable failure",
+                " priority" if is_low_battery_error(reason) else "",
+            )
+        else:
+            _LOGGER.info(
+                "Recovered %s after the final low-battery failure for room %s; "
+                "continuing the queue",
+                self.name,
+                room_id,
+            )
         await self._async_save_store()
         self._notify_listeners()
         return True
+
+    def _recovering_room_for_error(self) -> tuple[str | None, str | None]:
+        """Return a room whose low-battery recovery can be superseded by an error."""
+        if not self.session or not self.session.active:
+            return None, None
+        if self.session.pending_recovery_room_id:
+            return (
+                self.session.pending_recovery_room_id,
+                self.session.pending_recovery_reason,
+            )
+        for room_id in self.session.priority_retry_room_ids:
+            reason = self.session.failed_room_reasons.get(room_id)
+            if is_low_battery_error(reason):
+                return room_id, reason
+        return None, None
+
+    async def _async_handle_pending_recovery_error(self, error: str) -> None:
+        """Replace a pending or queued recovery with the latest actual error."""
+        if not self.session:
+            return
+        room_id, previous_reason = self._recovering_room_for_error()
+        if not room_id:
+            return
+
+        self._remove_while_away_failure(room_id, previous_reason)
+        self.session.discard_retry(room_id)
+        if self.session.pending_recovery_room_id == room_id:
+            self.session.resolve_recoverable_failure(room_id, queue_retry=False)
+
+        mark_failure(
+            self.ledgers.setdefault(room_id, RoomLedger()),
+            utcnow_iso(),
+            error,
+        )
+        self.session.mark_failed(room_id, error)
+        self._record_while_away_outcome("failed", room_id, error)
+
+        if is_low_battery_error(error):
+            if self.config.get(CONF_BATTERY_ENTITY):
+                self.session.begin_recovering(room_id, error, priority=True)
+            command_error = await self._async_cancel_low_battery_task(error)
+            if not self.config.get(CONF_BATTERY_ENTITY):
+                await self._async_fail_missing_low_battery_sensor()
+                return
+            if command_error:
+                await self._async_mark_needs_help(command_error)
+                return
+            await self._async_save_store()
+            self._notify_listeners()
+            await self._async_maybe_start_next_room()
+            return
+
+        if (
+            is_recoverable_navigation_error(error)
+            and self.session.can_retry_room(room_id)
+        ):
+            self.session.begin_recovering(room_id, error)
+
+        try:
+            await self._async_return_to_dock_or_stop_resumable(error)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Failed to return %s after %s", self.vacuum_entity, error)
+            await self._async_mark_needs_help(
+                f"Could not return the vacuum after {error}: {err}"
+            )
+            return
+
+        if self._error_needs_help(error):
+            await self._async_mark_needs_help(error)
+            return
+
+        await self._async_save_store()
+        self._notify_listeners()
+        await self._async_maybe_start_next_room()
+
+    async def _async_fail_missing_low_battery_sensor(self) -> None:
+        """Terminate low-battery recovery when no charge sensor is configured."""
+        await self._async_mark_needs_help(
+            "Low-battery recovery requires a configured battery_entity"
+        )
+
+    async def _async_mark_needs_help(self, message: str) -> None:
+        """Terminate the active session with a durable needs-help reason."""
+        if not self.session:
+            return
+        self._set_needs_help_state(message)
+        await self._async_save_store()
+        self._notify_listeners()
+        await self._async_maybe_send_auto_clean_summary()
+
+    def _set_needs_help_state(self, message: str) -> None:
+        """Set terminal needs-help state without introducing an intermediate save."""
+        if not self.session:
+            return
+        self.session.active = False
+        self.session.pending_recovery_room_id = None
+        self.session.pending_recovery_reason = None
+        self.session.pending_recovery_priority = False
+        self.session.retry_room_ids = []
+        self.session.priority_retry_room_ids = []
+        self.session.terminal_reason = "needs_help"
+        self.session.terminal_message = message
+        self.session.needs_help = True
 
     async def _async_reconcile_restored_session(self) -> None:
         """Resume or finalize a persisted auto-clean session after Home Assistant restarts."""
         if not self.session:
             return
+        if (
+            not self.active_run
+            and self._recovering_room_for_error()[0]
+            and self._configured_error_is_available()
+            and not is_error_clear(self.error_state)
+        ):
+            await self._async_handle_pending_recovery_error(
+                self.error_state or "Unknown error"
+            )
+            return
         if self._restore_active_run_observations(dt_util.utcnow()):
             await self._async_save_store()
-        if self.active_run and self._status_flag() != "resumable":
-            vacuum_state = normalize_state(self._state(self.vacuum_entity))
-            if vacuum_state in _READY_VACUUM_STATES:
-                await self._async_finish_active_run()
-                return
+        if self.active_run and await self._async_reconcile_restored_active_run():
+            return
         if self.session.active and not self.active_run:
             await self._async_maybe_start_next_room()
             return
         await self._async_maybe_send_auto_clean_summary()
+
+    async def _async_reconcile_restored_active_run(self) -> bool:
+        """Reconcile one persisted run after its entity states become available."""
+        if not self.active_run or not self._active_run_restored:
+            return False
+
+        if (
+            self._configured_error_is_available()
+            and not is_error_clear(self.error_state)
+        ):
+            await self._async_handle_active_run_error(
+                self.error_state or "Unknown error"
+            )
+            return True
+
+        if not self.active_run.command_published:
+            room = self.room_by_id.get(self.active_run.room_id or "")
+            if self.active_run.observed_cleaning or self.active_run.observed_segment_cleaning:
+                self.active_run.command_published = True
+                if room and self.session:
+                    self._record_published_run(
+                        self.session,
+                        room,
+                        was_retry=room.room_id in self.session.retry_room_ids,
+                        was_priority_retry=(
+                            room.room_id in self.session.priority_retry_room_ids
+                        ),
+                    )
+                await self._async_save_store()
+            elif self._restored_dispatch_intent_deadline is None:
+                self._restored_dispatch_intent_deadline = (
+                    dt_util.utcnow()
+                    + timedelta(seconds=_RESTORE_RECONCILE_DELAY_SECONDS)
+                )
+                return True
+            elif dt_util.utcnow() < self._restored_dispatch_intent_deadline:
+                return True
+            else:
+                self.active_run = None
+                self._active_run_restored = False
+                self._restored_dispatch_intent_deadline = None
+                if self.session:
+                    self.session.active_room_id = None
+                await self._async_save_store()
+                await self._async_maybe_start_next_room()
+                return True
+
+        if self._configured_error_is_available():
+            if not is_error_clear(self.error_state):
+                await self._async_handle_active_run_error(self.error_state or "Unknown error")
+                return True
+        elif normalize_state(self._state(self.vacuum_entity)) in _READY_VACUUM_STATES:
+            return True
+
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state not in _READY_VACUUM_STATES:
+            return False
+        if await self._async_maybe_recover_docked_low_battery_run():
+            return True
+
+        battery_entity = self.config.get(CONF_BATTERY_ENTITY)
+        if battery_entity and parse_float(self._state(battery_entity)) is None:
+            return True
+        if (
+            self.config.get(CONF_STATUS_FLAG_ENTITY)
+            and not self._configured_status_is_available()
+        ):
+            return True
+        if self._status_flag() != "resumable":
+            await self._async_finish_active_run()
+            return True
+        return False
+
+    async def _async_maybe_recover_docked_low_battery_run(self) -> bool:
+        """Infer a missed low-battery event for a restored docked room run."""
+        if (
+            not self.active_run
+            or (
+                not self.active_run.observed_cleaning
+                and not self.active_run.command_published
+            )
+            or not self._active_run_restored
+            or not self.session
+            or not self.session.active
+            or normalize_state(self._state(self.vacuum_entity)) != "docked"
+            or not self._configured_error_is_clear()
+            or (
+                self.config.get(CONF_STATUS_FLAG_ENTITY)
+                and not self._configured_status_is_available()
+            )
+        ):
+            return False
+        battery_entity = self.config.get(CONF_BATTERY_ENTITY)
+        battery = parse_float(self._state(battery_entity)) if battery_entity else None
+        room = self.room_by_id.get(self.active_run.room_id or "")
+        if room:
+            if not self.config.get(CONF_STATUS_FLAG_ENTITY):
+                self.active_run.observed_segment_cleaning = True
+            success, _reason = evaluate_run_success(
+                room,
+                self.active_run,
+                parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+                parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+                self.error_state,
+            )
+            if success:
+                await self._async_finish_active_run(success_override=True)
+                return True
+        if (
+            battery is None
+            or not self.config.get(CONF_STATUS_FLAG_ENTITY)
+            or not self._configured_status_is_available()
+            or self._status_flag() != "resumable"
+        ):
+            return False
+        await self._async_handle_active_run_error("Low battery")
+        return True
 
     def _restore_active_run_observations(self, now: datetime) -> bool:
         """Seed active-run observations from current HA state after a restart."""
@@ -812,30 +1503,91 @@ class ValetudoVacuumCoordinator:
 
     async def _async_maybe_send_auto_clean_summary(self) -> None:
         """Send the one final auto-clean notification when the session is terminal."""
-        if not self.session or self.session.active or self.active_run or self.session.notification_sent:
+        if not self.session or self.session.active or self.active_run:
             return
         if not self.session.terminal_reason:
             return
+        if self.session.notification_sent and self.settings_snapshot is None:
+            return
         if not self._vacuum_at_safe_terminal_point() and not self.session.needs_help:
             return
+        if self._terminal_cleanup_retry_attempts >= _MAX_TERMINAL_CLEANUP_RETRIES:
+            return
+        self._terminal_cleanup_retry_attempts += 1
 
-        summary = build_auto_clean_summary(
-            vacuum_name=self.name.replace(" Coordinator", ""),
-            completed_room_names=[self.room_by_id[room_id].name for room_id in self.session.completed_room_ids],
-            skipped_room_reasons=self._named_reasons(self.session.skipped_room_reasons),
-            failed_room_reasons=self._named_reasons(self.session.failed_room_reasons),
-            terminal_reason=self.session.terminal_reason,
-            terminal_message=self.session.terminal_message,
-            needs_help=self.session.needs_help,
-            all_rooms_cleaned=self._all_enabled_rooms_completed(),
-            total_room_count=len(self._auto_clean_rooms()),
-        )
-        self.session.notification_sent = True
-        if summary:
-            await self._async_send_notification(summary.title, summary.message)
-        await self._async_restore_auto_clean_settings()
+        notification_failed = False
+        if not self.session.notification_sent:
+            summary = build_auto_clean_summary(
+                vacuum_name=self.name.replace(" Coordinator", ""),
+                completed_room_names=[
+                    self.room_by_id[room_id].name
+                    for room_id in self.session.completed_room_ids
+                ],
+                skipped_room_reasons=self._named_reasons(
+                    self.session.skipped_room_reasons
+                ),
+                failed_room_reasons=self._named_reasons(
+                    self.session.failed_room_reasons
+                ),
+                terminal_reason=self.session.terminal_reason,
+                terminal_message=self.session.terminal_message,
+                needs_help=self.session.needs_help,
+                all_rooms_cleaned=self._all_enabled_rooms_completed(),
+                total_room_count=len(self._auto_clean_rooms()),
+            )
+            if summary:
+                try:
+                    await self._async_send_notification(summary.title, summary.message)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Could not send auto-clean summary for %s", self.name)
+                    notification_failed = True
+            if not notification_failed:
+                self.session.notification_sent = True
+
+        restoration_failed = False
+        try:
+            restoration_failed = not await self._async_restore_auto_clean_settings()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Could not restore auto-clean settings for %s", self.name)
+            restoration_failed = True
         await self._async_save_store()
         self._notify_listeners()
+        if notification_failed or restoration_failed:
+            self._schedule_terminal_cleanup_retry()
+        else:
+            self._cancel_terminal_cleanup_retry()
+            self._terminal_cleanup_retry_attempts = 0
+
+    def _schedule_terminal_cleanup_retry(self) -> None:
+        """Schedule a bounded retry for notification or settings cleanup."""
+        if (
+            self._terminal_cleanup_retry_cancel is not None
+            or self._terminal_cleanup_retry_attempts >= _MAX_TERMINAL_CLEANUP_RETRIES
+        ):
+            return
+        def timer_finished(_now: datetime) -> None:
+            self._terminal_cleanup_retry_cancel = None
+            schedule_hass_task(
+                self.hass,
+                self._async_retry_terminal_cleanup_serialized(),
+            )
+
+        self._terminal_cleanup_retry_cancel = async_call_later(
+            self.hass,
+            _TERMINAL_CLEANUP_RETRY_SECONDS,
+            timer_finished,
+        )
+
+    async def _async_retry_terminal_cleanup_serialized(self) -> None:
+        """Retry terminal notification and settings cleanup safely."""
+        async with self._event_lock:
+            await self._async_maybe_send_auto_clean_summary()
+
+    def _cancel_terminal_cleanup_retry(self) -> None:
+        """Cancel a scheduled terminal cleanup retry."""
+        if self._terminal_cleanup_retry_cancel is not None:
+            self._terminal_cleanup_retry_cancel()
+            self._terminal_cleanup_retry_cancel = None
 
     async def _async_prepare_auto_clean_settings(self) -> None:
         """Snapshot current user settings and apply auto-clean settings."""
@@ -859,24 +1611,42 @@ class ValetudoVacuumCoordinator:
             self.config.get(CONF_WATER_MOP_OPTION),
         )
 
-    async def _async_restore_auto_clean_settings(self) -> None:
-        """Restore user settings captured before the auto-clean session."""
+    async def _async_restore_auto_clean_settings(self) -> bool:
+        """Restore user settings, retaining the snapshot if any call fails."""
         if self.settings_snapshot is None:
-            return
+            return True
         snapshot = self.settings_snapshot
-        self.settings_snapshot = None
-        await self._async_select_option(self.config.get(CONF_MODE_ENTITY), snapshot.mode)
-        await self._async_select_option(self.config.get(CONF_FAN_ENTITY), snapshot.fan)
-        await self._async_select_option(self.config.get(CONF_WATER_ENTITY), snapshot.water)
-        await self._async_select_option(self.config.get(CONF_PASSES_ENTITY), snapshot.passes)
+        restored = all(
+            [
+                await self._async_select_option(
+                    self.config.get(CONF_MODE_ENTITY), snapshot.mode
+                ),
+                await self._async_select_option(
+                    self.config.get(CONF_FAN_ENTITY), snapshot.fan
+                ),
+                await self._async_select_option(
+                    self.config.get(CONF_WATER_ENTITY), snapshot.water
+                ),
+                await self._async_select_option(
+                    self.config.get(CONF_PASSES_ENTITY), snapshot.passes
+                ),
+            ]
+        )
+        if restored:
+            self.settings_snapshot = None
+        return restored
 
-    async def _async_select_option(self, entity_id: str | None, option: str | None) -> None:
+    async def _async_select_option(
+        self,
+        entity_id: str | None,
+        option: str | None,
+    ) -> bool:
         """Select an option on a select or input_select entity when available."""
         if not entity_id or option in _UNKNOWN_OR_CLEAR_STATES:
-            return
+            return True
         domain = entity_id.split(".", 1)[0]
         if domain not in {"select", "input_select"}:
-            return
+            return True
         try:
             await self.hass.services.async_call(
                 domain,
@@ -886,6 +1656,8 @@ class ValetudoVacuumCoordinator:
             )
         except Exception:  # noqa: BLE001
             _LOGGER.warning("Could not select %s on %s", option, entity_id, exc_info=True)
+            return False
+        return True
 
     def _restorable_state(self, entity_id: str | None) -> str | None:
         """Return a setting value safe to restore later."""
@@ -907,7 +1679,7 @@ class ValetudoVacuumCoordinator:
                 "url": notification_url,
                 "clickAction": notification_url,
             }
-        await self.hass.services.async_call(domain, service, data, blocking=False)
+        await self.hass.services.async_call(domain, service, data, blocking=True)
 
     def _named_reasons(self, room_reasons: dict[str, str]) -> dict[str, str]:
         """Return failure reasons keyed by friendly room name."""
@@ -944,20 +1716,34 @@ class ValetudoVacuumCoordinator:
     def _vacuum_at_safe_terminal_point(self) -> bool:
         """Return whether it is safe to clear auto-cleaning and notify."""
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
-        return vacuum_state in _READY_VACUUM_STATES and self._status_flag() != "resumable"
+        if self._has_cancelled_low_battery_failure():
+            return vacuum_state in _READY_VACUUM_STATES
+        if not self.config.get(CONF_STATUS_FLAG_ENTITY):
+            return vacuum_state in _READY_VACUUM_STATES
+        status_flag = self._status_flag()
+        return (
+            vacuum_state in _READY_VACUUM_STATES
+            and status_flag not in {None, "unknown", "unavailable", "resumable"}
+        )
 
     def _vacuum_successfully_docked(self) -> bool:
         """Return whether the robot reached the dock and is no longer resumable."""
-        return normalize_state(self._state(self.vacuum_entity)) == "docked" and self._status_flag() != "resumable"
+        if not self.config.get(CONF_STATUS_FLAG_ENTITY):
+            return normalize_state(self._state(self.vacuum_entity)) == "docked"
+        status_flag = self._status_flag()
+        return (
+            normalize_state(self._state(self.vacuum_entity)) == "docked"
+            and status_flag not in {None, "unknown", "unavailable", "resumable"}
+        )
 
     def _error_needs_help(self, error: str | None) -> bool:
         """Return whether an error should stop auto-clean and notify for help."""
         normalized = normalize_state(error)
         if not normalized or is_error_clear(normalized):
             return False
-        lowered = normalized.lower()
-        if "low battery" in lowered:
+        if is_low_battery_error(normalized):
             return False
+        lowered = normalized.lower()
         if "dock" in lowered and any(
             keyword in lowered for keyword in ("cannot reach", "cannot arrive", "cannot navigate")
         ):
@@ -1080,7 +1866,7 @@ class ValetudoVacuumCoordinator:
 
         def timer_finished(_now: datetime) -> None:
             self._next_day_timer_cancel = None
-            schedule_hass_task(self.hass, self._async_handle_next_day_rollover())
+            schedule_hass_task(self.hass, self._async_handle_next_day_rollover_serialized())
 
         self._next_day_timer_cancel = async_call_later(
             self.hass, self._seconds_until_next_auto_clean_day(), timer_finished
@@ -1093,6 +1879,11 @@ class ValetudoVacuumCoordinator:
             await self._async_save_store()
             self._notify_listeners()
         self._schedule_next_day_timer_if_needed()
+
+    async def _async_handle_next_day_rollover_serialized(self) -> None:
+        """Process the day rollover without racing active dispatch."""
+        async with self._event_lock:
+            await self._async_handle_next_day_rollover()
 
     def _seconds_until_next_auto_clean_day(self) -> int:
         """Return seconds until just after the next Home Assistant local midnight."""
@@ -1108,7 +1899,12 @@ class ValetudoVacuumCoordinator:
             self._next_day_timer_cancel()
             self._next_day_timer_cancel = None
 
-    async def _async_return_to_dock_or_stop_resumable(self, reason: str) -> None:
+    async def _async_return_to_dock_or_stop_resumable(
+        self,
+        reason: str,
+        *,
+        command_may_be_pending: bool = False,
+    ) -> None:
         """Cancel a moving or resumable Valetudo task."""
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
         if vacuum_state == "error" and self._error_is_mop_resource(reason):
@@ -1117,7 +1913,7 @@ class ValetudoVacuumCoordinator:
                 "vacuum",
                 "stop",
                 {ATTR_ENTITY_ID: self.vacuum_entity},
-                blocking=False,
+                blocking=True,
             )
             return
 
@@ -1126,7 +1922,16 @@ class ValetudoVacuumCoordinator:
                 "vacuum",
                 "stop",
                 {ATTR_ENTITY_ID: self.vacuum_entity},
-                blocking=False,
+                blocking=True,
+            )
+            return
+
+        if command_may_be_pending and vacuum_state in _READY_VACUUM_STATES:
+            await self.hass.services.async_call(
+                "vacuum",
+                "stop",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=True,
             )
             return
 
@@ -1136,7 +1941,7 @@ class ValetudoVacuumCoordinator:
                 "vacuum",
                 "return_to_base",
                 {ATTR_ENTITY_ID: self.vacuum_entity},
-                blocking=False,
+                blocking=True,
             )
 
     async def _async_clear_paused_between_rooms(self) -> None:
@@ -1151,22 +1956,70 @@ class ValetudoVacuumCoordinator:
             blocking=False,
         )
 
-    def _vacuum_ready_for_next_room(self) -> bool:
+    def _vacuum_ready_for_next_room(
+        self,
+        *,
+        ignore_status_flag: bool = False,
+    ) -> bool:
         """Return whether dispatching another segment is safe."""
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
         if vacuum_state not in _READY_VACUUM_STATES:
             return False
-        if self._status_flag() == "resumable":
+        if self.config.get(CONF_STATUS_FLAG_ENTITY) and not ignore_status_flag:
+            status_flag = self._status_flag()
+            if status_flag in {None, "unknown", "unavailable", "resumable"}:
+                return False
+
+        if not self._configured_error_is_available():
+            return False
+        if cleaning_block_reason(self._resource_state()):
             return False
 
-        dock_status = normalize_state(self._state(self.config.get(CONF_DOCK_STATUS_ENTITY)))
-        if dock_status and dock_status.lower() in _BUSY_DOCK_STATES:
-            return False
+        dock_status_entity = self.config.get(CONF_DOCK_STATUS_ENTITY)
+        dock_status = normalize_state(self._state(dock_status_entity))
+        if dock_status_entity:
+            if not dock_status or dock_status.lower() in {"unknown", "unavailable"}:
+                return False
+            if dock_status.lower() in _BUSY_DOCK_STATES:
+                return False
 
-        battery = parse_float(self._state(self.config.get(CONF_BATTERY_ENTITY)))
-        if battery is not None and battery < float(self.config.get(CONF_MIN_BATTERY)):
-            return False
+        battery_entity = self.config.get(CONF_BATTERY_ENTITY)
+        if battery_entity:
+            battery = parse_float(self._state(battery_entity))
+            if battery is None or battery < float(self.config.get(CONF_MIN_BATTERY)):
+                return False
         return True
+
+    def _configured_error_is_available(self) -> bool:
+        """Return whether a configured error sensor has a definitive state."""
+        error_entity = self.config.get(CONF_ERROR_ENTITY)
+        if not error_entity:
+            return True
+        error = normalize_state(self._state(error_entity))
+        return error is not None and error.lower() not in {"unknown", "unavailable"}
+
+    def _configured_error_is_clear(self) -> bool:
+        """Return whether the configured error sensor is available and clear."""
+        return self._configured_error_is_available() and is_error_clear(self.error_state)
+
+    def _configured_status_is_available(self) -> bool:
+        """Return whether a configured status sensor has a definitive state."""
+        status_entity = self.config.get(CONF_STATUS_FLAG_ENTITY)
+        if not status_entity:
+            return True
+        status = self._status_flag()
+        return status not in {None, "unknown", "unavailable"}
+
+    def _has_cancelled_low_battery_failure(self) -> bool:
+        """Return whether this session already stopped a low-battery native task."""
+        if not self.session:
+            return False
+        if is_low_battery_error(self.session.pending_recovery_reason):
+            return True
+        return any(
+            is_low_battery_error(reason)
+            for reason in self.session.failed_room_reasons.values()
+        )
 
     def _resource_state(self) -> ResourceState:
         """Return current Valetudo resource state."""
@@ -1271,6 +2124,20 @@ class ValetudoVacuumCoordinator:
             self.config.get(CONF_MOP_ATTACHMENT_ENTITY),
         ]
 
+    def _resource_sensor_entities(self) -> set[str]:
+        """Return configured resource entities that can unblock dispatch."""
+        return {
+            entity_id
+            for entity_id in (
+                self.config.get(CONF_FRESH_WATER_ENTITY),
+                self.config.get(CONF_DIRTY_WATER_ENTITY),
+                self.config.get(CONF_DETERGENT_ENTITY),
+                self.config.get(CONF_DUSTBAG_ENTITY),
+                self.config.get(CONF_MOP_ATTACHMENT_ENTITY),
+            )
+            if entity_id
+        }
+
     async def _async_load_store(self) -> None:
         """Load persisted pause state and room ledgers."""
         stored = await self._store.async_load()
@@ -1282,6 +2149,7 @@ class ValetudoVacuumCoordinator:
         self.away_since = stored.get("away_since")
         self.session = SessionState.from_dict(stored.get("session"))
         self.active_run = ActiveRun.from_dict(stored.get("active_run"))
+        self._active_run_restored = self.active_run is not None
         self.manual_run = ActiveRun.from_dict(stored.get("manual_run"))
         self.settings_snapshot = AutoCleanSettingsSnapshot.from_dict(stored.get("settings_snapshot"))
         stored_outcomes = stored.get("while_away_outcomes", [])
