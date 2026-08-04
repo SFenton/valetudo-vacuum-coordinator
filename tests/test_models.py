@@ -597,24 +597,87 @@ def test_manual_rooms_to_credit_respects_selected_room_snapshot():
     assert [room.room_id for room in credited] == ["room_two"]
 
 
-def test_active_run_dispatch_phase_round_trips_with_legacy_default():
+def test_v012_active_run_migrates_with_passive_resume_defaults():
     pending = logic.ActiveRun(
         room_id="room_one",
         segment_id="1",
         session_id="session",
         started_at=logic.utcnow_iso(),
         command_published=False,
+        requested_iterations=3,
     )
 
     restored_pending = logic.ActiveRun.from_dict(pending.to_dict())
     legacy = pending.to_dict()
-    legacy.pop("command_published")
+    for field_name in (
+        "command_published",
+        "phase",
+        "suspended_at",
+        "suspend_reason",
+        "resumable_latched",
+        "resumed_after_suspend",
+        "resume_source",
+        "docked_at",
+        "interruption_count",
+        "requested_iterations",
+        "recovery_deadline",
+        "resume_required",
+        "post_suspend_cleaning_observed",
+        "post_suspend_segment_observed",
+        "accumulated_area",
+        "accumulated_time",
+        "last_area",
+        "last_time",
+        "cancel_requested_at",
+        "cancel_reason",
+        "cancel_stop_attempted",
+    ):
+        legacy.pop(field_name)
     restored_legacy = logic.ActiveRun.from_dict(legacy)
 
     assert restored_pending is not None
     assert restored_pending.command_published is False
+    assert restored_pending.requested_iterations == 3
     assert restored_legacy is not None
     assert restored_legacy.command_published is True
+    assert restored_legacy.phase == logic.RUN_PHASE_DISPATCHING
+    assert restored_legacy.suspended_at is None
+    assert restored_legacy.resumable_latched is False
+    assert restored_legacy.resumed_after_suspend is False
+    assert restored_legacy.interruption_count == 0
+    assert restored_legacy.requested_iterations == 2
+    assert restored_legacy.recovery_deadline is None
+    assert restored_legacy.accumulated_area == 0
+    assert restored_legacy.accumulated_time == 0
+
+
+def test_active_run_native_resume_metadata_round_trips():
+    run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at="2026-08-04T12:00:00+00:00",
+        command_published=True,
+        phase=logic.RUN_PHASE_SUSPENDED,
+        suspended_at="2026-08-04T12:10:00+00:00",
+        suspend_reason="Low battery",
+        resumable_latched=True,
+        resumed_after_suspend=False,
+        docked_at="2026-08-04T12:12:00+00:00",
+        interruption_count=2,
+        requested_iterations=3,
+        recovery_deadline="2026-08-04T15:10:00+00:00",
+        resume_required=True,
+        accumulated_area=12.5,
+        accumulated_time=610,
+        last_area=12.5,
+        last_time=610,
+        cancel_continue_session=True,
+    )
+
+    restored = logic.ActiveRun.from_dict(run.to_dict())
+
+    assert restored == run
 
 
 def test_mark_success_updates_attempted_and_counts():
@@ -905,6 +968,11 @@ def test_session_state_round_trips_terminal_details():
         active=False,
         terminal_reason="complete",
         notification_sent=True,
+        native_resume_guard_latched=True,
+        native_guard_cancel_pending=True,
+        native_guard_stop_confirmed=True,
+        native_guard_return_confirmed=False,
+        native_guard_cancel_reason="test cancel",
     )
     session.mark_completed("room_one")
     session.mark_skipped("room_two", "clean water empty")
@@ -918,3 +986,8 @@ def test_session_state_round_trips_terminal_details():
     assert restored.failed_room_reasons == {"room_three": "Cannot reach target"}
     assert restored.terminal_reason == "complete"
     assert restored.notification_sent is True
+    assert restored.native_resume_guard_latched is True
+    assert restored.native_guard_cancel_pending is True
+    assert restored.native_guard_stop_confirmed is True
+    assert restored.native_guard_return_confirmed is False
+    assert restored.native_guard_cancel_reason == "test cancel"

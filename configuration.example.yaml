@@ -6,6 +6,13 @@ valetudo_vacuum_coordinator:
     - person.person_two
   away_delay: 300
   min_battery: 55
+  # Retain the firmware's native task through charging and mop-rinse interruptions.
+  # No fresh segment or vacuum.start fallback is issued on timeout.
+  native_resume_enabled: true
+  native_resume_timeout: 10800
+  dock_settle: 60
+  # Reserved for future opt-in behavior; v0.1.3 keeps this inert.
+  resume_nudge_enabled: false
 
   # MQTT topics are case-sensitive; replace `robot` with the exact Valetudo MQTT identifier.
   segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set

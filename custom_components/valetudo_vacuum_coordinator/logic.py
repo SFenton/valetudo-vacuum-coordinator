@@ -47,6 +47,32 @@ LOW_BATTERY_ERROR_KEYWORDS = (
     "battery low",
 )
 
+RUN_PHASE_DISPATCHING = "dispatching"
+RUN_PHASE_CLEANING = "cleaning"
+RUN_PHASE_DOCK_INTERRUPT = "dock_interrupt"
+RUN_PHASE_SUSPENDED = "suspended"
+RUN_PHASE_RESUMED_CLEANING = "resumed_cleaning"
+RUN_PHASE_CANCEL_PENDING = "cancel_pending"
+RUN_PHASE_RECOVERY_STALLED = "recovery_stalled"
+
+RUN_PHASES = {
+    RUN_PHASE_DISPATCHING,
+    RUN_PHASE_CLEANING,
+    RUN_PHASE_DOCK_INTERRUPT,
+    RUN_PHASE_SUSPENDED,
+    RUN_PHASE_RESUMED_CLEANING,
+    RUN_PHASE_CANCEL_PENDING,
+    RUN_PHASE_RECOVERY_STALLED,
+}
+NATIVE_RESUME_PENDING_PHASES = {
+    RUN_PHASE_DOCK_INTERRUPT,
+    RUN_PHASE_SUSPENDED,
+    RUN_PHASE_CANCEL_PENDING,
+    RUN_PHASE_RECOVERY_STALLED,
+}
+
+WRONG_ROOM_FAILURE_PREFIX = "Estimated segment dwell was dominated by"
+
 
 def schedule_hass_task(hass: Any, coroutine: Any) -> None:
     """Schedule a coroutine from either the event loop or a timer thread."""
@@ -152,12 +178,72 @@ class ActiveRun:
     vacuum_only: bool = False
     cancelled: bool = False
     command_published: bool = False
+    phase: str = RUN_PHASE_DISPATCHING
     observed_cleaning: bool = False
     observed_segment_cleaning: bool = False
+    suspended_at: str | None = None
+    suspend_reason: str | None = None
+    resumable_latched: bool = False
+    resumed_after_suspend: bool = False
+    resume_source: str | None = None
+    docked_at: str | None = None
+    interruption_count: int = 0
+    requested_iterations: int = 2
+    recovery_deadline: str | None = None
+    resume_required: bool = False
+    post_suspend_cleaning_observed: bool = False
+    post_suspend_segment_observed: bool = False
+    accumulated_area: float = 0.0
+    accumulated_time: float = 0.0
+    last_area: float | None = None
+    last_time: float | None = None
+    cancel_requested_at: str | None = None
+    cancel_reason: str | None = None
+    cancel_stop_attempted: bool = False
+    cancel_continue_session: bool = False
     last_estimated_room_id: str | None = None
     last_estimated_changed_at: str | None = None
     estimated_dwell_seconds: dict[str, float] = field(default_factory=dict)
     manual_credit_room_ids: list[str] | None = None
+
+    @property
+    def native_resume_pending(self) -> bool:
+        """Return whether the run is waiting on retained native-task recovery."""
+        return self.phase in NATIVE_RESUME_PENDING_PHASES
+
+    def checkpoint_statistics(
+        self,
+        current_area: float | None,
+        current_time: float | None,
+    ) -> None:
+        """Accumulate counters before a dock interruption can reset them."""
+        area_baseline = self.last_area if self.last_area is not None else self.start_area
+        if area_baseline is not None and current_area is not None:
+            self.accumulated_area += counter_delta(area_baseline, current_area)
+            self.last_area = current_area
+        elif current_area is not None:
+            self.last_area = current_area
+
+        time_baseline = self.last_time if self.last_time is not None else self.start_time
+        if time_baseline is not None and current_time is not None:
+            self.accumulated_time += counter_delta(time_baseline, current_time)
+            self.last_time = current_time
+        elif current_time is not None:
+            self.last_time = current_time
+
+    def total_area(self, end_area: float | None) -> float | None:
+        """Return accumulated cleaned area across counter resets."""
+        baseline = self.last_area if self.last_area is not None else self.start_area
+        if baseline is None or end_area is None:
+            return None
+        return self.accumulated_area + counter_delta(baseline, end_area)
+
+    def total_time(self, end_time: float | None) -> float | None:
+        """Return accumulated cleaning time across counter resets."""
+        baseline = self.last_time if self.last_time is not None else self.start_time
+        if baseline is None or end_time is None:
+            return None
+        return self.accumulated_time + counter_delta(baseline, end_time)
 
     def observe_estimated_room(self, room_id: str | None, observed_at: datetime) -> None:
         """Accumulate dwell time for estimated room updates."""
@@ -182,19 +268,60 @@ class ActiveRun:
         """Build an active run from stored JSON."""
         if not isinstance(data, dict):
             return None
+        command_published = bool(data.get("command_published", True))
+        observed_cleaning = bool(data.get("observed_cleaning", False))
+        phase = data.get("phase")
+        if phase not in RUN_PHASES:
+            if bool(data.get("cancelled", False)):
+                phase = RUN_PHASE_CANCEL_PENDING
+            elif observed_cleaning:
+                phase = RUN_PHASE_CLEANING
+            else:
+                phase = RUN_PHASE_DISPATCHING
+        start_area = parse_float(data.get("start_area"))
+        start_time = parse_float(data.get("start_time"))
         return cls(
             room_id=data.get("room_id"),
             segment_id=data.get("segment_id"),
             session_id=data.get("session_id"),
             started_at=data.get("started_at") or utcnow_iso(),
-            start_area=parse_float(data.get("start_area")),
-            start_time=parse_float(data.get("start_time")),
+            start_area=start_area,
+            start_time=start_time,
             manual=bool(data.get("manual", False)),
             vacuum_only=bool(data.get("vacuum_only", False)),
             cancelled=bool(data.get("cancelled", False)),
-            command_published=bool(data.get("command_published", True)),
-            observed_cleaning=bool(data.get("observed_cleaning", False)),
+            command_published=command_published,
+            phase=phase,
+            observed_cleaning=observed_cleaning,
             observed_segment_cleaning=bool(data.get("observed_segment_cleaning", False)),
+            suspended_at=data.get("suspended_at"),
+            suspend_reason=data.get("suspend_reason"),
+            resumable_latched=bool(data.get("resumable_latched", False)),
+            resumed_after_suspend=bool(data.get("resumed_after_suspend", False)),
+            resume_source=data.get("resume_source"),
+            docked_at=data.get("docked_at"),
+            interruption_count=int(parse_float(data.get("interruption_count")) or 0),
+            requested_iterations=max(
+                1, int(parse_float(data.get("requested_iterations")) or 2)
+            ),
+            recovery_deadline=data.get("recovery_deadline"),
+            resume_required=bool(data.get("resume_required", False)),
+            post_suspend_cleaning_observed=bool(
+                data.get("post_suspend_cleaning_observed", False)
+            ),
+            post_suspend_segment_observed=bool(
+                data.get("post_suspend_segment_observed", False)
+            ),
+            accumulated_area=parse_float(data.get("accumulated_area")) or 0.0,
+            accumulated_time=parse_float(data.get("accumulated_time")) or 0.0,
+            last_area=parse_float(data.get("last_area", start_area)),
+            last_time=parse_float(data.get("last_time", start_time)),
+            cancel_requested_at=data.get("cancel_requested_at"),
+            cancel_reason=data.get("cancel_reason"),
+            cancel_stop_attempted=bool(data.get("cancel_stop_attempted", False)),
+            cancel_continue_session=bool(
+                data.get("cancel_continue_session", False)
+            ),
             last_estimated_room_id=data.get("last_estimated_room_id"),
             last_estimated_changed_at=data.get("last_estimated_changed_at"),
             estimated_dwell_seconds={
@@ -221,8 +348,29 @@ class ActiveRun:
             "vacuum_only": self.vacuum_only,
             "cancelled": self.cancelled,
             "command_published": self.command_published,
+            "phase": self.phase,
             "observed_cleaning": self.observed_cleaning,
             "observed_segment_cleaning": self.observed_segment_cleaning,
+            "suspended_at": self.suspended_at,
+            "suspend_reason": self.suspend_reason,
+            "resumable_latched": self.resumable_latched,
+            "resumed_after_suspend": self.resumed_after_suspend,
+            "resume_source": self.resume_source,
+            "docked_at": self.docked_at,
+            "interruption_count": self.interruption_count,
+            "requested_iterations": self.requested_iterations,
+            "recovery_deadline": self.recovery_deadline,
+            "resume_required": self.resume_required,
+            "post_suspend_cleaning_observed": self.post_suspend_cleaning_observed,
+            "post_suspend_segment_observed": self.post_suspend_segment_observed,
+            "accumulated_area": self.accumulated_area,
+            "accumulated_time": self.accumulated_time,
+            "last_area": self.last_area,
+            "last_time": self.last_time,
+            "cancel_requested_at": self.cancel_requested_at,
+            "cancel_reason": self.cancel_reason,
+            "cancel_stop_attempted": self.cancel_stop_attempted,
+            "cancel_continue_session": self.cancel_continue_session,
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
             "estimated_dwell_seconds": self.estimated_dwell_seconds,
@@ -350,6 +498,11 @@ class SessionState:
     terminal_message: str | None = None
     needs_help: bool = False
     notification_sent: bool = False
+    native_resume_guard_latched: bool = False
+    native_guard_cancel_pending: bool = False
+    native_guard_stop_confirmed: bool = False
+    native_guard_return_confirmed: bool = False
+    native_guard_cancel_reason: str | None = None
 
     def mark_attempted(self, room_id: str) -> None:
         """Record that a room has consumed its one attempt for this session."""
@@ -484,6 +637,19 @@ class SessionState:
             terminal_message=data.get("terminal_message"),
             needs_help=bool(data.get("needs_help", False)),
             notification_sent=bool(data.get("notification_sent", False)),
+            native_resume_guard_latched=bool(
+                data.get("native_resume_guard_latched", False)
+            ),
+            native_guard_cancel_pending=bool(
+                data.get("native_guard_cancel_pending", False)
+            ),
+            native_guard_stop_confirmed=bool(
+                data.get("native_guard_stop_confirmed", False)
+            ),
+            native_guard_return_confirmed=bool(
+                data.get("native_guard_return_confirmed", False)
+            ),
+            native_guard_cancel_reason=data.get("native_guard_cancel_reason"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -510,6 +676,11 @@ class SessionState:
             "terminal_message": self.terminal_message,
             "needs_help": self.needs_help,
             "notification_sent": self.notification_sent,
+            "native_resume_guard_latched": self.native_resume_guard_latched,
+            "native_guard_cancel_pending": self.native_guard_cancel_pending,
+            "native_guard_stop_confirmed": self.native_guard_stop_confirmed,
+            "native_guard_return_confirmed": self.native_guard_return_confirmed,
+            "native_guard_cancel_reason": self.native_guard_cancel_reason,
         }
 
 
@@ -901,15 +1072,23 @@ def evaluate_run_success(
     if not run.observed_segment_cleaning:
         return False, "Vacuum never reported segment cleaning"
 
-    start_time = run.start_time
-    if start_time is not None and end_time is not None:
-        duration_delta = counter_delta(start_time, end_time)
+    if room.require_estimated_segment:
+        wrong_room = dominant_wrong_room(run, room)
+        if wrong_room is not None:
+            wrong_room_id, wrong_dwell, commanded_dwell = wrong_room
+            return (
+                False,
+                f"{WRONG_ROOM_FAILURE_PREFIX} {wrong_room_id} "
+                f"({wrong_dwell:.0f}s versus {commanded_dwell:.0f}s in {room.room_id})",
+            )
+
+    duration_delta = run.total_time(end_time)
+    if duration_delta is not None:
         if duration_delta < room.min_duration:
             return False, f"Cleaned for {duration_delta:.0f}s, below {room.min_duration}s threshold"
 
-    start_area = run.start_area
-    if room.min_area > 0 and start_area is not None and end_area is not None:
-        area_delta = counter_delta(start_area, end_area)
+    area_delta = run.total_area(end_area)
+    if room.min_area > 0 and area_delta is not None:
         if area_delta < room.min_area:
             return False, f"Cleaned area {area_delta:.1f}, below {room.min_area:.1f} threshold"
 
@@ -926,6 +1105,38 @@ def counter_delta(start_value: float, end_value: float) -> float:
     if end_value >= start_value:
         return end_value - start_value
     return max(0.0, end_value)
+
+
+def dominant_wrong_room(
+    run: ActiveRun,
+    room: RoomConfig,
+) -> tuple[str, float, float] | None:
+    """Return a materially dominant non-commanded room, excluding transit."""
+    commanded_dwell = run.estimated_dwell_seconds.get(room.room_id, 0.0)
+    if commanded_dwell < max(10.0, float(room.min_estimated_dwell)):
+        return None
+    wrong_rooms = [
+        (room_id, dwell)
+        for room_id, dwell in run.estimated_dwell_seconds.items()
+        if room_id != room.room_id
+    ]
+    if not wrong_rooms:
+        return None
+
+    wrong_room_id, wrong_dwell = max(wrong_rooms, key=lambda item: item[1])
+    minimum_dwell = max(60.0, float(room.min_estimated_dwell))
+    if (
+        wrong_dwell >= minimum_dwell
+        and wrong_dwell >= commanded_dwell * 1.5
+        and wrong_dwell - commanded_dwell >= 10.0
+    ):
+        return wrong_room_id, wrong_dwell, commanded_dwell
+    return None
+
+
+def is_wrong_room_failure(reason: str | None) -> bool:
+    """Return whether a failure indicates the firmware cleaned another room."""
+    return bool(reason and reason.startswith(WRONG_ROOM_FAILURE_PREFIX))
 
 
 def manual_rooms_to_credit(

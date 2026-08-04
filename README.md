@@ -25,6 +25,11 @@ valetudo_vacuum_coordinator:
     - person.person_one
     - person.person_two
   away_delay: 300
+  min_battery: 55
+  native_resume_enabled: true
+  native_resume_timeout: 10800
+  dock_settle: 60
+  resume_nudge_enabled: false
   segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set
   status_flag_entity: sensor.valetudo_robot_status_flag
   dock_status_entity: sensor.valetudo_robot_dock_status
@@ -72,6 +77,7 @@ See [configuration.example.yaml](configuration.example.yaml) for a fuller generi
 - Per-room auto-clean disabled switches: toggle a room on here to exclude it from future away auto-clean sessions without changing manual selected-room cleaning.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
 - Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
+- Native-resume-pending binary sensor: read-only guard that stays on while a retained Valetudo task is interrupted or suspended. Use it to block manual/startup command loops.
 - Session sensors: state, current room, queue summary.
 - Per-room sensors: last successful clean timestamp and successful clean count.
 
@@ -83,7 +89,13 @@ Set `notify_service` to enable one final summary notification per away auto-clea
 
 Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration can also use the Status Flag, Dock Status, Error, Battery, Current Statistics, Estimated Segment, and optional Dock Component sensors.
 
-Low-battery recovery requires `battery_entity`. The coordinator immediately sends a blocking `vacuum.stop` to cancel Valetudo's native task, returns the robot to its dock when needed, and waits for a clear error plus `min_battery`. Keep `min_battery` above the robot firmware's native auto-resume threshold; the default is 55%. The coordinator then republishes the same room's segment once as a priority retry without using `vacuum.start` or waiting for a native resumable task. If that room hits low battery again, the failure remains recorded; the coordinator still cancels, docks, and charges the robot before continuing with the remaining rooms.
+Version 0.1.3 uses passive native resume for low-battery and dock/mop-rinse interruptions. The same active room run and session remain retained while the robot returns, docks, charges, or rinses. The coordinator does not call `vacuum.stop`, `vacuum.return_to_base`, `vacuum.start`, or publish a fresh segment as part of recovery. It waits for native `cleaning` plus `status_flag=segment`, accumulates statistics across counter resets, and only then continues accounting for the original run.
+
+Configure `status_flag_entity` for passive native-resume confirmation. A suspended run is never released merely because the flag later becomes `none`; without a segment-status observation, it remains guarded until timeout or explicit cancellation.
+
+`native_resume_timeout` defaults to three hours. Expiry ends the uncredited room as `needs_help` without restarting or otherwise commanding the robot. Setting `native_resume_enabled: false` also makes a low-battery interruption terminate as `needs_help`; it does not restore the old restart behavior. `dock_settle` defaults to 60 seconds so a docked/idle event cannot complete a run before late status or dock-state updates arrive. `min_battery` now applies only between room dispatches and never releases or restarts a suspended native task. `resume_nudge_enabled` is reserved and defaults to `false`; v0.1.3 intentionally implements no `vacuum.start` nudge or automatic fresh-segment fallback.
+
+Person arrival and explicit cancellation remain intentionally destructive: when an active run exists, the coordinator persists cancellation intent, sends one blocking `vacuum.stop`, returns to base only when needed, then clears the run and restores settings.
 
 Manual clean tracking credits rooms from Valetudo estimated-segment dwell. If a room has `manual_credit_entity`, a manual run snapshots selected rooms at start and only credits selected rooms that were also observed long enough. This keeps transit segments from being marked clean when a Home Assistant dashboard launches a selected-room run.
 

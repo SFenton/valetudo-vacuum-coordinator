@@ -22,6 +22,7 @@ async def async_setup_platform(
     async_add_entities([
         ValetudoPauseBinarySensor(coordinator),
         ValetudoAutoCleaningBinarySensor(coordinator),
+        ValetudoNativeResumePendingBinarySensor(coordinator),
     ])
 
 
@@ -71,4 +72,32 @@ class ValetudoAutoCleaningBinarySensor(ValetudoCoordinatorEntity, BinarySensorEn
             "terminal_reason": session.terminal_reason if session else None,
             "needs_help": session.needs_help if session else False,
             "notification_sent": session.notification_sent if session else False,
+            **self.coordinator.native_resume_attributes,
         }
+
+
+class ValetudoNativeResumePendingBinarySensor(
+    ValetudoCoordinatorEntity,
+    BinarySensorEntity,
+):
+    """Read-only guard for a retained native Valetudo task."""
+
+    _attr_icon = "mdi:robot-vacuum-alert"
+
+    def __init__(self, coordinator) -> None:
+        """Initialize the native-resume guard sensor."""
+        super().__init__(
+            coordinator,
+            "native_resume_pending",
+            "Native Resume Pending",
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether automations must avoid issuing vacuum commands."""
+        return self.coordinator.native_resume_pending
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return retained-task recovery details."""
+        return self.coordinator.native_resume_attributes

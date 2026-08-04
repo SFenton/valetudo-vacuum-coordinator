@@ -2,7 +2,7 @@
 
 DOMAIN = "valetudo_vacuum_coordinator"
 NAME = "Valetudo Vacuum Coordinator"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 PLATFORM_BINARY_SENSOR = "binary_sensor"
 PLATFORM_SENSOR = "sensor"
@@ -20,6 +20,10 @@ CONF_FRESH_WATER_ENTITY = "fresh_water_entity"
 CONF_IDENTIFIER = "identifier"
 CONF_MANUAL_TRACKING = "manual_tracking"
 CONF_MIN_BATTERY = "min_battery"
+CONF_NATIVE_RESUME_ENABLED = "native_resume_enabled"
+CONF_NATIVE_RESUME_TIMEOUT = "native_resume_timeout"
+CONF_DOCK_SETTLE = "dock_settle"
+CONF_RESUME_NUDGE_ENABLED = "resume_nudge_enabled"
 CONF_MODE_ENTITY = "mode_entity"
 CONF_MODE_VACUUM_OPTION = "mode_vacuum_option"
 CONF_MODE_MOP_OPTION = "mode_mop_option"
@@ -57,6 +61,10 @@ CONF_ROOM_MANUAL_CREDIT_ENTITY = "manual_credit_entity"
 
 DEFAULT_AWAY_DELAY = 300
 DEFAULT_MIN_BATTERY = 55
+DEFAULT_NATIVE_RESUME_ENABLED = True
+DEFAULT_NATIVE_RESUME_TIMEOUT = 10800
+DEFAULT_DOCK_SETTLE = 60
+DEFAULT_RESUME_NUDGE_ENABLED = False
 DEFAULT_ROOM_MIN_DURATION = 120
 DEFAULT_ROOM_MIN_AREA = 0.0
 DEFAULT_ROOM_MIN_ESTIMATED_DWELL = 30
@@ -98,6 +106,15 @@ ATTR_NOTIFICATION_SENT = "notification_sent"
 ATTR_WHILE_AWAY_CLEANED = "while_away_cleaned"
 ATTR_WHILE_AWAY_ISSUES = "while_away_issues"
 ATTR_VACUUM_ONLY = "vacuum_only"
+ATTR_PHASE = "phase"
+ATTR_SUSPENDED_AT = "suspended_at"
+ATTR_SUSPEND_REASON = "suspend_reason"
+ATTR_RESUME_SOURCE = "resume_source"
+ATTR_INTERRUPTION_COUNT = "interruption_count"
+ATTR_NATIVE_RESUME_OBSERVED = "native_resume_observed"
+ATTR_RESUMABLE_LATCHED = "resumable_latched"
+ATTR_RECOVERY_DEADLINE = "recovery_deadline"
+ATTR_REQUESTED_ITERATIONS = "requested_iterations"
 
 STORE_VERSION = 1
 STORE_KEY = "valetudo_vacuum_coordinator"

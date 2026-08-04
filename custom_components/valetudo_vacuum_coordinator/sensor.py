@@ -19,6 +19,15 @@ from .const import (
     ATTR_LAST_SUCCESSFUL_CLEAN,
     ATTR_LAST_VACUUMED,
     ATTR_PENDING_ROOMS,
+    ATTR_PHASE,
+    ATTR_SUSPENDED_AT,
+    ATTR_SUSPEND_REASON,
+    ATTR_RESUME_SOURCE,
+    ATTR_INTERRUPTION_COUNT,
+    ATTR_NATIVE_RESUME_OBSERVED,
+    ATTR_RESUMABLE_LATCHED,
+    ATTR_RECOVERY_DEADLINE,
+    ATTR_REQUESTED_ITERATIONS,
     ATTR_ROOM_ID,
     ATTR_SESSION_ID,
     ATTR_SKIPPED_REASONS,
@@ -85,6 +94,7 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
             ATTR_WHILE_AWAY_ISSUES: self.coordinator.while_away_issue_messages,
+            **self.coordinator.native_resume_attributes,
         }
 
 
@@ -111,6 +121,19 @@ class ValetudoCurrentRoomSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_ROOM_ID: run.room_id if run else None,
             "segment_id": run.segment_id if run else None,
             ATTR_VACUUM_ONLY: run.vacuum_only if run else False,
+            ATTR_PHASE: run.phase if run else None,
+            ATTR_SUSPENDED_AT: run.suspended_at if run else None,
+            ATTR_SUSPEND_REASON: run.suspend_reason if run else None,
+            ATTR_RESUME_SOURCE: run.resume_source if run else None,
+            ATTR_INTERRUPTION_COUNT: run.interruption_count if run else 0,
+            ATTR_NATIVE_RESUME_OBSERVED: (
+                run.resumed_after_suspend if run else False
+            ),
+            ATTR_RESUMABLE_LATCHED: run.resumable_latched if run else False,
+            ATTR_RECOVERY_DEADLINE: run.recovery_deadline if run else None,
+            ATTR_REQUESTED_ITERATIONS: (
+                run.requested_iterations if run else None
+            ),
         }
 
 
