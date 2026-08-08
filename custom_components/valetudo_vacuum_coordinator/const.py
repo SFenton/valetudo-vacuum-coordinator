@@ -2,7 +2,7 @@
 
 DOMAIN = "valetudo_vacuum_coordinator"
 NAME = "Valetudo Vacuum Coordinator"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 PLATFORM_BINARY_SENSOR = "binary_sensor"
 PLATFORM_SENSOR = "sensor"
@@ -79,6 +79,7 @@ DEFAULT_FAN_AUTO_CLEAN_OPTION = "max"
 DEFAULT_WATER_MOP_OPTION = "max"
 
 SERVICE_CANCEL_SESSION = "cancel_session"
+SERVICE_DOCK_ACTION = "dock_action"
 SERVICE_MARK_ROOM_CLEANED = "mark_room_cleaned"
 SERVICE_RESET_ROOM = "reset_room"
 SERVICE_SET_PAUSED = "set_paused"

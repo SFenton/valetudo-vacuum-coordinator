@@ -22,6 +22,33 @@ cancel_session:
       selector:
         text:
 
+dock_action:
+  name: Run Valetudo dock action
+  description: Start or stop a supported mop-dock cleaning or drying action through the robot's local Valetudo API.
+  fields:
+    identifier:
+      name: Valetudo identifier
+      description: Case-sensitive Valetudo robot identifier.
+      required: true
+      selector:
+        text:
+    capability:
+      name: Dock capability
+      required: true
+      selector:
+        select:
+          options:
+            - clean
+            - dry
+    action:
+      name: Action
+      required: true
+      selector:
+        select:
+          options:
+            - start
+            - stop
+
 set_paused:
   name: Set coordinator pause
   description: Pause or resume automatic cleaning behavior.
