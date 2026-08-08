@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import asyncio
 import logging
 from typing import Any
 
@@ -10,6 +11,8 @@ import voluptuous as vol
 
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
@@ -83,12 +86,18 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     SERVICE_CANCEL_SESSION,
+    SERVICE_DOCK_ACTION,
     SERVICE_MARK_ROOM_CLEANED,
     SERVICE_RESET_ROOM,
     SERVICE_SET_PAUSED,
     SERVICE_START_SESSION,
 )
 from .coordinator import ValetudoVacuumCoordinator
+from .dock import (
+    DOCK_ACTION_CAPABILITIES,
+    DOCK_ACTIONS,
+    build_dock_action_url,
+)
 from .logic import RoomConfig
 
 _LOGGER = logging.getLogger(__name__)
@@ -183,6 +192,17 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
+DOCK_ACTION_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_IDENTIFIER): vol.All(
+            cv.string,
+            vol.Match(r"^[A-Za-z0-9]+$"),
+        ),
+        vol.Required("capability"): vol.In(DOCK_ACTION_CAPABILITIES),
+        vol.Required("action"): vol.In(DOCK_ACTIONS),
+    }
+)
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up Valetudo Vacuum Coordinator from YAML."""
@@ -260,6 +280,33 @@ def _register_services(hass: HomeAssistant) -> None:
         coordinator = _get_coordinator(hass, call.data.get("coordinator"))
         await coordinator.async_cancel_session(call.data.get("reason", "service"))
 
+    async def async_dock_action(call: ServiceCall) -> None:
+        identifier = str(call.data[CONF_IDENTIFIER])
+        capability = str(call.data["capability"])
+        action = str(call.data["action"])
+        url = build_dock_action_url(identifier, capability)
+        session = async_get_clientsession(hass)
+
+        try:
+            async with asyncio.timeout(15):
+                async with session.put(url, json={"action": action}) as response:
+                    response_body = await response.text()
+                    if response.status >= 400:
+                        raise HomeAssistantError(
+                            f"Valetudo dock action failed with HTTP "
+                            f"{response.status}: {response_body[:200]}"
+                        )
+        except TimeoutError as err:
+            raise HomeAssistantError(
+                f"Valetudo dock action timed out for {identifier}"
+            ) from err
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Valetudo dock action failed for {identifier}: {err}"
+            ) from err
+
     async def async_set_paused(call: ServiceCall) -> None:
         coordinator = _get_coordinator(hass, call.data.get("coordinator"))
         await coordinator.async_set_paused(bool(call.data["paused"]), call.data.get("reason", "service"))
@@ -278,6 +325,12 @@ def _register_services(hass: HomeAssistant) -> None:
 
     hass.services.async_register(DOMAIN, SERVICE_START_SESSION, async_start_session)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_SESSION, async_cancel_session)
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DOCK_ACTION,
+        async_dock_action,
+        schema=DOCK_ACTION_SCHEMA,
+    )
     hass.services.async_register(DOMAIN, SERVICE_SET_PAUSED, async_set_paused)
     hass.services.async_register(DOMAIN, SERVICE_MARK_ROOM_CLEANED, async_mark_room_cleaned)
     hass.services.async_register(DOMAIN, SERVICE_RESET_ROOM, async_reset_room)

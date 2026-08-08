@@ -81,6 +81,15 @@ See [configuration.example.yaml](configuration.example.yaml) for a fuller generi
 - Session sensors: state, current room, queue summary.
 - Per-room sensors: last successful clean timestamp and successful clean count.
 
+## Dock Actions
+
+The integration registers `valetudo_vacuum_coordinator.dock_action` as a
+restricted Home Assistant bridge for Valetudo mop-dock cleaning and drying.
+It accepts only an alphanumeric Valetudo identifier, `clean` or `dry`, and
+`start` or `stop`. The service constructs the matching
+`valetudo-<identifier>.local` capability URL; callers cannot supply arbitrary
+URLs.
+
 ## Auto-Clean Notifications
 
 Set `notify_service` to enable one final summary notification per away auto-clean session. Normal per-room completion and recoverable error notifications should be suppressed while the auto-cleaning binary sensor is on. The integration sends no summary if someone comes home before any room completes.
