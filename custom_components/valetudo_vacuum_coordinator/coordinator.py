@@ -1291,6 +1291,52 @@ class ValetudoVacuumCoordinator:
         self._cancel_native_resume_timeout()
         return True
 
+    def _cleared_native_task_settle_started_at(
+        self,
+        run: ActiveRun,
+    ) -> datetime | None:
+        """Return when a retained non-battery task became safely clear at the dock."""
+        if (
+            not run.native_resume_pending
+            or not run.resume_required
+            or is_low_battery_error(run.suspend_reason)
+            or run.cancel_requested_at is not None
+            or not self.session
+            or not self.session.active
+            or normalize_state(self._state(self.vacuum_entity)) != "docked"
+            or not self._configured_error_is_clear()
+        ):
+            return None
+
+        status_entity = self.config.get(CONF_STATUS_FLAG_ENTITY)
+        if (
+            not status_entity
+            or not self._configured_status_is_available()
+            or self._status_flag() != "none"
+        ):
+            return None
+
+        dock_status_entity = self.config.get(CONF_DOCK_STATUS_ENTITY)
+        dock_status = normalize_state(self._state(dock_status_entity))
+        if dock_status_entity and (
+            dock_status is None
+            or dock_status.lower() in {"unknown", "unavailable"}
+            or dock_status.lower() in _BUSY_DOCK_STATES
+        ):
+            return None
+
+        suspended_at = parse_datetime(run.suspended_at)
+        docked_at = parse_datetime(run.docked_at)
+        status_state = self.hass.states.get(status_entity)
+        if (
+            suspended_at is None
+            or docked_at is None
+            or status_state is None
+            or status_state.last_changed <= suspended_at
+        ):
+            return None
+        return max(docked_at, status_state.last_changed)
+
     async def _async_reconcile_active_run(self, now: datetime) -> bool:
         """Reconcile retained-run recovery from the current HA sensor snapshot."""
         run = self.active_run
@@ -1529,8 +1575,34 @@ class ValetudoVacuumCoordinator:
             self._notify_listeners()
 
         if run.native_resume_pending and run.resume_required:
-            self._schedule_native_resume_timeout()
-            return
+            cleared_task_settle_started_at = (
+                self._cleared_native_task_settle_started_at(run)
+            )
+            if cleared_task_settle_started_at is None:
+                self._schedule_native_resume_timeout()
+                return
+
+            settle_seconds = int(
+                self.config.get(CONF_DOCK_SETTLE, DEFAULT_DOCK_SETTLE)
+            )
+            if (
+                now - cleared_task_settle_started_at
+            ).total_seconds() < settle_seconds:
+                self._schedule_dock_settle_timer(
+                    cleared_task_settle_started_at
+                )
+                self._schedule_native_resume_timeout()
+                return
+
+            _LOGGER.info(
+                "Finalizing %s room %s after Valetudo cleared the retained task at the dock",
+                self.name,
+                run.room_id,
+            )
+            run.resume_required = False
+            run.resume_source = "native_task_cleared"
+            run.recovery_deadline = None
+            self._cancel_native_resume_timeout()
 
         docked_at = parse_datetime(run.docked_at) or now
         settle_seconds = int(
@@ -1642,7 +1714,10 @@ class ValetudoVacuumCoordinator:
             timer_finished,
         )
 
-    def _schedule_dock_settle_timer(self) -> None:
+    def _schedule_dock_settle_timer(
+        self,
+        settle_started_at: datetime | None = None,
+    ) -> None:
         """Schedule reconciliation after the stable dock settle window."""
         run = self.active_run
         if (
@@ -1651,14 +1726,14 @@ class ValetudoVacuumCoordinator:
             or self._dock_settle_cancel is not None
         ):
             return
-        docked_at = parse_datetime(run.docked_at)
-        if docked_at is None:
+        settle_started_at = settle_started_at or parse_datetime(run.docked_at)
+        if settle_started_at is None:
             return
         settle_seconds = int(
             self.config.get(CONF_DOCK_SETTLE, DEFAULT_DOCK_SETTLE)
         )
         remaining = settle_seconds - (
-            dt_util.utcnow() - docked_at
+            dt_util.utcnow() - settle_started_at
         ).total_seconds()
         if remaining <= 0:
             return
@@ -2041,11 +2116,7 @@ class ValetudoVacuumCoordinator:
         run = self.active_run
         if not run or not run.room_id:
             return
-        if (
-            success_override is None
-            and run.resume_required
-            and not run.resumed_after_suspend
-        ):
+        if success_override is None and run.resume_required:
             return
 
         room = self.room_by_id[run.room_id]

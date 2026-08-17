@@ -358,6 +358,25 @@ def _trigger_low_battery(
     _handle_event(coordinator, "sensor.robot_error", "Low battery")
 
 
+def _trigger_final_resumable_return(
+    coordinator: _RecoverableFailureCoordinator,
+) -> logic.ActiveRun:
+    active_run = coordinator.active_run
+    assert active_run is not None
+    active_run.phase = logic.RUN_PHASE_RESUMED_CLEANING
+    active_run.observed_cleaning = True
+    active_run.observed_segment_cleaning = True
+    active_run.resumed_after_suspend = True
+    active_run.resume_source = "native_segment"
+    coordinator.set_state(coordinator.vacuum_entity, "returning")
+    _handle_event(coordinator, "sensor.robot_status_flag", "resumable")
+
+    assert coordinator.active_run is active_run
+    assert active_run.phase == logic.RUN_PHASE_SUSPENDED
+    assert active_run.resume_required is True
+    return active_run
+
+
 def test_error_95_recovery_clears_warning_and_requeues_room_after_docking() -> None:
     coordinator = _RecoverableFailureCoordinator()
     event_cls = sys.modules["homeassistant.core"].Event
@@ -1013,6 +1032,150 @@ def test_mid_job_dock_busy_and_resumable_never_complete_or_dispatch() -> None:
     assert coordinator.session.completed_room_ids == []
     assert coordinator.started_rooms == []
     assert coordinator.hass.services.calls == []
+
+
+def test_final_resumable_task_clears_at_stable_dock_and_advances() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    active_run = _trigger_final_resumable_return(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+
+    _handle_event(coordinator, "sensor.robot_status_flag", "none")
+
+    assert active_run.resume_required is False
+    assert active_run.resume_source == "native_task_cleared"
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    assert coordinator.ledgers["room_one"].successful_count == 1
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "room_two"
+    assert coordinator.started_rooms == ["room_two"]
+    assert coordinator.hass.services.calls == []
+
+
+def test_final_resumable_task_waits_for_status_and_dock_settle() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_DOCK_SETTLE] = 60
+    active_run = _trigger_final_resumable_return(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+
+    _handle_event(coordinator, "sensor.robot_status_flag", "none")
+
+    assert coordinator.active_run is active_run
+    assert active_run.resume_required is True
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+
+    now = datetime.now(UTC)
+    active_run.docked_at = (now - timedelta(seconds=61)).isoformat()
+    active_run.suspended_at = (now - timedelta(seconds=120)).isoformat()
+    coordinator.hass.states.get(
+        "sensor.robot_status_flag"
+    ).last_changed = now - timedelta(seconds=61)
+
+    asyncio.run(coordinator._async_reconcile_active_run(now))
+
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "room_two"
+    assert coordinator.started_rooms == ["room_two"]
+
+
+def test_final_resumable_none_while_returning_does_not_release() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    active_run = _trigger_final_resumable_return(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_status_flag", "none")
+
+    assert coordinator.active_run is active_run
+    assert active_run.phase == logic.RUN_PHASE_SUSPENDED
+    assert active_run.resume_required is True
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.started_rooms == []
+
+
+def test_final_resumable_reasserted_before_settle_remains_suspended() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_DOCK_SETTLE] = 60
+    active_run = _trigger_final_resumable_return(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+    _handle_event(coordinator, "sensor.robot_status_flag", "none")
+
+    _handle_event(coordinator, "sensor.robot_status_flag", "resumable")
+
+    now = datetime.now(UTC)
+    active_run.docked_at = (now - timedelta(seconds=61)).isoformat()
+    asyncio.run(coordinator._async_reconcile_active_run(now))
+
+    assert coordinator.active_run is active_run
+    assert active_run.phase == logic.RUN_PHASE_SUSPENDED
+    assert active_run.resume_required is True
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.started_rooms == []
+
+
+def test_final_resumable_ignores_none_that_predates_suspension() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    active_run = coordinator.active_run
+    assert active_run is not None
+    now = datetime.now(UTC)
+    active_run.phase = logic.RUN_PHASE_SUSPENDED
+    active_run.observed_cleaning = True
+    active_run.observed_segment_cleaning = True
+    active_run.suspended_at = (now - timedelta(seconds=60)).isoformat()
+    active_run.suspend_reason = "Valetudo reported a resumable native task"
+    active_run.resumable_latched = True
+    active_run.resume_required = True
+    active_run.docked_at = (now - timedelta(seconds=30)).isoformat()
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+    coordinator.hass.states.get(
+        "sensor.robot_status_flag"
+    ).last_changed = now - timedelta(seconds=120)
+
+    asyncio.run(coordinator._async_reconcile_active_run(now))
+
+    assert coordinator.active_run is active_run
+    assert active_run.resume_required is True
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.started_rooms == []
+
+
+def test_restored_final_resumable_task_clears_after_stable_dock() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    active_run = coordinator.active_run
+    assert active_run is not None
+    now = datetime.now(UTC)
+    active_run.phase = logic.RUN_PHASE_SUSPENDED
+    active_run.observed_cleaning = True
+    active_run.observed_segment_cleaning = True
+    active_run.suspended_at = (now - timedelta(seconds=120)).isoformat()
+    active_run.suspend_reason = "Valetudo reported a resumable native task"
+    active_run.resumable_latched = True
+    active_run.resume_required = True
+    active_run.docked_at = (now - timedelta(seconds=61)).isoformat()
+    coordinator.config[const.CONF_DOCK_SETTLE] = 60
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+    coordinator.hass.states.get(
+        "sensor.robot_status_flag"
+    ).last_changed = now - timedelta(seconds=61)
+    coordinator._active_run_restored = True
+
+    asyncio.run(coordinator._async_reconcile_restored_session())
+
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "room_two"
+    assert coordinator.started_rooms == ["room_two"]
 
 
 def test_legacy_low_battery_retry_becomes_needs_help_without_republish() -> None:
