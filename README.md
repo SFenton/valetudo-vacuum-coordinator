@@ -29,7 +29,10 @@ valetudo_vacuum_coordinator:
   native_resume_enabled: true
   native_resume_timeout: 10800
   dock_settle: 60
+  dispatch_start_timeout: 120
+  blocked_session_timeout: 300
   resume_nudge_enabled: false
+  identifier: robot
   segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set
   status_flag_entity: sensor.valetudo_robot_status_flag
   dock_status_entity: sensor.valetudo_robot_dock_status
@@ -53,6 +56,7 @@ valetudo_vacuum_coordinator:
   dirty_water_entity: sensor.valetudo_robot_wastewater_dock_component
   detergent_entity: sensor.valetudo_robot_detergent_dock_component
   dustbag_entity: sensor.valetudo_robot_dustbag_dock_component
+  allow_vacuum_only_when_mop_blocked: true
   rooms:
     - id: room_one
       name: Room One
@@ -78,8 +82,8 @@ See [configuration.example.yaml](configuration.example.yaml) for a fuller generi
 - Pause binary sensor: read-only status for dashboards and automation conditions.
 - Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
 - Native-resume-pending binary sensor: read-only guard that stays on while a retained Valetudo task is interrupted or suspended. Use it to block manual/startup command loops.
-- Session sensors: state, current room, queue summary.
-- Per-room sensors: last successful clean timestamp and successful clean count.
+- Session sensors: state, current room, actionable queue, fallback-vacuumed rooms, and deferred full-clean rooms.
+- Per-room sensors: last successful clean, last vacuumed, last fallback-vacuumed, last mopped, and successful clean count.
 
 ## Dock Actions
 
@@ -94,9 +98,50 @@ URLs.
 
 Set `notify_service` to enable one final summary notification per away auto-clean session. Normal per-room completion and recoverable error notifications should be suppressed while the auto-cleaning binary sensor is on. The integration sends no summary if someone comes home before any room completes.
 
+When clean water remains empty, the final summary distinguishes fully completed
+rooms from rooms that were only vacuumed and still need mopping.
+
 ## Notes
 
 Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration can also use the Status Flag, Dock Status, Error, Battery, Current Statistics, Estimated Segment, and optional Dock Component sensors.
+
+Version 0.1.6 handles the exact clean-water-empty dock fault as a finite
+degraded session. It cancels the interrupted full run, processes every
+configured vacuum-only room first, then—when
+`allow_vacuum_only_when_mop_blocked` is enabled—vacuum-cleans each incomplete
+dual-mode room at most once. Those fallback rooms update `last_vacuumed` and
+`last_fallback_vacuumed`, but not the successful-clean timestamp, daily
+auto-clean slot, mop timestamp, successful count, or full completed-room list.
+They therefore remain due for a later normal vacuum-and-mop session.
+
+The degraded queue terminalizes as `mop_resource_deferred` when its actionable
+work is exhausted or cannot begin within the configured bounds. The queue state
+then reaches zero while `deferred_full_clean_rooms` preserves the outstanding
+mop obligations. `dispatch_start_timeout` bounds a segment publish that the
+firmware never starts; `blocked_session_timeout` bounds any active session with
+no active run and no safe dispatch. If clean water is refilled before
+terminalization, remaining native vacuum-only rooms still finish first, then
+untouched dual-mode rooms return to normal full cleaning. A terminal session is
+not revived or automatically restarted during the same persisted away period.
+After refilling, use `start_session` explicitly or wait for a later home-to-away
+transition.
+
+The vacuum-only fallback is intentionally limited to positively identified
+clean-water-empty faults. Unknown error 120, wastewater, detergent, tray, and
+other mop-resource errors do not receive an automatic vacuum fallback.
+`blocked_session_timeout` still applies to those ordinary sessions: after one
+final re-evaluation, a stationary session that remains blocked terminates with
+`terminal_reason: blocked` instead of remaining silently active.
+Both `blocked` and `mop_resource_deferred` terminals suppress automatic restart
+during the same persisted away period. Battery-below-minimum, charging, and
+resumable waits use the longer `native_resume_timeout`; a later shorter resource
+fault may shorten that deadline, but no state change extends it.
+
+If `identifier` is configured, degraded preparation sends one bounded
+mop-dock-clean stop through the existing restricted dock-action bridge before
+selecting vacuum mode. Firmware support for starting a segment while the
+clean-water warning remains latched is model-specific; an ignored command is
+handled by the finite dispatch timeout rather than retried forever.
 
 Version 0.1.3 uses passive native resume for low-battery and dock/mop-rinse interruptions. The same active room run and session remain retained while the robot returns, docks, charges, or rinses. The coordinator does not call `vacuum.stop`, `vacuum.return_to_base`, `vacuum.start`, or publish a fresh segment as part of recovery. It waits for native `cleaning` plus `status_flag=segment`, accumulates statistics across counter resets, and only then continues accounting for the original run.
 

@@ -8,6 +8,10 @@ from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import (
+    ATTR_DEFERRED_FULL_CLEAN_ROOMS,
+    ATTR_FALLBACK_COMPLETED_ROOMS,
+)
 from .entity import ValetudoCoordinatorEntity, get_coordinator_from_discovery
 
 
@@ -69,6 +73,12 @@ class ValetudoAutoCleaningBinarySensor(ValetudoCoordinatorEntity, BinarySensorEn
             "completed_rooms": session.completed_room_ids if session else [],
             "skipped_rooms": session.skipped_room_ids if session else [],
             "failed_rooms": session.failed_room_ids if session else [],
+            ATTR_FALLBACK_COMPLETED_ROOMS: (
+                session.fallback_completed_room_ids if session else []
+            ),
+            ATTR_DEFERRED_FULL_CLEAN_ROOMS: (
+                session.deferred_full_clean_room_ids if session else []
+            ),
             "terminal_reason": session.terminal_reason if session else None,
             "needs_help": session.needs_help if session else False,
             "notification_sent": session.notification_sent if session else False,

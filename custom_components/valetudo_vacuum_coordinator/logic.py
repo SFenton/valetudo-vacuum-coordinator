@@ -11,6 +11,7 @@ NO_ERROR_VALUES = {None, "", "No error", "no error", "none", "unknown", "unavail
 
 MOP_RESOURCE_ERROR_KEYWORDS = (
     "clean water",
+    "fresh water",
     "freshwater",
     "water tank empty",
     "water tank missing",
@@ -46,6 +47,15 @@ LOW_BATTERY_ERROR_KEYWORDS = (
     "low battery",
     "battery low",
 )
+
+CLEAN_WATER_EMPTY_ERROR_VALUES = {
+    "mop dock clean water tank empty",
+    "clean water tank empty",
+    "fresh water is empty",
+    "fresh water tank empty",
+    "freshwater tank empty",
+}
+CLEAN_WATER_EMPTY_DISPOSITION = "__clean_water_empty__"
 
 RUN_PHASE_DISPATCHING = "dispatching"
 RUN_PHASE_CLEANING = "cleaning"
@@ -105,6 +115,7 @@ class RoomLedger:
 
     last_successful_clean: str | None = None
     last_vacuumed: str | None = None
+    last_fallback_vacuumed: str | None = None
     last_mopped: str | None = None
     last_auto_cleaned: str | None = None
     last_auto_cleaned_day: str | None = None
@@ -121,6 +132,7 @@ class RoomLedger:
         return cls(
             last_successful_clean=data.get("last_successful_clean"),
             last_vacuumed=data.get("last_vacuumed"),
+            last_fallback_vacuumed=data.get("last_fallback_vacuumed"),
             last_mopped=data.get("last_mopped"),
             last_auto_cleaned=data.get("last_auto_cleaned"),
             last_auto_cleaned_day=data.get("last_auto_cleaned_day"),
@@ -134,6 +146,7 @@ class RoomLedger:
         return {
             "last_successful_clean": self.last_successful_clean,
             "last_vacuumed": self.last_vacuumed,
+            "last_fallback_vacuumed": self.last_fallback_vacuumed,
             "last_mopped": self.last_mopped,
             "last_auto_cleaned": self.last_auto_cleaned,
             "last_auto_cleaned_day": self.last_auto_cleaned_day,
@@ -162,6 +175,7 @@ class RoomSelection:
     room: RoomConfig
     vacuum_only: bool = False
     mop_block_reason: str | None = None
+    fallback_vacuum: bool = False
 
 
 @dataclass(slots=True)
@@ -176,6 +190,8 @@ class ActiveRun:
     start_time: float | None = None
     manual: bool = False
     vacuum_only: bool = False
+    fallback_vacuum: bool = False
+    allowed_error_fingerprint: str | None = None
     cancelled: bool = False
     command_published: bool = False
     phase: str = RUN_PHASE_DISPATCHING
@@ -189,6 +205,7 @@ class ActiveRun:
     docked_at: str | None = None
     interruption_count: int = 0
     requested_iterations: int = 2
+    dispatch_deadline: str | None = None
     recovery_deadline: str | None = None
     resume_required: bool = False
     post_suspend_cleaning_observed: bool = False
@@ -289,6 +306,8 @@ class ActiveRun:
             start_time=start_time,
             manual=bool(data.get("manual", False)),
             vacuum_only=bool(data.get("vacuum_only", False)),
+            fallback_vacuum=bool(data.get("fallback_vacuum", False)),
+            allowed_error_fingerprint=data.get("allowed_error_fingerprint"),
             cancelled=bool(data.get("cancelled", False)),
             command_published=command_published,
             phase=phase,
@@ -304,6 +323,7 @@ class ActiveRun:
             requested_iterations=max(
                 1, int(parse_float(data.get("requested_iterations")) or 2)
             ),
+            dispatch_deadline=data.get("dispatch_deadline"),
             recovery_deadline=data.get("recovery_deadline"),
             resume_required=bool(data.get("resume_required", False)),
             post_suspend_cleaning_observed=bool(
@@ -346,6 +366,8 @@ class ActiveRun:
             "start_time": self.start_time,
             "manual": self.manual,
             "vacuum_only": self.vacuum_only,
+            "fallback_vacuum": self.fallback_vacuum,
+            "allowed_error_fingerprint": self.allowed_error_fingerprint,
             "cancelled": self.cancelled,
             "command_published": self.command_published,
             "phase": self.phase,
@@ -359,6 +381,7 @@ class ActiveRun:
             "docked_at": self.docked_at,
             "interruption_count": self.interruption_count,
             "requested_iterations": self.requested_iterations,
+            "dispatch_deadline": self.dispatch_deadline,
             "recovery_deadline": self.recovery_deadline,
             "resume_required": self.resume_required,
             "post_suspend_cleaning_observed": self.post_suspend_cleaning_observed,
@@ -426,7 +449,7 @@ class WhileAwayOutcome:
         day = normalize_state(data.get("day"))
         room_id = normalize_state(data.get("room_id"))
         kind = normalize_state(data.get("kind"))
-        if not day or not room_id or kind not in {"cleaned", "skipped", "failed"}:
+        if not day or not room_id or kind not in {"cleaned", "skipped", "failed", "fallback"}:
             return None
         return cls(day=day, room_id=room_id, kind=kind, reason=data.get("reason"))
 
@@ -449,6 +472,7 @@ def build_while_away_messages(
     cleaned_room_names: list[str] = []
     skipped_reasons: dict[str, str] = {}
     failed_reasons: dict[str, str] = {}
+    fallback_reasons: dict[str, str] = {}
 
     for outcome in outcomes:
         if outcome.day != day:
@@ -461,16 +485,26 @@ def build_while_away_messages(
                 cleaned_room_names.append(room_name)
             skipped_reasons.pop(room_name, None)
             failed_reasons.pop(room_name, None)
+            fallback_reasons.pop(room_name, None)
         elif outcome.kind == "skipped":
             if room_name not in cleaned_room_names:
                 skipped_reasons[room_name] = outcome.reason or "Unknown issue"
         elif outcome.kind == "failed":
             if room_name not in cleaned_room_names:
                 failed_reasons[room_name] = outcome.reason or "Unknown failure"
+        elif outcome.kind == "fallback":
+            if room_name not in cleaned_room_names:
+                failed_reasons.pop(room_name, None)
+                skipped_reasons.pop(room_name, None)
+                fallback_reasons[room_name] = outcome.reason or "Mopping remains due"
 
-    return build_cleaned_messages(cleaned_room_names), build_issue_messages(
-        skipped_reasons, failed_reasons
+    issues = build_issue_messages(skipped_reasons, failed_reasons)
+    issues.extend(
+        f"Vacuumed {room_name}; mopping remains due because "
+        f"{friendly_failure_reason(reason)}"
+        for room_name, reason in fallback_reasons.items()
     )
+    return build_cleaned_messages(cleaned_room_names), issues
 
 
 @dataclass(slots=True)
@@ -487,6 +521,12 @@ class SessionState:
     failed_room_ids: list[str] = field(default_factory=list)
     skipped_room_reasons: dict[str, str] = field(default_factory=dict)
     failed_room_reasons: dict[str, str] = field(default_factory=dict)
+    fallback_attempted_room_ids: list[str] = field(default_factory=list)
+    fallback_completed_room_ids: list[str] = field(default_factory=list)
+    fallback_failed_room_ids: list[str] = field(default_factory=list)
+    fallback_failed_room_reasons: dict[str, str] = field(default_factory=dict)
+    deferred_full_clean_room_ids: list[str] = field(default_factory=list)
+    deferred_full_clean_reasons: dict[str, str] = field(default_factory=dict)
     retry_room_ids: list[str] = field(default_factory=list)
     priority_retry_room_ids: list[str] = field(default_factory=list)
     retried_room_ids: list[str] = field(default_factory=list)
@@ -496,8 +536,15 @@ class SessionState:
     active_room_id: str | None = None
     terminal_reason: str | None = None
     terminal_message: str | None = None
+    terminal_cause: str | None = None
     needs_help: bool = False
     notification_sent: bool = False
+    degraded_reason: str | None = None
+    degraded_at: str | None = None
+    degraded_preparation_attempted: bool = False
+    degraded_preparation_completed: bool = False
+    blocked_deadline: str | None = None
+    blocked_reason: str | None = None
     native_resume_guard_latched: bool = False
     native_guard_cancel_pending: bool = False
     native_guard_stop_confirmed: bool = False
@@ -514,8 +561,45 @@ class SessionState:
         self.mark_attempted(room_id)
         if room_id not in self.completed_room_ids:
             self.completed_room_ids.append(room_id)
+        self.clear_deferred_full_clean(room_id)
         self._remove_room_issue(room_id)
         self.active_room_id = None
+
+    def mark_fallback_attempted(self, room_id: str) -> None:
+        """Record that a room consumed its one fallback-vacuum token."""
+        if room_id not in self.fallback_attempted_room_ids:
+            self.fallback_attempted_room_ids.append(room_id)
+
+    def mark_fallback_completed(self, room_id: str) -> None:
+        """Record partial vacuum-only success without normal completion credit."""
+        self.mark_fallback_attempted(room_id)
+        if room_id not in self.fallback_completed_room_ids:
+            self.fallback_completed_room_ids.append(room_id)
+        if room_id in self.fallback_failed_room_ids:
+            self.fallback_failed_room_ids.remove(room_id)
+        self.fallback_failed_room_reasons.pop(room_id, None)
+        self.active_room_id = None
+
+    def mark_fallback_failed(self, room_id: str, reason: str | None = None) -> None:
+        """Record a consumed fallback token that did not finish successfully."""
+        self.mark_fallback_attempted(room_id)
+        if room_id not in self.fallback_failed_room_ids:
+            self.fallback_failed_room_ids.append(room_id)
+        if reason:
+            self.fallback_failed_room_reasons[room_id] = reason
+        self.active_room_id = None
+
+    def defer_full_clean(self, room_id: str, reason: str) -> None:
+        """Record that a room still requires its configured full cleaning mode."""
+        if room_id not in self.deferred_full_clean_room_ids:
+            self.deferred_full_clean_room_ids.append(room_id)
+        self.deferred_full_clean_reasons[room_id] = reason
+
+    def clear_deferred_full_clean(self, room_id: str) -> None:
+        """Clear a deferred full-clean obligation after normal completion."""
+        if room_id in self.deferred_full_clean_room_ids:
+            self.deferred_full_clean_room_ids.remove(room_id)
+        self.deferred_full_clean_reasons.pop(room_id, None)
 
     def mark_skipped(self, room_id: str, reason: str | None = None) -> None:
         """Record a skipped room for this session."""
@@ -626,6 +710,24 @@ class SessionState:
             failed_room_ids=list(data.get("failed_room_ids") or []),
             skipped_room_reasons=dict(data.get("skipped_room_reasons") or {}),
             failed_room_reasons=dict(data.get("failed_room_reasons") or {}),
+            fallback_attempted_room_ids=list(
+                data.get("fallback_attempted_room_ids") or []
+            ),
+            fallback_completed_room_ids=list(
+                data.get("fallback_completed_room_ids") or []
+            ),
+            fallback_failed_room_ids=list(
+                data.get("fallback_failed_room_ids") or []
+            ),
+            fallback_failed_room_reasons=dict(
+                data.get("fallback_failed_room_reasons") or {}
+            ),
+            deferred_full_clean_room_ids=list(
+                data.get("deferred_full_clean_room_ids") or []
+            ),
+            deferred_full_clean_reasons=dict(
+                data.get("deferred_full_clean_reasons") or {}
+            ),
             retry_room_ids=list(data.get("retry_room_ids") or []),
             priority_retry_room_ids=list(data.get("priority_retry_room_ids") or []),
             retried_room_ids=list(data.get("retried_room_ids") or []),
@@ -635,8 +737,19 @@ class SessionState:
             active_room_id=data.get("active_room_id"),
             terminal_reason=data.get("terminal_reason"),
             terminal_message=data.get("terminal_message"),
+            terminal_cause=data.get("terminal_cause"),
             needs_help=bool(data.get("needs_help", False)),
             notification_sent=bool(data.get("notification_sent", False)),
+            degraded_reason=data.get("degraded_reason"),
+            degraded_at=data.get("degraded_at"),
+            degraded_preparation_attempted=bool(
+                data.get("degraded_preparation_attempted", False)
+            ),
+            degraded_preparation_completed=bool(
+                data.get("degraded_preparation_completed", False)
+            ),
+            blocked_deadline=data.get("blocked_deadline"),
+            blocked_reason=data.get("blocked_reason"),
             native_resume_guard_latched=bool(
                 data.get("native_resume_guard_latched", False)
             ),
@@ -665,6 +778,12 @@ class SessionState:
             "failed_room_ids": self.failed_room_ids,
             "skipped_room_reasons": self.skipped_room_reasons,
             "failed_room_reasons": self.failed_room_reasons,
+            "fallback_attempted_room_ids": self.fallback_attempted_room_ids,
+            "fallback_completed_room_ids": self.fallback_completed_room_ids,
+            "fallback_failed_room_ids": self.fallback_failed_room_ids,
+            "fallback_failed_room_reasons": self.fallback_failed_room_reasons,
+            "deferred_full_clean_room_ids": self.deferred_full_clean_room_ids,
+            "deferred_full_clean_reasons": self.deferred_full_clean_reasons,
             "retry_room_ids": self.retry_room_ids,
             "priority_retry_room_ids": self.priority_retry_room_ids,
             "retried_room_ids": self.retried_room_ids,
@@ -674,8 +793,15 @@ class SessionState:
             "active_room_id": self.active_room_id,
             "terminal_reason": self.terminal_reason,
             "terminal_message": self.terminal_message,
+            "terminal_cause": self.terminal_cause,
             "needs_help": self.needs_help,
             "notification_sent": self.notification_sent,
+            "degraded_reason": self.degraded_reason,
+            "degraded_at": self.degraded_at,
+            "degraded_preparation_attempted": self.degraded_preparation_attempted,
+            "degraded_preparation_completed": self.degraded_preparation_completed,
+            "blocked_deadline": self.blocked_deadline,
+            "blocked_reason": self.blocked_reason,
             "native_resume_guard_latched": self.native_resume_guard_latched,
             "native_guard_cancel_pending": self.native_guard_cancel_pending,
             "native_guard_stop_confirmed": self.native_guard_stop_confirmed,
@@ -730,7 +856,12 @@ def friendly_failure_reason(reason: str | None) -> str:
         return "the mop attachment was not detected"
     if "tracked person arrived home" in lowered:
         return "someone came home"
-    if "clean water" in lowered or "water tank empty" in lowered:
+    if (
+        "clean water" in lowered
+        or "fresh water" in lowered
+        or "freshwater" in lowered
+        or "water tank empty" in lowered
+    ):
         return "the clean water tank is empty"
     if "dirty tank" in lowered or "dirty water" in lowered or "wastewater" in lowered:
         return "the dirty water tank is full"
@@ -808,10 +939,41 @@ def build_auto_clean_summary(
     needs_help: bool = False,
     all_rooms_cleaned: bool = False,
     total_room_count: int | None = None,
+    fallback_room_names: list[str] | None = None,
+    deferred_room_names: list[str] | None = None,
 ) -> AutoCleanSummary | None:
     """Build the one notification for an auto-clean session."""
     completed_count = len(completed_room_names)
+    fallback_room_names = fallback_room_names or []
+    deferred_room_names = deferred_room_names or []
+    fallback_count = len(fallback_room_names)
     friendly_terminal = friendly_failure_reason(terminal_message)
+
+    if terminal_reason == "mop_resource_deferred":
+        parts: list[str] = []
+        if completed_count:
+            parts.append(
+                f"{vacuum_name} finished "
+                f"{room_count_label(completed_count).lower()}"
+            )
+        if fallback_count:
+            verb = "vacuumed" if parts else f"{vacuum_name} vacuumed"
+            subject = (
+                fallback_room_names[0]
+                if fallback_count == 1
+                else f"{fallback_count} additional rooms"
+            )
+            parts.append(f"{verb} {subject}")
+        message = " and ".join(parts) if parts else f"{vacuum_name} could not finish"
+        if deferred_room_names:
+            message += (
+                f"; mopping remains due in {format_room_list(deferred_room_names)} "
+                f"because {friendly_terminal}"
+            )
+        return AutoCleanSummary(
+            title=f"{vacuum_name} · Mopping Deferred",
+            message=f"{message}.",
+        )
 
     if needs_help:
         if completed_count:
@@ -831,14 +993,23 @@ def build_auto_clean_summary(
             message=f"Stopped before any room finished: {friendly_terminal}.",
         )
 
+    if terminal_reason == "blocked":
+        if completed_count:
+            return AutoCleanSummary(
+                title=f"{vacuum_name} · Stopped Early",
+                message=(
+                    f"{cleaned_summary_sentence(vacuum_name, completed_room_names)} "
+                    f"Automatic cleaning stopped because {friendly_terminal}."
+                ),
+            )
+        return AutoCleanSummary(
+            title=f"{vacuum_name} · Auto-Clean Blocked",
+            message=f"Could not start: {friendly_terminal}.",
+        )
+
     if completed_count == 0:
         if terminal_reason == "returned_home" or terminal_reason == "cancelled":
             return None
-        if terminal_reason == "blocked":
-            return AutoCleanSummary(
-                title=f"{vacuum_name} · Auto-Clean Blocked",
-                message=f"Could not start: {friendly_terminal}.",
-            )
         return None
 
     if all_rooms_cleaned:
@@ -944,6 +1115,46 @@ def is_low_battery_error(error: str | None) -> bool:
     return error_contains_any(error, LOW_BATTERY_ERROR_KEYWORDS)
 
 
+def is_clean_water_empty_error(error: str | None) -> bool:
+    """Return whether Valetudo reports the supported clean-water-empty fault."""
+    normalized = normalize_state(error)
+    return bool(normalized and normalized.lower() in CLEAN_WATER_EMPTY_ERROR_VALUES)
+
+
+def clean_water_empty_reason(resources: ResourceState) -> str | None:
+    """Return the exact clean-water-empty reason, if present."""
+    if is_clean_water_empty_error(resources.error):
+        return normalize_state(resources.error)
+    fresh_water = normalize_state(resources.fresh_water)
+    if fresh_water and fresh_water.lower() == "empty":
+        return "fresh water is empty"
+    return None
+
+
+def allowed_error_fingerprint(resources: ResourceState) -> str | None:
+    """Return the persisted fingerprint for an allowed degraded vacuum run."""
+    if not clean_water_empty_reason(resources):
+        return None
+    normalized_error = normalize_state(resources.error)
+    if is_clean_water_empty_error(normalized_error):
+        return normalized_error.lower()
+    return CLEAN_WATER_EMPTY_DISPOSITION
+
+
+def run_allows_error(run: ActiveRun, error: str | None) -> bool:
+    """Return whether a run may ignore this exact pre-existing water warning."""
+    if not run.vacuum_only or not run.allowed_error_fingerprint:
+        return False
+    normalized = normalize_state(error)
+    if not is_clean_water_empty_error(normalized):
+        return False
+    fingerprint = run.allowed_error_fingerprint
+    return (
+        fingerprint == CLEAN_WATER_EMPTY_DISPOSITION
+        or fingerprint == normalized.lower()
+    )
+
+
 def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
     """Return the reason a mop-required room cannot run, if any."""
     if not room.mop_required:
@@ -1030,8 +1241,16 @@ def select_next_room(
         if reason is None:
             return RoomSelection(room=room, vacuum_only=not room.mop_required), skipped
 
-        if allow_vacuum_only_when_mop_blocked:
-            return RoomSelection(room=room, vacuum_only=True, mop_block_reason=reason), skipped
+        if (
+            allow_vacuum_only_when_mop_blocked
+            and clean_water_empty_reason(resources)
+        ):
+            return RoomSelection(
+                room=room,
+                vacuum_only=True,
+                mop_block_reason=reason,
+                fallback_vacuum=True,
+            ), skipped
 
         skipped.append((room, reason))
 
@@ -1065,7 +1284,7 @@ def evaluate_run_success(
     """Evaluate whether a commanded room run should count as successful."""
     if run.cancelled:
         return False, "Run was cancelled"
-    if not is_error_clear(error):
+    if not is_error_clear(error) and not run_allows_error(run, error):
         return False, normalize_state(error)
     if not run.observed_cleaning:
         return False, "Vacuum never entered cleaning state"
@@ -1181,6 +1400,13 @@ def mark_success(
         ledger.last_auto_cleaned_day = auto_clean_day or auto_clean_date_from_timestamp(when)
     ledger.last_failed_reason = None
     ledger.successful_count += 1
+
+
+def mark_fallback_vacuum_success(ledger: RoomLedger, when: str) -> None:
+    """Record physical vacuuming without granting normal/full clean credit."""
+    ledger.last_attempted = when
+    ledger.last_vacuumed = when
+    ledger.last_fallback_vacuumed = when
 
 
 def auto_clean_date_from_timestamp(value: str | None) -> str | None:

@@ -28,6 +28,10 @@ const = load_module(f"{package.__name__}.const", PACKAGE / "const.py")
 logic = load_module(f"{package.__name__}.logic", PACKAGE / "logic.py")
 
 
+def test_clean_water_fallback_is_enabled_by_default():
+    assert const.DEFAULT_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED is True
+
+
 def test_pick_next_room_prefers_oldest_success():
     rooms = [
         logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
@@ -182,6 +186,34 @@ def test_unknown_error_120_does_not_block_vacuum_only_room():
     assert skipped == []
 
 
+def test_clean_water_empty_classification_is_narrow():
+    assert logic.is_clean_water_empty_error("Mop Dock Clean Water Tank empty")
+    assert logic.is_clean_water_empty_error("fresh water is empty")
+    assert not logic.is_clean_water_empty_error("Unknown error 120")
+    assert not logic.is_clean_water_empty_error("Mop Dock Tray full of water")
+    assert (
+        logic.clean_water_empty_reason(
+            logic.ResourceState(fresh_water="empty", error="No error")
+        )
+        == "fresh water is empty"
+    )
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        mop_required=True,
+    )
+    selection, skipped = logic.select_next_room(
+        [room],
+        {},
+        set(),
+        logic.ResourceState(error="Unknown error 120"),
+        allow_vacuum_only_when_mop_blocked=True,
+    )
+    assert selection is None
+    assert skipped == [(room, "Unknown error 120")]
+
+
 def test_mop_ready_room_uses_mop_mode():
     room = logic.RoomConfig(
         room_id="room_one",
@@ -236,6 +268,7 @@ def test_mop_block_can_fall_back_to_vacuum_only():
 
     assert selection is not None
     assert selection.vacuum_only is True
+    assert selection.fallback_vacuum is True
     assert selection.mop_block_reason == "fresh water is empty"
     assert skipped == []
 
@@ -511,6 +544,45 @@ def test_run_success_accepts_completed_segment_run():
     assert reason is None
 
 
+def test_run_success_tolerates_only_exact_allowed_clean_water_error():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_duration=0,
+    )
+    run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+    )
+
+    ok, reason = logic.evaluate_run_success(
+        room,
+        run,
+        end_area=10,
+        end_time=10,
+        error="Mop Dock Clean Water Tank empty",
+    )
+    assert ok is True
+    assert reason is None
+
+    ok, reason = logic.evaluate_run_success(
+        room,
+        run,
+        end_area=10,
+        end_time=10,
+        error="Robot is stuck",
+    )
+    assert ok is False
+    assert reason == "Robot is stuck"
+
+
 def test_run_success_accepts_reset_current_statistics():
     room = logic.RoomConfig(
         room_id="room_one",
@@ -658,6 +730,9 @@ def test_active_run_native_resume_metadata_round_trips():
         session_id="session",
         started_at="2026-08-04T12:00:00+00:00",
         command_published=True,
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
         phase=logic.RUN_PHASE_SUSPENDED,
         suspended_at="2026-08-04T12:10:00+00:00",
         suspend_reason="Low battery",
@@ -666,6 +741,7 @@ def test_active_run_native_resume_metadata_round_trips():
         docked_at="2026-08-04T12:12:00+00:00",
         interruption_count=2,
         requested_iterations=3,
+        dispatch_deadline="2026-08-04T12:01:00+00:00",
         recovery_deadline="2026-08-04T15:10:00+00:00",
         resume_required=True,
         accumulated_area=12.5,
@@ -709,6 +785,31 @@ def test_mark_success_records_auto_clean_day_only_for_auto_clean():
     assert ledger.last_auto_cleaned_day == "2026-06-05"
 
 
+def test_mark_fallback_vacuum_success_only_updates_partial_credit():
+    ledger = logic.RoomLedger(
+        last_successful_clean="2026-08-01T10:00:00+00:00",
+        last_mopped="2026-08-01T10:00:00+00:00",
+        last_auto_cleaned="2026-08-01T10:00:00+00:00",
+        last_auto_cleaned_day="2026-08-01",
+        last_failed_reason="Mop Dock Clean Water Tank empty",
+        successful_count=4,
+    )
+
+    logic.mark_fallback_vacuum_success(
+        ledger,
+        "2026-08-18T21:00:00+00:00",
+    )
+
+    assert ledger.last_attempted == "2026-08-18T21:00:00+00:00"
+    assert ledger.last_vacuumed == "2026-08-18T21:00:00+00:00"
+    assert ledger.last_fallback_vacuumed == "2026-08-18T21:00:00+00:00"
+    assert ledger.last_successful_clean == "2026-08-01T10:00:00+00:00"
+    assert ledger.last_mopped == "2026-08-01T10:00:00+00:00"
+    assert ledger.last_auto_cleaned_day == "2026-08-01"
+    assert ledger.successful_count == 4
+    assert ledger.last_failed_reason == "Mop Dock Clean Water Tank empty"
+
+
 def test_while_away_outcome_round_trips():
     outcome = logic.WhileAwayOutcome(
         day="2026-06-05",
@@ -720,6 +821,33 @@ def test_while_away_outcome_round_trips():
     restored = logic.WhileAwayOutcome.from_dict(outcome.to_dict())
 
     assert restored == outcome
+
+
+def test_while_away_fallback_reports_vacuumed_but_mopping_due():
+    cleaned, issues = logic.build_while_away_messages(
+        [
+            logic.WhileAwayOutcome(
+                day="2026-08-18",
+                room_id="dining",
+                kind="failed",
+                reason="Mop Dock Clean Water Tank empty",
+            ),
+            logic.WhileAwayOutcome(
+                day="2026-08-18",
+                room_id="dining",
+                kind="fallback",
+                reason="Mop Dock Clean Water Tank empty",
+            ),
+        ],
+        {"dining": "Dining Room"},
+        "2026-08-18",
+    )
+
+    assert cleaned == []
+    assert issues == [
+        "Vacuumed Dining Room; mopping remains due because "
+        "the clean water tank is empty"
+    ]
 
 
 def test_while_away_messages_filter_to_requested_day():
@@ -849,6 +977,24 @@ def test_auto_clean_summary_reports_blocked_before_start():
     assert summary.message == "Could not start: the clean water tank is empty."
 
 
+def test_auto_clean_summary_reports_blocked_after_partial_progress():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=["Kitchen", "Office"],
+        skipped_room_reasons={},
+        failed_room_reasons={},
+        terminal_reason="blocked",
+        terminal_message="Unknown error 120",
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Stopped Early"
+    assert summary.message == (
+        "Main Floor Vacuum cleaned 2 rooms while everyone was away. "
+        "Automatic cleaning stopped because unknown error 120."
+    )
+
+
 def test_auto_clean_summary_reports_needs_help():
     summary = logic.build_auto_clean_summary(
         vacuum_name="Main Floor Vacuum",
@@ -865,6 +1011,27 @@ def test_auto_clean_summary_reports_needs_help():
     assert summary.message == (
         "Main Floor Vacuum cleaned 2 rooms while everyone was away. "
         "While everyone was away, the vacuum ran into some errors."
+    )
+
+
+def test_auto_clean_summary_reports_mop_deferred_partial_credit():
+    summary = logic.build_auto_clean_summary(
+        vacuum_name="Main Floor Vacuum",
+        completed_room_names=["Kitchen", "Office"],
+        fallback_room_names=["Dining Room", "Guest Bathroom"],
+        deferred_room_names=["Dining Room", "Guest Bathroom"],
+        skipped_room_reasons={},
+        failed_room_reasons={},
+        terminal_reason="mop_resource_deferred",
+        terminal_message="Mop Dock Clean Water Tank empty",
+    )
+
+    assert summary is not None
+    assert summary.title == "Main Floor Vacuum · Mopping Deferred"
+    assert summary.message == (
+        "Main Floor Vacuum finished 2 rooms and vacuumed 2 additional rooms; "
+        "mopping remains due in Dining Room and Guest Bathroom because "
+        "the clean water tank is empty."
     )
 
 
@@ -973,10 +1140,16 @@ def test_session_state_round_trips_terminal_details():
         native_guard_stop_confirmed=True,
         native_guard_return_confirmed=False,
         native_guard_cancel_reason="test cancel",
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at="2026-08-18T20:46:40+00:00",
+        terminal_cause="queue_exhausted",
+        blocked_reason="dock status is pause",
     )
     session.mark_completed("room_one")
     session.mark_skipped("room_two", "clean water empty")
     session.mark_failed("room_three", "Cannot reach target")
+    session.defer_full_clean("room_four", "Mop Dock Clean Water Tank empty")
+    session.mark_fallback_completed("room_four")
 
     restored = logic.SessionState.from_dict(session.to_dict())
 
@@ -988,6 +1161,12 @@ def test_session_state_round_trips_terminal_details():
     assert restored.notification_sent is True
     assert restored.native_resume_guard_latched is True
     assert restored.native_guard_cancel_pending is True
+    assert restored.fallback_attempted_room_ids == ["room_four"]
+    assert restored.fallback_completed_room_ids == ["room_four"]
+    assert restored.deferred_full_clean_room_ids == ["room_four"]
+    assert restored.degraded_reason == "Mop Dock Clean Water Tank empty"
+    assert restored.terminal_cause == "queue_exhausted"
+    assert restored.blocked_reason == "dock status is pause"
     assert restored.native_guard_stop_confirmed is True
     assert restored.native_guard_return_confirmed is False
     assert restored.native_guard_cancel_reason == "test cancel"

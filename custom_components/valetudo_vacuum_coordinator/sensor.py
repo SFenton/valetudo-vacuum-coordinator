@@ -10,14 +10,27 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_ACTIVE_ROOM,
+    ATTR_BLOCKED_REASON,
     ATTR_CANCELLED,
     ATTR_COMPLETED_ROOMS,
+    ATTR_DEFERRED_FULL_CLEAN_REASONS,
+    ATTR_DEFERRED_FULL_CLEAN_ROOMS,
+    ATTR_DEGRADED_AT,
+    ATTR_DEGRADED_REASON,
+    ATTR_FALLBACK_ATTEMPTED_ROOMS,
+    ATTR_FALLBACK_COMPLETED_ROOMS,
+    ATTR_FALLBACK_FAILED_REASONS,
+    ATTR_FALLBACK_FAILED_ROOMS,
+    ATTR_FALLBACK_VACUUM,
     ATTR_FAILED_REASONS,
     ATTR_FAILED_ROOMS,
     ATTR_LAST_FAILED_REASON,
     ATTR_LAST_MOPPED,
+    ATTR_LAST_FALLBACK_VACUUMED,
     ATTR_LAST_SUCCESSFUL_CLEAN,
     ATTR_LAST_VACUUMED,
+    ATTR_MOP_DEFERRED,
+    ATTR_MOP_DEFERRED_REASON,
     ATTR_PENDING_ROOMS,
     ATTR_PHASE,
     ATTR_SUSPENDED_AT,
@@ -28,6 +41,7 @@ from .const import (
     ATTR_RESUMABLE_LATCHED,
     ATTR_RECOVERY_DEADLINE,
     ATTR_REQUESTED_ITERATIONS,
+    ATTR_RAW_ERROR,
     ATTR_ROOM_ID,
     ATTR_SESSION_ID,
     ATTR_SKIPPED_REASONS,
@@ -37,6 +51,7 @@ from .const import (
     ATTR_SUCCESSFUL_COUNT,
     ATTR_TERMINAL_MESSAGE,
     ATTR_TERMINAL_REASON,
+    ATTR_TERMINAL_CAUSE,
     ATTR_VACUUM_ONLY,
     ATTR_WHILE_AWAY_CLEANED,
     ATTR_WHILE_AWAY_ISSUES,
@@ -88,8 +103,31 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_FAILED_ROOMS: session.failed_room_ids if session else [],
             ATTR_SKIPPED_REASONS: session.skipped_room_reasons if session else {},
             ATTR_FAILED_REASONS: session.failed_room_reasons if session else {},
+            ATTR_FALLBACK_ATTEMPTED_ROOMS: (
+                session.fallback_attempted_room_ids if session else []
+            ),
+            ATTR_FALLBACK_COMPLETED_ROOMS: (
+                session.fallback_completed_room_ids if session else []
+            ),
+            ATTR_FALLBACK_FAILED_ROOMS: (
+                session.fallback_failed_room_ids if session else []
+            ),
+            ATTR_FALLBACK_FAILED_REASONS: (
+                session.fallback_failed_room_reasons if session else {}
+            ),
+            ATTR_DEFERRED_FULL_CLEAN_ROOMS: (
+                session.deferred_full_clean_room_ids if session else []
+            ),
+            ATTR_DEFERRED_FULL_CLEAN_REASONS: (
+                session.deferred_full_clean_reasons if session else {}
+            ),
+            ATTR_DEGRADED_REASON: session.degraded_reason if session else None,
+            ATTR_DEGRADED_AT: session.degraded_at if session else None,
+            ATTR_BLOCKED_REASON: session.blocked_reason if session else None,
+            ATTR_RAW_ERROR: self.coordinator.error_state,
             ATTR_TERMINAL_REASON: session.terminal_reason if session else None,
             ATTR_TERMINAL_MESSAGE: session.terminal_message if session else None,
+            ATTR_TERMINAL_CAUSE: session.terminal_cause if session else None,
             ATTR_NEEDS_HELP: session.needs_help if session else False,
             ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
@@ -121,6 +159,7 @@ class ValetudoCurrentRoomSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_ROOM_ID: run.room_id if run else None,
             "segment_id": run.segment_id if run else None,
             ATTR_VACUUM_ONLY: run.vacuum_only if run else False,
+            ATTR_FALLBACK_VACUUM: run.fallback_vacuum if run else False,
             ATTR_PHASE: run.phase if run else None,
             ATTR_SUSPENDED_AT: run.suspended_at if run else None,
             ATTR_SUSPEND_REASON: run.suspend_reason if run else None,
@@ -154,7 +193,27 @@ class ValetudoQueueSensor(ValetudoCoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return pending rooms."""
-        return {ATTR_PENDING_ROOMS: [room.room_id for room in self.coordinator.pending_rooms]}
+        session = self.coordinator.session
+        return {
+            ATTR_PENDING_ROOMS: [
+                room.room_id for room in self.coordinator.pending_rooms
+            ],
+            ATTR_DEFERRED_FULL_CLEAN_ROOMS: (
+                session.deferred_full_clean_room_ids if session else []
+            ),
+            ATTR_DEFERRED_FULL_CLEAN_REASONS: (
+                session.deferred_full_clean_reasons if session else {}
+            ),
+            ATTR_FALLBACK_COMPLETED_ROOMS: (
+                session.fallback_completed_room_ids if session else []
+            ),
+            ATTR_FALLBACK_FAILED_ROOMS: (
+                session.fallback_failed_room_ids if session else []
+            ),
+            ATTR_FALLBACK_FAILED_REASONS: (
+                session.fallback_failed_room_reasons if session else {}
+            ),
+        }
 
 
 class ValetudoRoomLedgerSensor(ValetudoCoordinatorEntity, SensorEntity):
@@ -178,6 +237,7 @@ class ValetudoRoomLedgerSensor(ValetudoCoordinatorEntity, SensorEntity):
         """Return detailed room ledger state."""
         ledger = self.coordinator.ledgers[self.room_id]
         room = self.coordinator.room_by_id[self.room_id]
+        session = self.coordinator.session
         return {
             ATTR_ROOM_ID: self.room_id,
             "room_name": room.name,
@@ -185,7 +245,16 @@ class ValetudoRoomLedgerSensor(ValetudoCoordinatorEntity, SensorEntity):
             "mop_required": room.mop_required,
             ATTR_LAST_SUCCESSFUL_CLEAN: ledger.last_successful_clean,
             ATTR_LAST_VACUUMED: ledger.last_vacuumed,
+            ATTR_LAST_FALLBACK_VACUUMED: ledger.last_fallback_vacuumed,
             ATTR_LAST_MOPPED: ledger.last_mopped,
             ATTR_LAST_FAILED_REASON: ledger.last_failed_reason,
             ATTR_SUCCESSFUL_COUNT: ledger.successful_count,
+            ATTR_MOP_DEFERRED: bool(
+                session and self.room_id in session.deferred_full_clean_room_ids
+            ),
+            ATTR_MOP_DEFERRED_REASON: (
+                session.deferred_full_clean_reasons.get(self.room_id)
+                if session
+                else None
+            ),
         }

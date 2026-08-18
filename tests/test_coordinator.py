@@ -288,6 +288,8 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
         self._terminal_cleanup_retry_cancel = None
         self._dock_settle_cancel = None
         self._native_resume_timeout_cancel = None
+        self._dispatch_start_timeout_cancel = None
+        self._blocked_session_watchdog_cancel = None
         self._terminal_cleanup_retry_attempts = 0
         self._event_lock = asyncio.Lock()
         self._active_run_restored = False
@@ -311,7 +313,13 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
     def _notify_listeners(self) -> None:
         return None
 
-    async def _async_start_room(self, room, *, vacuum_only: bool) -> None:
+    async def _async_start_room(
+        self,
+        room,
+        *,
+        vacuum_only: bool,
+        fallback_vacuum: bool = False,
+    ) -> None:
         if self.session:
             is_retry = (
                 room.room_id in self.session.retry_room_ids
@@ -322,7 +330,11 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
                 self.session.mark_retry_started(room.room_id)
                 self.session.clear_room_issue(room.room_id)
                 self._remove_while_away_failure(room.room_id, previous_reason)
-            self.session.mark_attempted(room.room_id)
+            if fallback_vacuum:
+                self.session.mark_fallback_attempted(room.room_id)
+            else:
+                self.session.mark_attempted(room.room_id)
+            self._clear_blocked_session_watchdog()
             self.session.active_room_id = room.room_id
             self.active_run = logic.ActiveRun(
                 room_id=room.room_id,
@@ -330,6 +342,12 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
                 session_id=self.session.session_id,
                 started_at=logic.utcnow_iso(),
                 vacuum_only=vacuum_only,
+                fallback_vacuum=fallback_vacuum,
+                allowed_error_fingerprint=(
+                    logic.allowed_error_fingerprint(self._resource_state())
+                    if vacuum_only and self.session.degraded_reason
+                    else None
+                ),
             )
         self.started_rooms.append(room.room_id)
 
@@ -346,6 +364,20 @@ def _handle_event(
 
 def _service_names(coordinator: _RecoverableFailureCoordinator) -> list[str]:
     return [call["service"] for call in coordinator.hass.services.calls]
+
+
+def _set_rooms(
+    coordinator: _RecoverableFailureCoordinator,
+    rooms: list[logic.RoomConfig],
+) -> None:
+    coordinator.rooms = rooms
+    coordinator.room_by_id = {room.room_id: room for room in rooms}
+    coordinator.room_by_segment = {room.segment_id: room for room in rooms}
+    coordinator.room_by_name = {room.name.lower(): room for room in rooms}
+    coordinator.ledgers = {
+        room.room_id: coordinator.ledgers.get(room.room_id, logic.RoomLedger())
+        for room in rooms
+    }
 
 
 def _trigger_low_battery(
@@ -592,6 +624,216 @@ def test_recoverable_mop_error_during_dock_interrupt_continues_queue() -> None:
     _handle_event(coordinator, "sensor.robot_dock_status", "idle")
 
     assert coordinator.started_rooms == ["room_two"]
+
+
+def test_latched_clean_water_error_dispatches_native_vacuum_room_from_pause() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="room_one",
+                name="Dining Room",
+                segment_id="1",
+                mop_required=True,
+            ),
+            logic.RoomConfig(
+                room_id="room_two",
+                name="Office",
+                segment_id="2",
+            ),
+        ],
+    )
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+    assert coordinator.active_run is not None
+    coordinator.active_run.observed_cleaning = True
+    coordinator.active_run.observed_segment_cleaning = True
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+
+    _handle_event(coordinator, "sensor.robot_dock_status", "pause")
+    _handle_event(
+        coordinator,
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    assert coordinator.session is not None
+    assert coordinator.state == const.STATE_RUNNING
+    assert coordinator.session.degraded_reason == "Mop Dock Clean Water Tank empty"
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.deferred_full_clean_room_ids == ["room_one"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "room_two"
+    assert coordinator.active_run.vacuum_only is True
+    assert coordinator.active_run.fallback_vacuum is False
+    assert coordinator.active_run.allowed_error_fingerprint == (
+        "mop dock clean water tank empty"
+    )
+    assert coordinator.error_state == "Mop Dock Clean Water Tank empty"
+    assert coordinator._state("sensor.robot_dock_status") == "pause"
+    publish_call = next(
+        call
+        for call in coordinator.hass.services.calls
+        if call["domain"] == "mqtt" and call["service"] == "publish"
+    )
+    assert json.loads(publish_call["data"]["payload"])["segment_ids"] == ["2"]
+
+
+def test_active_clean_water_session_reports_degraded_instead_of_raw_error() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    assert coordinator.state == const.STATE_DEGRADED
+
+
+def test_degraded_lane_orders_all_native_rooms_before_fallbacks() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    rooms = [
+        logic.RoomConfig(
+            room_id="dual_old",
+            name="Dual Old",
+            segment_id="1",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="native_old",
+            name="Native Old",
+            segment_id="2",
+        ),
+        logic.RoomConfig(
+            room_id="dual_new",
+            name="Dual New",
+            segment_id="3",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="native_new",
+            name="Native New",
+            segment_id="4",
+        ),
+    ]
+    _set_rooms(coordinator, rooms)
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["dual_old"],
+        failed_room_ids=["dual_old"],
+        failed_room_reasons={
+            "dual_old": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = None
+    coordinator.ledgers["dual_old"].last_successful_clean = "2026-08-01T00:00:00+00:00"
+    coordinator.ledgers["native_old"].last_successful_clean = "2026-08-02T00:00:00+00:00"
+    coordinator.ledgers["dual_new"].last_successful_clean = "2026-08-03T00:00:00+00:00"
+    coordinator.ledgers["native_new"].last_successful_clean = "2026-08-04T00:00:00+00:00"
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert coordinator.started_rooms == ["native_old"]
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    assert coordinator.started_rooms == ["native_old", "native_new"]
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    assert coordinator.started_rooms == ["native_old", "native_new", "dual_old"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.fallback_vacuum is True
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    assert coordinator.started_rooms == [
+        "native_old",
+        "native_new",
+        "dual_old",
+        "dual_new",
+    ]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.fallback_vacuum is True
+
+
+def test_fallback_partial_credit_stays_due_for_new_same_day_session() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+    )
+    ledger = coordinator.ledgers["room_one"]
+    ledger.last_successful_clean = "2026-08-01T00:00:00+00:00"
+    ledger.last_mopped = "2026-08-01T00:00:00+00:00"
+    ledger.last_failed_reason = "Mop Dock Clean Water Tank empty"
+    ledger.successful_count = 3
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+
+    assert ledger.last_fallback_vacuumed is not None
+    assert ledger.last_vacuumed == ledger.last_fallback_vacuumed
+    assert ledger.last_successful_clean == "2026-08-01T00:00:00+00:00"
+    assert ledger.last_mopped == "2026-08-01T00:00:00+00:00"
+    assert ledger.last_auto_cleaned_day is None
+    assert ledger.successful_count == 3
+    assert ledger.last_failed_reason == "Mop Dock Clean Water Tank empty"
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.session.fallback_completed_room_ids == ["room_one"]
+
+    selection, _skipped = logic.select_next_room(
+        [room],
+        coordinator.ledgers,
+        set(),
+        logic.ResourceState(),
+        False,
+        auto_clean_day=coordinator._current_auto_clean_day(),
+    )
+    assert selection is not None
+    assert selection.room.room_id == "room_one"
+    assert selection.vacuum_only is False
 
 
 def test_recoverable_dock_error_retries_failed_stop_then_continues() -> None:
@@ -2208,6 +2450,1104 @@ def test_recoverable_mop_error_allows_vacuum_only_queue_progress() -> None:
     _handle_event(coordinator, coordinator.vacuum_entity, "docked")
 
     assert coordinator.started_rooms == ["room_two"]
+
+
+def test_degraded_queue_exhaustion_terminalizes_and_cleans_up_once() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        fallback_attempted_room_ids=["room_one"],
+        fallback_completed_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = None
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop"
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator.set_state("select.robot_mode", "vacuum")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "mop_resource_deferred"
+    assert coordinator.session.terminal_cause == "queue_exhausted"
+    assert coordinator.session.needs_help is False
+    assert coordinator.state == const.STATE_DEFERRED
+    assert coordinator.pending_rooms == []
+    assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is None
+    calls_after_terminal = len(coordinator.hass.services.calls)
+
+    _handle_event(
+        coordinator,
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    assert len(coordinator.hass.services.calls) == calls_after_terminal
+
+
+def test_refill_keeps_native_lane_then_runs_untouched_dual_normally() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="native",
+                name="Office",
+                segment_id="1",
+            ),
+            logic.RoomConfig(
+                room_id="dual",
+                name="Bathroom",
+                segment_id="2",
+                mop_required=True,
+            ),
+        ],
+    )
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["dual"],
+        deferred_full_clean_reasons={
+            "dual": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert coordinator.started_rooms == ["native"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.fallback_vacuum is False
+
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    assert coordinator.started_rooms == ["native", "dual"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.vacuum_only is False
+    assert coordinator.active_run.fallback_vacuum is False
+
+
+def test_refill_queues_one_normal_retry_for_original_water_failed_room() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["room_one"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.fallback_vacuum is False
+    assert coordinator.active_run.vacuum_only is False
+    assert coordinator.session.retried_room_ids == ["room_one"]
+
+
+def test_refill_during_fallback_finishes_it_then_runs_other_dual_normally() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="fallback_room",
+                name="Dining Room",
+                segment_id="1",
+                mop_required=True,
+            ),
+            logic.RoomConfig(
+                room_id="untouched_room",
+                name="Bathroom",
+                segment_id="2",
+                mop_required=True,
+            ),
+        ],
+    )
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        fallback_attempted_room_ids=["fallback_room"],
+        deferred_full_clean_room_ids=["fallback_room", "untouched_room"],
+        deferred_full_clean_reasons={
+            "fallback_room": "Mop Dock Clean Water Tank empty",
+            "untouched_room": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="fallback_room",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+
+    assert coordinator.session is not None
+    assert coordinator.session.fallback_completed_room_ids == ["fallback_room"]
+    assert coordinator.started_rooms == ["untouched_room"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.fallback_vacuum is False
+    assert coordinator.active_run.vacuum_only is False
+    assert "fallback_room" in coordinator.session.deferred_full_clean_room_ids
+
+
+def test_terminal_degraded_session_does_not_revive_after_refill() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="mop_resource_deferred",
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        notification_sent=True,
+    )
+    coordinator.settings_snapshot = None
+
+    _handle_event(coordinator, "sensor.robot_error", "No error")
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "mop_resource_deferred"
+
+
+def test_same_away_period_does_not_schedule_terminal_session_restart() -> None:
+    for terminal_reason in ("mop_resource_deferred", "blocked"):
+        coordinator = _RecoverableFailureCoordinator()
+        coordinator.active_run = None
+        away_since = datetime.now(UTC) - timedelta(minutes=30)
+        coordinator.away_since = away_since.isoformat()
+        coordinator.session = logic.SessionState(
+            session_id="session",
+            started_at=(away_since + timedelta(minutes=10)).isoformat(),
+            active=False,
+            terminal_reason=terminal_reason,
+            notification_sent=True,
+        )
+
+        async def keep_loaded_state() -> None:
+            return None
+
+        coordinator._async_load_store = keep_loaded_state
+        coordinator._unsubscribers = []
+        coordinator._listeners = []
+
+        asyncio.run(coordinator.async_setup())
+
+        assert coordinator._away_timer_cancel is None
+        assert coordinator.session.session_id == "session"
+
+
+def test_newer_away_period_allows_terminal_session_restart_timer() -> None:
+    for terminal_reason in ("mop_resource_deferred", "blocked"):
+        coordinator = _RecoverableFailureCoordinator()
+        coordinator.active_run = None
+        now = datetime.now(UTC)
+        coordinator.away_since = (now - timedelta(seconds=1)).isoformat()
+        coordinator.session = logic.SessionState(
+            session_id="session",
+            started_at=(now - timedelta(hours=1)).isoformat(),
+            active=False,
+            terminal_reason=terminal_reason,
+            notification_sent=True,
+        )
+
+        coordinator._schedule_away_timer_if_needed()
+
+        assert coordinator._away_timer_cancel is not None
+
+
+def test_explicit_start_is_allowed_during_same_terminal_away_period() -> None:
+    for terminal_reason in ("mop_resource_deferred", "blocked"):
+        coordinator = _RecoverableFailureCoordinator()
+        coordinator.active_run = None
+        away_since = datetime.now(UTC) - timedelta(minutes=30)
+        coordinator.away_since = away_since.isoformat()
+        old_session = logic.SessionState(
+            session_id="old-session",
+            started_at=(away_since + timedelta(minutes=10)).isoformat(),
+            active=False,
+            terminal_reason=terminal_reason,
+            notification_sent=True,
+        )
+        coordinator.session = old_session
+        coordinator.set_state(coordinator.vacuum_entity, "docked")
+        coordinator.set_state("sensor.robot_status_flag", "none")
+        coordinator.set_state("sensor.robot_dock_status", "idle")
+        coordinator.set_state("sensor.robot_error", "No error")
+
+        asyncio.run(coordinator.async_start_session("service"))
+
+        assert coordinator.session is not old_session
+        assert coordinator.session.session_id != "old-session"
+        assert coordinator.session.active is True
+        assert coordinator.started_rooms == ["room_one"]
+
+
+def test_restored_consumed_fallback_token_is_not_redispatched() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    stored = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.session = logic.SessionState.from_dict(stored.to_dict())
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(coordinator._async_reconcile_restored_session())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session is not None
+    assert coordinator.session.terminal_reason == "mop_resource_deferred"
+    assert coordinator.session.fallback_attempted_room_ids == ["room_one"]
+
+
+def test_restored_allowed_clean_water_run_finishes_without_error_reclassification() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+        command_published=True,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+    )
+    coordinator._active_run_restored = True
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(coordinator._async_reconcile_restored_active_run())
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    assert coordinator.session.fallback_completed_room_ids == ["room_one"]
+    assert coordinator.session.needs_help is False
+
+
+def test_allowed_clean_water_error_is_tolerated_at_dock_completion_gate() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+        command_published=True,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(
+        coordinator._async_reconcile_active_run_at_dock(datetime.now(UTC))
+    )
+
+    assert coordinator.active_run is None
+    assert coordinator.session.fallback_completed_room_ids == ["room_one"]
+    assert coordinator.session.needs_help is False
+
+
+def test_changed_error_during_allowed_fallback_becomes_needs_help() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        allowed_error_fingerprint="mop dock clean water tank empty",
+        command_published=True,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+    )
+
+    _handle_event(coordinator, "sensor.robot_error", "Robot is stuck")
+
+    assert coordinator.session is not None
+    assert coordinator.session.active is False
+    assert coordinator.session.needs_help is True
+    assert coordinator.session.terminal_reason == "needs_help"
+
+
+def test_fatal_error_between_degraded_rooms_becomes_needs_help() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+    )
+
+    _handle_event(coordinator, "sensor.robot_error", "Robot is stuck")
+
+    assert coordinator.session.active is False
+    assert coordinator.session.needs_help is True
+    assert coordinator.session.terminal_reason == "needs_help"
+
+
+def test_changed_mop_resource_errors_are_fatal_during_allowed_run() -> None:
+    for changed_error in (
+        "Unknown error 120",
+        "Mop Dock Wastewater Tank not installed or full",
+    ):
+        coordinator = _RecoverableFailureCoordinator()
+        room = logic.RoomConfig(
+            room_id="room_one",
+            name="Dining Room",
+            segment_id="1",
+            mop_required=True,
+        )
+        _set_rooms(coordinator, [room])
+        coordinator.session = logic.SessionState(
+            session_id="session",
+            started_at=logic.utcnow_iso(),
+            degraded_reason="Mop Dock Clean Water Tank empty",
+            fallback_attempted_room_ids=["room_one"],
+            deferred_full_clean_room_ids=["room_one"],
+            deferred_full_clean_reasons={
+                "room_one": "Mop Dock Clean Water Tank empty",
+            },
+        )
+        coordinator.active_run = logic.ActiveRun(
+            room_id="room_one",
+            segment_id="1",
+            session_id="session",
+            started_at=logic.utcnow_iso(),
+            vacuum_only=True,
+            fallback_vacuum=True,
+            allowed_error_fingerprint="mop dock clean water tank empty",
+            command_published=True,
+        )
+        coordinator.set_state(coordinator.vacuum_entity, "error")
+
+        _handle_event(coordinator, "sensor.robot_error", changed_error)
+
+        assert coordinator.session.active is False
+        assert coordinator.session.needs_help is True
+        assert coordinator.session.terminal_reason == "needs_help"
+
+
+def test_changed_mop_resource_errors_are_fatal_between_degraded_rooms() -> None:
+    for changed_error in (
+        "Unknown error 120",
+        "Mop Dock Wastewater Tank not installed or full",
+    ):
+        coordinator = _RecoverableFailureCoordinator()
+        coordinator.active_run = None
+        coordinator.session = logic.SessionState(
+            session_id="session",
+            started_at=logic.utcnow_iso(),
+            degraded_reason="Mop Dock Clean Water Tank empty",
+            degraded_at=logic.utcnow_iso(),
+        )
+
+        _handle_event(coordinator, "sensor.robot_error", changed_error)
+
+        assert coordinator.session.active is False
+        assert coordinator.session.needs_help is True
+        assert coordinator.session.terminal_reason == "needs_help"
+
+
+def test_fallback_navigation_failure_is_not_republished() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        fallback_attempted_room_ids=["room_one"],
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+        command_published=True,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_error", "Unknown error 95")
+
+    _handle_event(coordinator, "sensor.robot_error", "Unknown error 95")
+
+    assert coordinator.session.pending_recovery_room_id is None
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.session.fallback_failed_room_ids == ["room_one"]
+    assert coordinator.started_rooms == []
+
+
+def test_unknown_error_120_does_not_activate_clean_water_fallback() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_error", "Unknown error 120")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.degraded_reason is None
+    assert coordinator.session.fallback_attempted_room_ids == []
+
+
+def test_generic_sticky_mop_error_watchdog_terminalizes_and_cleans_up() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop"
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("select.robot_mode", "vacuum")
+
+    _handle_event(coordinator, "sensor.robot_error", "Unknown error 120")
+
+    assert coordinator.session.blocked_deadline is not None
+    assert coordinator.session.blocked_reason == "Unknown error 120"
+    assert coordinator.session.active is True
+
+    asyncio.run(coordinator._async_expire_blocked_session_serialized())
+
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "blocked"
+    assert coordinator.session.terminal_message == "Unknown error 120"
+    assert coordinator.session.needs_help is False
+    assert coordinator.pending_rooms == []
+    assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is None
+    assert _service_names(coordinator).count("select_option") == 1
+    calls_after_cleanup = len(coordinator.hass.services.calls)
+
+    _handle_event(coordinator, "sensor.robot_error", "Unknown error 120")
+
+    assert len(coordinator.hass.services.calls) == calls_after_cleanup
+
+
+def test_blocked_watchdog_uses_long_battery_bound_without_extending_deadline() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_BLOCKED_SESSION_TIMEOUT] = 300
+    coordinator.config[const.CONF_NATIVE_RESUME_TIMEOUT] = 10800
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "charging")
+    coordinator.set_state("sensor.robot_battery", "20")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("sensor.robot_error", "Low battery")
+
+    before_long = datetime.now(UTC)
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog(
+            "battery is 20%, below 40%"
+        )
+    )
+    long_deadline = logic.parse_datetime(coordinator.session.blocked_deadline)
+    assert long_deadline is not None
+    assert (long_deadline - before_long).total_seconds() > 10000
+
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_battery", "100")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_error", "Unknown error 120")
+
+    before_short = datetime.now(UTC)
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog("Unknown error 120")
+    )
+    short_deadline = logic.parse_datetime(coordinator.session.blocked_deadline)
+    assert short_deadline is not None
+    assert 250 < (short_deadline - before_short).total_seconds() < 301
+    assert short_deadline < long_deadline
+
+    coordinator.set_state(coordinator.vacuum_entity, "charging")
+    coordinator.set_state("sensor.robot_battery", "20")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("sensor.robot_error", "Low battery")
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog("Low battery")
+    )
+
+    assert logic.parse_datetime(coordinator.session.blocked_deadline) == short_deadline
+
+
+def test_resource_terminal_cleanup_blocks_resumable_but_accepts_stale_segment() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="blocked",
+        terminal_message="Unknown error 120",
+    )
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop"
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("sensor.robot_error", "Unknown error 120")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("select.robot_mode", "vacuum")
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.session.notification_sent is False
+    assert coordinator.settings_snapshot is not None
+    assert _service_names(coordinator).count("select_option") == 0
+
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is None
+    assert _service_names(coordinator).count("select_option") == 1
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+    assert _service_names(coordinator).count("select_option") == 1
+
+    deferred = _RecoverableFailureCoordinator()
+    _set_rooms(deferred, [room])
+    deferred.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    deferred.active_run = None
+    deferred.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="mop_resource_deferred",
+        terminal_message="Mop Dock Clean Water Tank empty",
+        degraded_reason="Mop Dock Clean Water Tank empty",
+    )
+    deferred.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop"
+    )
+    deferred.set_state(deferred.vacuum_entity, "error")
+    deferred.set_state("sensor.robot_dock_status", "pause")
+    deferred.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    deferred.set_state("sensor.robot_status_flag", "segment")
+    deferred.set_state("select.robot_mode", "vacuum")
+
+    asyncio.run(deferred._async_maybe_send_auto_clean_summary())
+
+    assert deferred.session.notification_sent is True
+    assert deferred.settings_snapshot is None
+    assert _service_names(deferred).count("select_option") == 1
+
+
+def test_blocked_deadline_survives_preparation_and_repeated_tentative_aborts() -> None:
+    deadline = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+
+    degraded = _RecoverableFailureCoordinator()
+    degraded.active_run = None
+    degraded.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        blocked_deadline=deadline,
+        blocked_reason="original block",
+    )
+    degraded.set_state(degraded.vacuum_entity, "error")
+    degraded.set_state("sensor.robot_status_flag", "none")
+    degraded.set_state("sensor.robot_dock_status", "pause")
+    degraded.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    assert asyncio.run(degraded._async_prepare_degraded_vacuuming()) is True
+    assert degraded.session.blocked_deadline == deadline
+
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_DUSTBAG_ENTITY] = "sensor.robot_dustbag"
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        blocked_deadline=deadline,
+        blocked_reason="original block",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_dustbag", "ok")
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+
+    async def block_before_publish(*, vacuum_only: bool) -> None:
+        coordinator.set_state("sensor.robot_dustbag", "full")
+
+    coordinator._async_apply_mode = block_before_publish
+
+    for _attempt in range(2):
+        coordinator.set_state("sensor.robot_dustbag", "ok")
+        asyncio.run(
+            coordinator._async_start_room(
+                coordinator.room_by_id["room_one"],
+                vacuum_only=True,
+            )
+        )
+        assert coordinator.active_run is None
+        assert coordinator.session.blocked_deadline == deadline
+        assert "publish" not in _service_names(coordinator)
+
+    coordinator.set_state("sensor.robot_dustbag", "full")
+    asyncio.run(coordinator._async_expire_blocked_session_serialized())
+
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "blocked"
+    assert coordinator.session.terminal_cause == "blocked_timeout"
+
+
+def test_degraded_preparation_failure_terminalizes_without_dispatch() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Office",
+        segment_id="1",
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    async def fail_mode(*, vacuum_only: bool) -> None:
+        raise RuntimeError("mode failed")
+
+    coordinator._async_apply_mode = fail_mode
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "mop_resource_deferred"
+    assert coordinator.session.terminal_cause == "preparation_failed"
+
+
+def test_dispatch_and_blocked_watchdogs_finish_degraded_work_finitely() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert coordinator.active_run is not None
+    assert coordinator.session.fallback_attempted_room_ids == ["room_one"]
+    assert _service_names(coordinator).count("publish") == 1
+
+    asyncio.run(coordinator._async_expire_dispatch_start())
+
+    assert coordinator.active_run is None
+    assert coordinator.session.fallback_failed_room_ids == ["room_one"]
+    assert coordinator.session.terminal_reason == "mop_resource_deferred"
+    assert _service_names(coordinator).count("publish") == 1
+
+    blocked = _RecoverableFailureCoordinator()
+    _set_rooms(blocked, [room])
+    blocked.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    blocked.active_run = None
+    blocked.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["room_one"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    blocked.set_state(blocked.vacuum_entity, "returning")
+    blocked.set_state("sensor.robot_status_flag", "none")
+    blocked.set_state("sensor.robot_dock_status", "pause")
+    blocked.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    asyncio.run(blocked._async_maybe_start_next_room())
+    assert blocked.session.blocked_deadline is not None
+    asyncio.run(blocked._async_expire_blocked_session_serialized())
+    assert blocked.session.active is False
+    assert blocked.session.terminal_cause == "blocked_timeout"
+
+
+def test_dispatch_timeout_stops_late_command_before_next_publish() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="room_one",
+                name="Dining Room",
+                segment_id="1",
+                mop_required=True,
+            ),
+            logic.RoomConfig(
+                room_id="room_two",
+                name="Guest Bathroom",
+                segment_id="2",
+                mop_required=True,
+            ),
+        ],
+    )
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["room_one", "room_two"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+            "room_two": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    asyncio.run(coordinator._async_expire_dispatch_start())
+
+    service_names = _service_names(coordinator)
+    first_publish = service_names.index("publish")
+    stop = service_names.index("stop", first_publish + 1)
+    second_publish = service_names.index("publish", stop + 1)
+    assert first_publish < stop < second_publish
+    assert service_names.count("publish") == 2
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "room_two"
+
+
+def test_dispatch_timeout_cancel_failure_prevents_next_publish() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="room_one",
+                name="Dining Room",
+                segment_id="1",
+                mop_required=True,
+            ),
+            logic.RoomConfig(
+                room_id="room_two",
+                name="Guest Bathroom",
+                segment_id="2",
+                mop_required=True,
+            ),
+        ],
+    )
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+        degraded_preparation_attempted=True,
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=["room_one", "room_two"],
+        deferred_full_clean_reasons={
+            "room_one": "Mop Dock Clean Water Tank empty",
+            "room_two": "Mop Dock Clean Water Tank empty",
+        },
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    original_async_call = coordinator.hass.services.async_call
+
+    async def fail_stop(domain, service, data, blocking=False) -> None:
+        if domain == "vacuum" and service == "stop":
+            raise RuntimeError("stop failed")
+        await original_async_call(domain, service, data, blocking)
+
+    coordinator.hass.services.async_call = fail_stop
+    asyncio.run(coordinator._async_expire_dispatch_start())
+
+    assert _service_names(coordinator).count("publish") == 1
+    assert coordinator.session.active is False
+    assert coordinator.session.needs_help is True
+    assert coordinator.session.terminal_reason == "needs_help"
 
 
 def test_error_change_before_publish_aborts_then_supersedes_recovery() -> None:

@@ -1,6 +1,8 @@
 valetudo_vacuum_coordinator:
   name: Downstairs Vacuum Coordinator
   vacuum_entity: vacuum.valetudo_robot
+  # Optional, but enables one bounded mop-dock clean-stop during degraded recovery.
+  identifier: robot
   people:
     - person.person_one
     - person.person_two
@@ -11,6 +13,10 @@ valetudo_vacuum_coordinator:
   native_resume_enabled: true
   native_resume_timeout: 10800
   dock_settle: 60
+  dispatch_start_timeout: 120
+  # Applies to ordinary resource blocks; battery/charging/resumable waits use
+  # native_resume_timeout and an existing deadline is never extended.
+  blocked_session_timeout: 300
   # Reserved for future opt-in behavior; v0.1.3 keeps this inert.
   resume_nudge_enabled: false
 
@@ -46,7 +52,9 @@ valetudo_vacuum_coordinator:
   detergent_entity: sensor.valetudo_robot_detergent_dock_component
   dustbag_entity: sensor.valetudo_robot_dustbag_dock_component
 
-  allow_vacuum_only_when_mop_blocked: false
+  # After an exact clean-water-empty fault, finish configured vacuum-only
+  # rooms first, then vacuum each incomplete mop room once without full credit.
+  allow_vacuum_only_when_mop_blocked: true
   cancel_any_away_run_on_arrival: true
   manual_tracking: true
   track_manual_when_paused: true
