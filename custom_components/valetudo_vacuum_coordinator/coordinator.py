@@ -49,6 +49,10 @@ from .const import (
     CONF_NOTIFY_SERVICE,
     CONF_PASSES_ENTITY,
     CONF_STATUS_FLAG_ENTITY,
+    CONF_STALE_RESUME_AGE,
+    CONF_STALE_RESUME_AUTO_CLEAR,
+    CONF_STALE_RESUME_CLEAR_TIMEOUT,
+    CONF_STALE_RESUME_SETTLE,
     CONF_TRACK_MANUAL_WHEN_PAUSED,
     CONF_WATER_ENTITY,
     CONF_WATER_MOP_OPTION,
@@ -58,6 +62,10 @@ from .const import (
     DEFAULT_MIN_BATTERY,
     DEFAULT_NATIVE_RESUME_ENABLED,
     DEFAULT_NATIVE_RESUME_TIMEOUT,
+    DEFAULT_STALE_RESUME_AGE,
+    DEFAULT_STALE_RESUME_AUTO_CLEAR,
+    DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
+    DEFAULT_STALE_RESUME_SETTLE,
     DOMAIN,
     SERVICE_DOCK_ACTION,
     STATE_DEFERRED,
@@ -83,12 +91,28 @@ from .logic import (
     RUN_PHASE_RESUMED_CLEANING,
     RUN_PHASE_SUSPENDED,
     ResourceState,
+    RetainedTaskGuard,
+    RETAINED_TASK_OWNER_COORDINATOR,
+    RETAINED_TASK_OWNER_MANUAL,
+    RETAINED_TASK_OWNER_UNKNOWN,
+    RETAINED_TASK_PHASE_CLEARED,
+    RETAINED_TASK_PHASE_CLEAR_PENDING,
+    RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING,
+    RETAINED_TASK_PHASE_DOCK_VERIFYING,
+    RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+    RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+    RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME,
+    RETAINED_TASK_PHASE_STALE_CANDIDATE,
+    RETAINED_TASK_PHASE_VERIFYING,
     RoomConfig,
     RoomLedger,
     SessionState,
     WhileAwayOutcome,
+    attempt_mode_for_run,
     build_auto_clean_summary,
+    build_while_away_outcome_contract,
     build_while_away_messages,
+    classify_outcome_reason,
     clean_water_empty_reason,
     cleaning_block_reason,
     evaluate_run_success,
@@ -108,6 +132,7 @@ from .logic import (
     normalize_state,
     parse_datetime,
     parse_float,
+    required_operation_for_room,
     room_auto_cleaned_on,
     room_sort_key,
     run_allows_error,
@@ -121,6 +146,14 @@ _LOGGER = logging.getLogger(__name__)
 _READY_VACUUM_STATES = {"docked", "idle"}
 _AT_DOCK_VACUUM_STATES = {"docked", "idle", "charging"}
 _BUSY_DOCK_STATES = {"cleaning", "emptying", "pause"}
+_ACTIVE_RETAINED_VACUUM_STATES = {
+    "cleaning",
+    "returning",
+    "paused",
+    "moving",
+    "manual_control",
+}
+_STALE_CLEAR_DOCK_STATES = {"idle", "pause"}
 _UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
 _UNKNOWN_PERSON_STATES = {None, "", "unknown", "unavailable"}
 _RESTORE_RECONCILE_DELAY_SECONDS = 15
@@ -163,8 +196,10 @@ class ValetudoVacuumCoordinator:
         self.session: SessionState | None = None
         self.active_run: ActiveRun | None = None
         self.manual_run: ActiveRun | None = None
+        self.retained_task_guard: RetainedTaskGuard | None = None
         self.settings_snapshot: AutoCleanSettingsSnapshot | None = None
         self.while_away_outcomes: list[WhileAwayOutcome] = []
+        self._while_away_outcome_sequence = 0
         self.last_error: str | None = None
 
         self._listeners: list[Callable[[], None]] = []
@@ -176,8 +211,12 @@ class ValetudoVacuumCoordinator:
         self._native_resume_timeout_cancel: Callable[[], None] | None = None
         self._dispatch_start_timeout_cancel: Callable[[], None] | None = None
         self._blocked_session_watchdog_cancel: Callable[[], None] | None = None
+        self._retained_task_timer_cancel: Callable[[], None] | None = None
+        self._retained_task_timer_deadline: datetime | None = None
+        self._retained_task_reconcile_scheduled = False
         self._blocked_watchdog_expiring = False
         self._terminal_cleanup_retry_attempts = 0
+        self._terminal_settings_restore_deferred = False
         self._event_lock = asyncio.Lock()
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline: datetime | None = None
@@ -199,6 +238,11 @@ class ValetudoVacuumCoordinator:
             )
         )
         async with self._event_lock:
+            await self._async_reconcile_retained_task(
+                dt_util.utcnow(),
+                allow_clear=False,
+                restored=True,
+            )
             if self.session and self.session.native_guard_cancel_pending:
                 if await self._async_execute_native_guard_cancel_pending():
                     await self._async_save_store()
@@ -228,6 +272,8 @@ class ValetudoVacuumCoordinator:
                     self._handle_delayed_restore_reconcile,
                 )
             )
+        if self.retained_task_guard:
+            self._schedule_retained_task_timer()
         if self._all_people_away() and self.away_since is None:
             self.away_since = self._latest_person_away_since()
             await self._async_save_store()
@@ -306,6 +352,13 @@ class ValetudoVacuumCoordinator:
         return bool(
             (self.session and self.session.native_resume_guard_latched)
             or (
+                self.retained_task_guard
+                and self.retained_task_guard.owner
+                == RETAINED_TASK_OWNER_COORDINATOR
+                and self.retained_task_guard.phase
+                == RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+            )
+            or (
                 self.active_run
                 and self.active_run.phase in NATIVE_RESUME_PENDING_PHASES
             )
@@ -338,6 +391,80 @@ class ValetudoVacuumCoordinator:
             "requested_iterations": run.requested_iterations if run else None,
             "resume_nudge_enabled": bool(
                 self.config.get(CONF_RESUME_NUDGE_ENABLED, False)
+            ),
+            **self.retained_task_attributes,
+        }
+
+    @property
+    def retained_task_attributes(self) -> dict[str, Any]:
+        """Return persisted retained-task ownership and recovery diagnostics."""
+        guard = self.retained_task_guard
+        last_material = (
+            parse_datetime(guard.last_material_activity_at) if guard else None
+        )
+        stale_age = (
+            max(0, int((dt_util.utcnow() - last_material).total_seconds()))
+            if last_material
+            else None
+        )
+        return {
+            "retained_task_owner": guard.owner if guard else None,
+            "retained_task_phase": guard.phase if guard else None,
+            "retained_task_reason": guard.reason if guard else None,
+            "retained_task_first_observed_at": (
+                guard.first_observed_at if guard else None
+            ),
+            "retained_task_last_material_activity_at": (
+                guard.last_material_activity_at if guard else None
+            ),
+            "retained_task_stale_age_seconds": stale_age,
+            "retained_task_coherent_since": (
+                guard.coherent_since if guard else None
+            ),
+            "retained_task_stale_deadline": (
+                guard.stale_deadline if guard else None
+            ),
+            "retained_task_observation_deadline": (
+                guard.observation_deadline if guard else None
+            ),
+            "retained_task_clear_attempts": (
+                guard.clear_attempts if guard else 0
+            ),
+            "retained_task_clear_requested_at": (
+                guard.clear_requested_at if guard else None
+            ),
+            "retained_task_clear_published_at": (
+                guard.clear_published_at if guard else None
+            ),
+            "retained_task_clear_deadline": (
+                guard.clear_deadline if guard else None
+            ),
+            "retained_task_clear_acknowledged_at": (
+                guard.clear_acknowledged_at if guard else None
+            ),
+            "retained_task_dock_clear_attempts": (
+                guard.dock_clear_attempts if guard else 0
+            ),
+            "retained_task_dock_clear_requested_at": (
+                guard.dock_clear_requested_at if guard else None
+            ),
+            "retained_task_dock_clear_published_at": (
+                guard.dock_clear_published_at if guard else None
+            ),
+            "retained_task_dock_clear_deadline": (
+                guard.dock_clear_deadline if guard else None
+            ),
+            "retained_task_dock_clear_acknowledged_at": (
+                guard.dock_clear_acknowledged_at if guard else None
+            ),
+            "retained_task_operator_required_reason": (
+                guard.operator_required_reason if guard else None
+            ),
+            "retained_task_auto_clear_enabled": bool(
+                self.config.get(
+                    CONF_STALE_RESUME_AUTO_CLEAR,
+                    DEFAULT_STALE_RESUME_AUTO_CLEAR,
+                )
             ),
         }
 
@@ -412,6 +539,15 @@ class ValetudoVacuumCoordinator:
         return issues
 
     @property
+    def while_away_outcome_contract(self) -> dict[str, Any]:
+        """Return the versioned typed while-away outcome contract."""
+        return build_while_away_outcome_contract(
+            self.while_away_outcomes,
+            self.room_by_id,
+            self._current_auto_clean_day(),
+        )
+
+    @property
     def error_state(self) -> str | None:
         """Return the current Valetudo error sensor state."""
         return self._state(self.config.get(CONF_ERROR_ENTITY))
@@ -435,6 +571,18 @@ class ValetudoVacuumCoordinator:
                 self.name,
             )
             return
+        if (
+            self.retained_task_guard
+            and self.retained_task_guard.owner
+            == RETAINED_TASK_OWNER_COORDINATOR
+            and self.retained_task_guard.phase
+            == RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+        ):
+            _LOGGER.warning(
+                "Not starting %s because its owned native task is still retained",
+                self.name,
+            )
+            return
         if self.paused:
             _LOGGER.info("Not starting %s because coordinator is paused", self.name)
             return
@@ -449,9 +597,9 @@ class ValetudoVacuumCoordinator:
         self._cancel_away_timer()
         self._clear_blocked_session_watchdog()
         self._terminal_cleanup_retry_attempts = 0
+        self._terminal_settings_restore_deferred = False
         self.session = SessionState(session_id=utcnow_iso(), started_at=utcnow_iso())
         _LOGGER.info("Starting Valetudo away-cleaning session %s (%s)", self.session.session_id, reason)
-        await self._async_prepare_auto_clean_settings()
         await self._async_save_store()
         self._notify_listeners()
         await self._async_maybe_start_next_room()
@@ -467,6 +615,10 @@ class ValetudoVacuumCoordinator:
         had_active_session = bool(self.session and self.session.active)
         had_native_resume_guard = bool(
             self.session and self.session.native_resume_guard_latched
+        )
+        retained_stop_consumed = bool(
+            self.retained_task_guard
+            and self.retained_task_guard.clear_attempts >= 1
         )
 
         if self.session:
@@ -506,7 +658,18 @@ class ValetudoVacuumCoordinator:
         elif had_native_resume_guard:
             if not await self._async_execute_native_guard_cancel_pending():
                 return
-        elif had_active_session:
+        elif (
+            had_active_session
+            and not retained_stop_consumed
+            and not (
+                self.retained_task_guard
+                and self.retained_task_guard.owner
+                in {
+                    RETAINED_TASK_OWNER_MANUAL,
+                    RETAINED_TASK_OWNER_UNKNOWN,
+                }
+            )
+        ):
             try:
                 await self._async_return_to_dock_or_stop_resumable(
                     reason,
@@ -592,12 +755,24 @@ class ValetudoVacuumCoordinator:
 
         if run.room_id:
             ledger = self.ledgers.setdefault(run.room_id, RoomLedger())
-            mark_failure(ledger, utcnow_iso(), reason)
+            when = utcnow_iso()
+            mark_failure(ledger, when, reason)
             if self.session:
                 if run.fallback_vacuum:
                     self.session.mark_fallback_failed(run.room_id, reason)
                 else:
                     self.session.mark_failed(run.room_id, reason)
+                if self.session.terminal_reason in {
+                    "returned_home",
+                    "cancelled",
+                }:
+                    self._record_attempt_outcome(
+                        kind="failed",
+                        run=run,
+                        result="interrupted",
+                        reason=reason,
+                        occurred_at=when,
+                    )
         if self.session:
             self.session.native_resume_guard_latched = False
         self._clear_active_run()
@@ -665,6 +840,7 @@ class ValetudoVacuumCoordinator:
         session.native_guard_stop_confirmed = False
         session.native_guard_return_confirmed = False
         session.native_guard_cancel_reason = None
+        self._clear_retained_task_guard()
         return True
 
     async def async_set_paused(self, paused: bool, reason: str | None = None) -> None:
@@ -806,9 +982,22 @@ class ValetudoVacuumCoordinator:
             self._observe_manual_run(entity_id, new_state, now)
             or observations_changed
         )
+        observations_changed = (
+            self._observe_retained_task(entity_id, new_state, now)
+            or observations_changed
+        )
         if observations_changed:
             await self._async_save_store()
             self._notify_listeners()
+
+        if (
+            entity_id in self._retained_task_sensor_entities()
+            and not self.active_run
+        ):
+            await self._async_reconcile_retained_task(
+                now,
+                allow_clear=bool(self.session and self.session.active),
+            )
 
         if (
             entity_id == self.config.get(CONF_ERROR_ENTITY)
@@ -944,6 +1133,14 @@ class ValetudoVacuumCoordinator:
         if self.active_run:
             return
         if self.session and self.session.native_resume_guard_latched:
+            return
+        if (
+            self.retained_task_guard
+            and self.retained_task_guard.owner
+            == RETAINED_TASK_OWNER_COORDINATOR
+            and self.retained_task_guard.phase
+            == RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+        ):
             return
         if self.session and self.session.active:
             return
@@ -1087,11 +1284,12 @@ class ValetudoVacuumCoordinator:
                     await self._async_maybe_send_auto_clean_summary()
                     return
                 cleared = self._clear_while_away_after_manual_clean_started()
+                manual_started = False
                 if self._manual_tracking_allowed():
-                    self._start_manual_run(now)
+                    manual_started = self._start_manual_run(now)
                 elif cleared:
                     self._notify_listeners()
-                if cleared:
+                if cleared or manual_started:
                     await self._async_save_store()
 
         if normalized_state == "returning" and self.active_run:
@@ -1110,7 +1308,10 @@ class ValetudoVacuumCoordinator:
             if self.active_run:
                 await self._async_reconcile_active_run_at_dock(now)
             elif self.manual_run:
-                await self._async_finish_manual_run(now)
+                await self._async_reconcile_retained_task(
+                    now,
+                    allow_clear=bool(self.session and self.session.active),
+                )
             else:
                 await self._async_maybe_send_auto_clean_summary()
                 await self._async_maybe_start_next_room()
@@ -1355,6 +1556,24 @@ class ValetudoVacuumCoordinator:
         if phase == RUN_PHASE_DOCK_INTERRUPT and run.docked_at is not None:
             run.docked_at = None
             changed = True
+        guard = self._ensure_retained_task_guard(
+            now,
+            owner=RETAINED_TASK_OWNER_COORDINATOR,
+            phase=RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME,
+            reason=reason,
+            run=run,
+        )
+        if guard.phase != RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME:
+            guard.phase = RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+            changed = True
+        if guard.reason != reason:
+            guard.reason = reason
+            changed = True
+        changed = self._update_retained_task_snapshot(
+            guard,
+            now,
+            material=True,
+        ) or changed
         return changed
 
     def _mark_active_run_resumed(self, run: ActiveRun) -> bool:
@@ -1394,6 +1613,19 @@ class ValetudoVacuumCoordinator:
         run.resume_required = False
         run.recovery_deadline = None
         run.docked_at = None
+        guard = self._ensure_retained_task_guard(
+            dt_util.utcnow(),
+            owner=RETAINED_TASK_OWNER_COORDINATOR,
+            phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+            run=run,
+        )
+        guard.phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+        guard.reason = None
+        self._update_retained_task_snapshot(
+            guard,
+            dt_util.utcnow(),
+            material=True,
+        )
         self._cancel_dock_settle_timer()
         self._cancel_native_resume_timeout()
         return True
@@ -1782,26 +2014,29 @@ class ValetudoVacuumCoordinator:
         if run.room_id:
             run.finalize_estimated_room(dt_util.utcnow())
             ledger = self.ledgers.setdefault(run.room_id, RoomLedger())
-            mark_failure(ledger, utcnow_iso(), message)
+            when = utcnow_iso()
+            mark_failure(ledger, when, message)
             if self.session:
                 if run.fallback_vacuum:
                     self.session.mark_fallback_failed(run.room_id, message)
                 else:
                     self.session.mark_failed(run.room_id, message)
-                self._record_while_away_outcome(
-                    "failed",
-                    run.room_id,
-                    message,
+                self._record_attempt_outcome(
+                    kind="failed",
+                    run=run,
+                    result="failed",
+                    reason=message,
+                    occurred_at=when,
                 )
         if self.session:
             self.session.native_resume_guard_latched = True
         self._set_needs_help_state(message)
-        self._clear_active_run()
+        self._clear_active_run(retain_task_guard=True)
         await self._async_save_store()
         self._notify_listeners()
         await self._async_maybe_send_auto_clean_summary()
 
-    def _clear_active_run(self) -> None:
+    def _clear_active_run(self, *, retain_task_guard: bool = False) -> None:
         """Clear the active run and all timers tied to it."""
         self.active_run = None
         self._active_run_restored = False
@@ -1809,6 +2044,8 @@ class ValetudoVacuumCoordinator:
         if self.session:
             self.session.active_room_id = None
         self._cancel_active_run_timers()
+        if not retain_task_guard:
+            self._clear_retained_task_guard()
 
     def _schedule_active_run_timers(self) -> None:
         """Recreate persisted active-run timers after startup."""
@@ -2011,6 +2248,1028 @@ class ValetudoVacuumCoordinator:
         self._cancel_native_resume_timeout()
         self._cancel_dispatch_start_timeout()
 
+    def _retained_task_sensor_entities(self) -> set[str]:
+        """Return entities whose transitions can materially change task ownership."""
+        return {
+            entity_id
+            for entity_id in (
+                self.vacuum_entity,
+                self.config.get(CONF_STATUS_FLAG_ENTITY),
+                self.config.get(CONF_DOCK_STATUS_ENTITY),
+                self.config.get(CONF_ERROR_ENTITY),
+                self.config.get(CONF_CURRENT_AREA_ENTITY),
+                self.config.get(CONF_CURRENT_TIME_ENTITY),
+                self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY),
+            )
+            if entity_id
+        }
+
+    def _retained_task_snapshot(
+        self,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Return the normalized task-relevant robot snapshot."""
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        dock_status = normalize_state(
+            self._state(self.config.get(CONF_DOCK_STATUS_ENTITY))
+        )
+        return (
+            vacuum_state.lower() if vacuum_state else None,
+            self._status_flag(),
+            dock_status.lower() if dock_status else None,
+            normalize_state(self.error_state),
+        )
+
+    def _ensure_retained_task_guard(
+        self,
+        now: datetime,
+        *,
+        owner: str,
+        phase: str,
+        reason: str | None = None,
+        run: ActiveRun | None = None,
+    ) -> RetainedTaskGuard:
+        """Return a persisted guard, upgrading ownership when evidence improves."""
+        guard = self.retained_task_guard
+        if guard is None:
+            vacuum_state, status_flag, dock_status, error = (
+                self._retained_task_snapshot()
+            )
+            guard = RetainedTaskGuard(
+                owner=owner,
+                phase=phase,
+                first_observed_at=now.isoformat(),
+                last_material_activity_at=now.isoformat(),
+                origin_session_id=(
+                    run.session_id
+                    if run
+                    else (self.session.session_id if self.session else None)
+                ),
+                origin_run_started_at=run.started_at if run else None,
+                reason=reason,
+                coherent_since=now.isoformat(),
+                last_vacuum_state=vacuum_state,
+                last_status_flag=status_flag,
+                last_dock_status=dock_status,
+                last_error=error,
+            )
+            self.retained_task_guard = guard
+            return guard
+
+        if owner == RETAINED_TASK_OWNER_COORDINATOR:
+            guard.owner = owner
+        elif (
+            owner == RETAINED_TASK_OWNER_MANUAL
+            and guard.owner == RETAINED_TASK_OWNER_UNKNOWN
+        ):
+            guard.owner = owner
+        if run:
+            guard.origin_session_id = run.session_id
+            guard.origin_run_started_at = run.started_at
+        elif guard.origin_session_id is None and self.session:
+            guard.origin_session_id = self.session.session_id
+        if reason is not None:
+            guard.reason = reason
+        return guard
+
+    def _set_retained_task_guard_for_run(self, run: ActiveRun) -> None:
+        """Claim a freshly prepared coordinator dispatch before publication."""
+        now = parse_datetime(run.started_at) or dt_util.utcnow()
+        vacuum_state, status_flag, dock_status, error = (
+            self._retained_task_snapshot()
+        )
+        self.retained_task_guard = RetainedTaskGuard(
+            owner=RETAINED_TASK_OWNER_COORDINATOR,
+            phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+            first_observed_at=now.isoformat(),
+            last_material_activity_at=now.isoformat(),
+            origin_session_id=run.session_id,
+            origin_run_started_at=run.started_at,
+            reason="Coordinator room dispatch prepared",
+            coherent_since=now.isoformat(),
+            last_vacuum_state=vacuum_state,
+            last_status_flag=status_flag,
+            last_dock_status=dock_status,
+            last_error=error,
+        )
+        self._cancel_retained_task_timer()
+
+    def _mark_retained_task_abandoned(self, reason: str) -> None:
+        """Keep ownership evidence after a terminal run error clears accounting."""
+        run = self.active_run
+        if not run:
+            return
+        now = dt_util.utcnow()
+        guard = self._ensure_retained_task_guard(
+            now,
+            owner=RETAINED_TASK_OWNER_COORDINATOR,
+            phase=RETAINED_TASK_PHASE_STALE_CANDIDATE,
+            reason=reason,
+            run=run,
+        )
+        guard.phase = RETAINED_TASK_PHASE_STALE_CANDIDATE
+        guard.reason = reason
+        guard.last_material_activity_at = now.isoformat()
+        guard.coherent_since = now.isoformat()
+        guard.stale_deadline = (
+            now
+            + timedelta(
+                seconds=int(
+                    self.config.get(
+                        CONF_STALE_RESUME_AGE,
+                        DEFAULT_STALE_RESUME_AGE,
+                    )
+                )
+            )
+        ).isoformat()
+        self._update_retained_task_snapshot(guard, now, material=False)
+        self._schedule_retained_task_timer()
+
+    def _update_retained_task_snapshot(
+        self,
+        guard: RetainedTaskGuard,
+        now: datetime,
+        *,
+        material: bool,
+        reset_coherent: bool = True,
+    ) -> bool:
+        """Update the guard from the coherent Home Assistant snapshot."""
+        vacuum_state, status_flag, dock_status, error = (
+            self._retained_task_snapshot()
+        )
+        snapshot_changed = (
+            guard.last_vacuum_state,
+            guard.last_status_flag,
+            guard.last_dock_status,
+            guard.last_error,
+        ) != (vacuum_state, status_flag, dock_status, error)
+        changed = snapshot_changed
+        guard.last_vacuum_state = vacuum_state
+        guard.last_status_flag = status_flag
+        guard.last_dock_status = dock_status
+        guard.last_error = error
+        if material:
+            current = now.isoformat()
+            if guard.last_material_activity_at != current:
+                guard.last_material_activity_at = current
+                changed = True
+            guard.stale_deadline = None
+        if reset_coherent and (snapshot_changed or guard.coherent_since is None):
+            guard.coherent_since = now.isoformat()
+            changed = True
+        return changed
+
+    def _observe_retained_task(
+        self,
+        entity_id: str,
+        new_state: State,
+        now: datetime,
+    ) -> bool:
+        """Observe task activity without issuing robot commands."""
+        if entity_id not in self._retained_task_sensor_entities():
+            return False
+
+        vacuum_state, status_flag, _dock_status, _error = (
+            self._retained_task_snapshot()
+        )
+        owner: str | None = None
+        phase: str | None = None
+        reason: str | None = None
+        run: ActiveRun | None = None
+        if self.active_run:
+            owner = RETAINED_TASK_OWNER_COORDINATOR
+            run = self.active_run
+            phase = (
+                RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+                if self.active_run.native_resume_pending
+                else RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            )
+        elif self.manual_run:
+            owner = RETAINED_TASK_OWNER_MANUAL
+            run = self.manual_run
+            phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+        elif (
+            vacuum_state in _ACTIVE_RETAINED_VACUUM_STATES
+            or status_flag == "resumable"
+            or self.retained_task_guard is not None
+        ):
+            owner = (
+                self.retained_task_guard.owner
+                if self.retained_task_guard
+                else RETAINED_TASK_OWNER_UNKNOWN
+            )
+            phase = (
+                RETAINED_TASK_PHASE_STALE_CANDIDATE
+                if status_flag == "resumable"
+                and vacuum_state not in _ACTIVE_RETAINED_VACUUM_STATES
+                else RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            )
+            reason = (
+                "Valetudo reported an unowned resumable task"
+                if status_flag == "resumable"
+                else "Observed external vacuum activity"
+            )
+        else:
+            return False
+
+        guard = self._ensure_retained_task_guard(
+            now,
+            owner=owner,
+            phase=phase,
+            reason=reason,
+            run=run,
+        )
+        if (
+            guard.phase == RETAINED_TASK_PHASE_CLEARED
+            and (
+                vacuum_state in _ACTIVE_RETAINED_VACUUM_STATES
+                or status_flag == "resumable"
+            )
+        ):
+            guard.owner = owner
+            guard.phase = phase
+            guard.first_observed_at = now.isoformat()
+            guard.last_material_activity_at = now.isoformat()
+            guard.coherent_since = now.isoformat()
+            guard.stale_deadline = None
+            guard.observation_deadline = None
+            guard.clear_requested_at = None
+            guard.clear_published_at = None
+            guard.clear_deadline = None
+            guard.clear_attempts = 0
+            guard.clear_acknowledged_at = None
+            guard.dock_clear_requested_at = None
+            guard.dock_clear_published_at = None
+            guard.dock_clear_deadline = None
+            guard.dock_clear_attempts = 0
+            guard.dock_clear_acknowledged_at = None
+            guard.operator_required_reason = None
+            guard.operator_notification_sent = False
+        protected_phase = guard.phase in {
+            RETAINED_TASK_PHASE_CLEAR_PENDING,
+            RETAINED_TASK_PHASE_VERIFYING,
+            RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING,
+            RETAINED_TASK_PHASE_DOCK_VERIFYING,
+            RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+        }
+        changed = False
+        if not protected_phase and guard.phase != phase:
+            guard.phase = phase
+            changed = True
+        if reason is not None and guard.reason != reason:
+            guard.reason = reason
+            changed = True
+
+        material = bool(
+            entity_id == self.vacuum_entity
+            or entity_id == self.config.get(CONF_STATUS_FLAG_ENTITY)
+            or entity_id == self.config.get(CONF_DOCK_STATUS_ENTITY)
+            or entity_id == self.config.get(CONF_ERROR_ENTITY)
+            or (
+                entity_id
+                in {
+                    self.config.get(CONF_CURRENT_AREA_ENTITY),
+                    self.config.get(CONF_CURRENT_TIME_ENTITY),
+                    self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY),
+                }
+                and vacuum_state == "cleaning"
+            )
+        )
+        changed = self._update_retained_task_snapshot(
+            guard,
+            now,
+            material=material,
+        ) or changed
+
+        if vacuum_state in _ACTIVE_RETAINED_VACUUM_STATES:
+            if not protected_phase:
+                guard.phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            if guard.observation_deadline is None:
+                guard.observation_deadline = (
+                    (parse_datetime(guard.first_observed_at) or now)
+                    + timedelta(
+                        seconds=int(
+                            self.config.get(
+                                CONF_NATIVE_RESUME_TIMEOUT,
+                                DEFAULT_NATIVE_RESUME_TIMEOUT,
+                            )
+                        )
+                    )
+                ).isoformat()
+                changed = True
+        elif status_flag == "resumable" and not protected_phase:
+            guard.phase = RETAINED_TASK_PHASE_STALE_CANDIDATE
+            guard.observation_deadline = None
+
+        if (
+            guard.phase != RETAINED_TASK_PHASE_CLEARED
+            and self.session
+            and self.session.active
+        ):
+            self.session.preflight_complete = False
+        return changed
+
+    def _retained_task_next_deadline(self) -> datetime | None:
+        """Return the next persisted retained-task transition deadline."""
+        guard = self.retained_task_guard
+        if not guard:
+            return None
+        values = [
+            guard.clear_deadline,
+            guard.dock_clear_deadline,
+            guard.stale_deadline,
+            guard.observation_deadline,
+        ]
+        deadlines = [
+            parsed
+            for value in values
+            if (parsed := parse_datetime(value)) is not None
+        ]
+        return min(deadlines) if deadlines else None
+
+    def _schedule_retained_task_timer(self) -> None:
+        """Schedule the next persisted retained-task reconciliation."""
+        deadline = self._retained_task_next_deadline()
+        if deadline is None:
+            self._cancel_retained_task_timer()
+            return
+        now = dt_util.utcnow()
+        if deadline <= now:
+            self._cancel_retained_task_timer()
+            if getattr(
+                self,
+                "_retained_task_reconcile_scheduled",
+                False,
+            ):
+                return
+            self._retained_task_reconcile_scheduled = True
+            try:
+                schedule_hass_task(
+                    self.hass,
+                    self._async_reconcile_retained_task_timer_serialized(),
+                )
+            except Exception:
+                self._retained_task_reconcile_scheduled = False
+                raise
+            return
+        existing_deadline = getattr(
+            self,
+            "_retained_task_timer_deadline",
+            None,
+        )
+        if (
+            getattr(self, "_retained_task_timer_cancel", None) is not None
+            and existing_deadline is not None
+            and existing_deadline <= deadline
+        ):
+            return
+        self._cancel_retained_task_timer()
+
+        def timer_finished(_now: datetime) -> None:
+            self._retained_task_timer_cancel = None
+            self._retained_task_timer_deadline = None
+            if not self._retained_task_reconcile_scheduled:
+                self._retained_task_reconcile_scheduled = True
+                try:
+                    schedule_hass_task(
+                        self.hass,
+                        self._async_reconcile_retained_task_timer_serialized(),
+                    )
+                except Exception:
+                    self._retained_task_reconcile_scheduled = False
+                    raise
+
+        self._retained_task_timer_deadline = deadline
+        self._retained_task_timer_cancel = async_call_later(
+            self.hass,
+            (deadline - now).total_seconds(),
+            timer_finished,
+        )
+
+    def _cancel_retained_task_timer(self) -> None:
+        """Cancel the retained-task deadline timer."""
+        if getattr(self, "_retained_task_timer_cancel", None) is not None:
+            self._retained_task_timer_cancel()
+            self._retained_task_timer_cancel = None
+        self._retained_task_timer_deadline = None
+
+    async def _async_reconcile_retained_task_timer_serialized(self) -> None:
+        """Reconcile a retained-task deadline without racing entity events."""
+        try:
+            async with self._event_lock:
+                if self.session and self.session.active and not self.active_run:
+                    await self._async_maybe_start_next_room()
+                    return
+                await self._async_reconcile_retained_task(
+                    dt_util.utcnow(),
+                    allow_clear=False,
+                )
+                if self.session and not self.session.active:
+                    await self._async_maybe_send_auto_clean_summary()
+        finally:
+            self._retained_task_reconcile_scheduled = False
+
+    async def _async_mark_retained_task_operator_required(
+        self,
+        reason: str,
+    ) -> None:
+        """Expose and notify an operator-required retained-task outcome."""
+        guard = self.retained_task_guard
+        if not guard:
+            return
+        guard.phase = RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+        guard.operator_required_reason = reason
+        guard.reason = reason
+        guard.stale_deadline = None
+        guard.observation_deadline = None
+        guard.clear_deadline = None
+        guard.dock_clear_deadline = None
+        self._cancel_retained_task_timer()
+        if self.session and self.session.active:
+            self.session.preflight_complete = False
+            self.session.blocked_reason = reason
+        await self._async_save_store()
+        self._notify_listeners()
+
+        if guard.operator_notification_sent:
+            return
+        try:
+            await self._async_send_notification(
+                f"{self.name.replace(' Coordinator', '')} · Action Needed",
+                (
+                    f"Automatic cleaning is waiting because {reason}. "
+                    "No room command was sent."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Could not send retained-task notification for %s",
+                self.name,
+            )
+            return
+        guard.operator_notification_sent = True
+        await self._async_save_store()
+        self._notify_listeners()
+
+    async def _async_acknowledge_retained_task_clear(
+        self,
+        now: datetime,
+    ) -> bool:
+        """Record a clear retained task and finish any manual accounting."""
+        guard = self.retained_task_guard
+        if not guard:
+            return True
+        guard.phase = RETAINED_TASK_PHASE_CLEARED
+        guard.reason = "Retained task cleared and dock settled"
+        if guard.clear_attempts:
+            guard.clear_acknowledged_at = (
+                guard.clear_acknowledged_at or now.isoformat()
+            )
+        if guard.dock_clear_attempts:
+            guard.dock_clear_acknowledged_at = now.isoformat()
+        guard.operator_required_reason = None
+        guard.stale_deadline = None
+        guard.observation_deadline = None
+        guard.clear_deadline = None
+        guard.dock_clear_deadline = None
+        if self.session and self.session.active:
+            self.session.preflight_complete = True
+            self.session.blocked_reason = None
+        self._clear_blocked_session_watchdog()
+        self._cancel_retained_task_timer()
+        if self.manual_run:
+            await self._async_finish_manual_run(now)
+        else:
+            await self._async_save_store()
+            self._notify_listeners()
+        return True
+
+    async def _async_publish_retained_dock_stop(
+        self,
+        now: datetime,
+    ) -> bool:
+        """Publish one persisted mop-dock clean stop after task acknowledgement."""
+        guard = self.retained_task_guard
+        if not guard:
+            return False
+        if not bool(
+            self.config.get(
+                CONF_STALE_RESUME_AUTO_CLEAR,
+                DEFAULT_STALE_RESUME_AUTO_CLEAR,
+            )
+        ):
+            await self._async_mark_retained_task_operator_required(
+                "the retained task cleared but automatic dock-pause recovery is disabled"
+            )
+            return False
+        identifier = self.config.get(CONF_IDENTIFIER)
+        if not identifier:
+            await self._async_mark_retained_task_operator_required(
+                "the retained task cleared but dock pause requires a configured Valetudo identifier"
+            )
+            return False
+        if guard.dock_clear_attempts >= 1:
+            await self._async_mark_retained_task_operator_required(
+                "the dock pause already consumed its one automatic clean-stop attempt"
+            )
+            return False
+
+        guard.phase = RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING
+        guard.dock_clear_attempts = 1
+        guard.dock_clear_requested_at = now.isoformat()
+        guard.dock_clear_deadline = (
+            now
+            + timedelta(
+                seconds=int(
+                    self.config.get(
+                        CONF_STALE_RESUME_CLEAR_TIMEOUT,
+                        DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
+                    )
+                )
+            )
+        ).isoformat()
+        guard.stale_deadline = None
+        guard.reason = "publishing one bounded mop-dock clean stop"
+        if self.session and self.session.active:
+            self.session.preflight_complete = False
+            self.session.blocked_reason = guard.reason
+        await self._async_save_store()
+        self._notify_listeners()
+
+        try:
+            await self.hass.services.async_call(
+                DOMAIN,
+                SERVICE_DOCK_ACTION,
+                {
+                    CONF_IDENTIFIER: identifier,
+                    "capability": "clean",
+                    "action": "stop",
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            await self._async_mark_retained_task_operator_required(
+                f"the one mop-dock clean-stop attempt failed: {err}"
+            )
+            return False
+
+        guard.dock_clear_published_at = dt_util.utcnow().isoformat()
+        guard.phase = RETAINED_TASK_PHASE_DOCK_VERIFYING
+        guard.reason = "waiting for dock idle acknowledgement"
+        await self._async_save_store()
+        self._notify_listeners()
+        self._schedule_retained_task_timer()
+        return False
+
+    async def _async_reconcile_retained_task(
+        self,
+        now: datetime,
+        *,
+        allow_clear: bool,
+        restored: bool = False,
+    ) -> bool:
+        """Reconcile retained-task ownership before changing settings or dispatching."""
+        vacuum_state, status_flag, dock_status, _error = (
+            self._retained_task_snapshot()
+        )
+        guard = self.retained_task_guard
+        if self.active_run:
+            guard = self._ensure_retained_task_guard(
+                now,
+                owner=RETAINED_TASK_OWNER_COORDINATOR,
+                phase=(
+                    RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+                    if self.active_run.native_resume_pending
+                    else RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+                ),
+                run=self.active_run,
+            )
+        elif self.manual_run:
+            guard = self._ensure_retained_task_guard(
+                now,
+                owner=RETAINED_TASK_OWNER_MANUAL,
+                phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+                reason="Observed manual cleaning",
+                run=self.manual_run,
+            )
+        elif guard is None and (
+            vacuum_state in _ACTIVE_RETAINED_VACUUM_STATES
+            or status_flag == "resumable"
+        ):
+            guard = self._ensure_retained_task_guard(
+                now,
+                owner=RETAINED_TASK_OWNER_UNKNOWN,
+                phase=(
+                    RETAINED_TASK_PHASE_STALE_CANDIDATE
+                    if status_flag == "resumable"
+                    else RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+                ),
+                reason=(
+                    "Valetudo reported an unowned resumable task"
+                    if status_flag == "resumable"
+                    else "Observed external vacuum activity"
+                ),
+            )
+
+        if guard is None:
+            if self.session and self.session.active:
+                self.session.preflight_complete = True
+            self._cancel_retained_task_timer()
+            return True
+
+        if restored:
+            guard.coherent_since = now.isoformat()
+        self._update_retained_task_snapshot(
+            guard,
+            now,
+            material=False,
+            reset_coherent=not restored,
+        )
+        if self.session and self.session.active and not self.active_run:
+            self._clear_blocked_session_watchdog()
+
+        if guard.phase == RETAINED_TASK_PHASE_CLEARED:
+            if (
+                status_flag != "resumable"
+                and vacuum_state not in _ACTIVE_RETAINED_VACUUM_STATES
+            ):
+                if self.session and self.session.active:
+                    self.session.preflight_complete = True
+                return True
+            guard.phase = (
+                RETAINED_TASK_PHASE_STALE_CANDIDATE
+                if status_flag == "resumable"
+                else RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            )
+            guard.first_observed_at = now.isoformat()
+            guard.last_material_activity_at = now.isoformat()
+            guard.clear_attempts = 0
+            guard.clear_requested_at = None
+            guard.clear_published_at = None
+            guard.clear_acknowledged_at = None
+            guard.dock_clear_requested_at = None
+            guard.dock_clear_published_at = None
+            guard.dock_clear_deadline = None
+            guard.dock_clear_attempts = 0
+            guard.dock_clear_acknowledged_at = None
+            guard.operator_notification_sent = False
+
+        if self.active_run and self.active_run.native_resume_pending:
+            guard.owner = RETAINED_TASK_OWNER_COORDINATOR
+            guard.phase = RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+            guard.reason = self.active_run.suspend_reason
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = guard.reason
+            await self._async_save_store()
+            self._notify_listeners()
+            return False
+
+        if vacuum_state in _ACTIVE_RETAINED_VACUUM_STATES:
+            was_operator_required = (
+                guard.phase == RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+            )
+            guard.phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            guard.reason = (
+                f"{guard.owner} retained task is currently {vacuum_state}"
+            )
+            if was_operator_required:
+                guard.operator_required_reason = None
+                guard.operator_notification_sent = False
+            if guard.observation_deadline is None:
+                guard.observation_deadline = (
+                    (parse_datetime(guard.first_observed_at) or now)
+                    + timedelta(
+                        seconds=int(
+                            self.config.get(
+                                CONF_NATIVE_RESUME_TIMEOUT,
+                                DEFAULT_NATIVE_RESUME_TIMEOUT,
+                            )
+                        )
+                    )
+                ).isoformat()
+            observation_deadline = parse_datetime(guard.observation_deadline)
+            if (
+                allow_clear
+                and observation_deadline is not None
+                and now >= observation_deadline
+            ):
+                await self._async_mark_retained_task_operator_required(
+                    "an external or manual vacuum task remained active beyond its observation deadline"
+                )
+                return False
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = guard.reason
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        guard.observation_deadline = None
+        status_configured = bool(self.config.get(CONF_STATUS_FLAG_ENTITY))
+        status_clear = not status_configured or status_flag not in {
+            None,
+            "unknown",
+            "unavailable",
+            "resumable",
+        }
+        dock_configured = bool(self.config.get(CONF_DOCK_STATUS_ENTITY))
+        dock_available = not dock_configured or dock_status not in {
+            None,
+            "unknown",
+            "unavailable",
+        }
+        error_available = self._configured_error_is_available()
+        error_clear = self._configured_error_is_clear()
+        task_clear_error_safe = bool(
+            error_available
+            and (
+                error_clear
+                or self._error_is_mop_resource(self.error_state)
+            )
+        )
+        coherent_since = parse_datetime(guard.coherent_since) or now
+        settle_seconds = int(
+            self.config.get(
+                CONF_STALE_RESUME_SETTLE,
+                DEFAULT_STALE_RESUME_SETTLE,
+            )
+        )
+        settle_deadline = coherent_since + timedelta(seconds=settle_seconds)
+
+        if guard.phase == RETAINED_TASK_PHASE_CLEAR_PENDING:
+            if guard.clear_published_at is None:
+                await self._async_mark_retained_task_operator_required(
+                    "a persisted stale-task clear intent has unknown command delivery after restart"
+                )
+                return False
+            guard.phase = RETAINED_TASK_PHASE_VERIFYING
+
+        if guard.phase == RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING:
+            if guard.dock_clear_published_at is None:
+                await self._async_mark_retained_task_operator_required(
+                    "a persisted dock clean-stop intent has unknown command delivery after restart"
+                )
+                return False
+            guard.phase = RETAINED_TASK_PHASE_DOCK_VERIFYING
+
+        vacuum_ack_safe = vacuum_state in {"docked", "idle"}
+        dock_idle = not dock_configured or dock_status == "idle"
+        if guard.phase in {
+            RETAINED_TASK_PHASE_VERIFYING,
+            RETAINED_TASK_PHASE_DOCK_VERIFYING,
+            RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+        } and status_clear:
+            if (
+                vacuum_ack_safe
+                and dock_available
+                and dock_idle
+                and task_clear_error_safe
+            ):
+                if guard.clear_attempts:
+                    guard.clear_acknowledged_at = (
+                        guard.clear_acknowledged_at or now.isoformat()
+                    )
+                if now >= settle_deadline:
+                    return await self._async_acknowledge_retained_task_clear(now)
+                guard.clear_deadline = None
+                guard.dock_clear_deadline = None
+                guard.stale_deadline = settle_deadline.isoformat()
+                if self.session and self.session.active:
+                    self.session.preflight_complete = False
+                    self.session.blocked_reason = (
+                        "retained task cleared; waiting for dock settle"
+                    )
+                await self._async_save_store()
+                self._notify_listeners()
+                self._schedule_retained_task_timer()
+                return False
+
+        if (
+            guard.phase == RETAINED_TASK_PHASE_VERIFYING
+            and status_clear
+            and vacuum_ack_safe
+            and dock_available
+            and dock_status == "pause"
+            and task_clear_error_safe
+        ):
+            guard.clear_acknowledged_at = (
+                guard.clear_acknowledged_at or now.isoformat()
+            )
+            guard.clear_deadline = None
+            if now < settle_deadline:
+                guard.stale_deadline = settle_deadline.isoformat()
+                guard.reason = (
+                    "retained task cleared; waiting for stable dock pause"
+                )
+                if self.session and self.session.active:
+                    self.session.preflight_complete = False
+                    self.session.blocked_reason = guard.reason
+                await self._async_save_store()
+                self._notify_listeners()
+                self._schedule_retained_task_timer()
+                return False
+            return await self._async_publish_retained_dock_stop(now)
+
+        if guard.phase == RETAINED_TASK_PHASE_VERIFYING:
+            clear_deadline = parse_datetime(guard.clear_deadline)
+            if clear_deadline is not None and now >= clear_deadline:
+                await self._async_mark_retained_task_operator_required(
+                    "the stale-task stop was published but the robot did not acknowledge a clear task"
+                )
+                return False
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = (
+                    "waiting for stale-task stop acknowledgement"
+                )
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        if guard.phase == RETAINED_TASK_PHASE_DOCK_VERIFYING:
+            dock_clear_deadline = parse_datetime(guard.dock_clear_deadline)
+            if (
+                dock_clear_deadline is not None
+                and now >= dock_clear_deadline
+            ):
+                await self._async_mark_retained_task_operator_required(
+                    "the mop-dock clean stop was published but dock status did not acknowledge idle"
+                )
+                return False
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = (
+                    "waiting for dock idle acknowledgement"
+                )
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        if guard.phase == RETAINED_TASK_PHASE_OPERATOR_REQUIRED:
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = guard.operator_required_reason
+            if allow_clear and not guard.operator_notification_sent:
+                await self._async_mark_retained_task_operator_required(
+                    guard.operator_required_reason
+                    or "a retained vacuum task requires operator action"
+                )
+            return False
+
+        if (
+            status_clear
+            and vacuum_ack_safe
+            and dock_available
+            and dock_idle
+            and task_clear_error_safe
+        ):
+            if now >= settle_deadline:
+                return await self._async_acknowledge_retained_task_clear(now)
+            guard.stale_deadline = settle_deadline.isoformat()
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = (
+                    "retained task appears clear; waiting for dock settle"
+                )
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        if status_flag != "resumable":
+            guard.phase = RETAINED_TASK_PHASE_STALE_CANDIDATE
+            guard.reason = "retained task state is not yet coherently clear"
+            unresolved_deadline = coherent_since + timedelta(
+                seconds=int(
+                    self.config.get(
+                        CONF_STALE_RESUME_AGE,
+                        DEFAULT_STALE_RESUME_AGE,
+                    )
+                )
+            )
+            guard.stale_deadline = unresolved_deadline.isoformat()
+            if allow_clear and now >= unresolved_deadline:
+                await self._async_mark_retained_task_operator_required(
+                    "the retained task did not reach a clear idle dock state before its deadline"
+                )
+                return False
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = guard.reason
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        guard.phase = RETAINED_TASK_PHASE_STALE_CANDIDATE
+        last_material = parse_datetime(guard.last_material_activity_at) or now
+        stale_deadline = last_material + timedelta(
+            seconds=int(
+                self.config.get(
+                    CONF_STALE_RESUME_AGE,
+                    DEFAULT_STALE_RESUME_AGE,
+                )
+            )
+        )
+        ready_at = max(stale_deadline, settle_deadline)
+        guard.stale_deadline = ready_at.isoformat()
+        stale_clear_snapshot = bool(
+            vacuum_state == "docked"
+            and dock_available
+            and dock_status in _STALE_CLEAR_DOCK_STATES
+            and error_available
+            and error_clear
+        )
+        if now < ready_at:
+            guard.reason = "unowned resumable task has not reached its stale deadline"
+            if self.session and self.session.active:
+                self.session.preflight_complete = False
+                self.session.blocked_reason = guard.reason
+            await self._async_save_store()
+            self._notify_listeners()
+            self._schedule_retained_task_timer()
+            return False
+
+        if not allow_clear:
+            guard.reason = "unowned resumable task is stale and awaiting session preflight"
+            await self._async_save_store()
+            self._notify_listeners()
+            return False
+
+        if not stale_clear_snapshot:
+            await self._async_mark_retained_task_operator_required(
+                "the stale resumable task is not in a coherent docked and error-clear state"
+            )
+            return False
+
+        if not bool(
+            self.config.get(
+                CONF_STALE_RESUME_AUTO_CLEAR,
+                DEFAULT_STALE_RESUME_AUTO_CLEAR,
+            )
+        ):
+            await self._async_mark_retained_task_operator_required(
+                "a stale docked resumable task was detected and automatic clearing is disabled"
+            )
+            return False
+
+        if guard.clear_attempts >= 1:
+            await self._async_mark_retained_task_operator_required(
+                "the stale resumable task already consumed its one automatic clear attempt"
+            )
+            return False
+
+        guard.phase = RETAINED_TASK_PHASE_CLEAR_PENDING
+        guard.clear_attempts = 1
+        guard.clear_requested_at = now.isoformat()
+        guard.clear_deadline = (
+            now
+            + timedelta(
+                seconds=int(
+                    self.config.get(
+                        CONF_STALE_RESUME_CLEAR_TIMEOUT,
+                        DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
+                    )
+                )
+            )
+        ).isoformat()
+        guard.stale_deadline = None
+        guard.reason = "publishing one bounded stop for a stale docked task"
+        if self.session and self.session.active:
+            self.session.preflight_complete = False
+            self.session.blocked_reason = guard.reason
+        await self._async_save_store()
+        self._notify_listeners()
+
+        try:
+            await self.hass.services.async_call(
+                "vacuum",
+                "stop",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            await self._async_mark_retained_task_operator_required(
+                f"the one stale-task stop attempt failed to publish: {err}"
+            )
+            return False
+
+        guard.clear_published_at = dt_util.utcnow().isoformat()
+        guard.phase = RETAINED_TASK_PHASE_VERIFYING
+        guard.reason = "waiting for stale-task stop acknowledgement"
+        await self._async_save_store()
+        self._notify_listeners()
+        self._schedule_retained_task_timer()
+        return False
+
+    def _clear_retained_task_guard(self) -> None:
+        """Clear retained-task ownership after definitive task completion."""
+        self.retained_task_guard = None
+        self._cancel_retained_task_timer()
+
     async def _async_arm_blocked_session_watchdog(
         self,
         reason: str | None = None,
@@ -2078,7 +3337,7 @@ class ValetudoVacuumCoordinator:
             or "battery" in normalized_reason
             or "charging" in normalized_reason
             or normalize_state(self._state(self.vacuum_entity)) == "charging"
-            or self._status_flag() == "resumable"
+            or self.native_resume_pending
             or (
                 battery is not None
                 and battery < minimum_battery
@@ -2178,6 +3437,19 @@ class ValetudoVacuumCoordinator:
             else:
                 self._notify_listeners()
             return
+        if not await self._async_reconcile_retained_task(
+            dt_util.utcnow(),
+            allow_clear=True,
+        ):
+            self._notify_listeners()
+            return
+        if not self.session or not self.session.active:
+            return
+        if not self.session.settings_prepared:
+            await self._async_prepare_auto_clean_settings()
+            self.session.settings_prepared = True
+            await self._async_save_store()
+            self._notify_listeners()
         if (
             self.session.pending_recovery_room_id
             and not await self._async_recover_pending_room_failure_if_ready()
@@ -2441,6 +3713,7 @@ class ValetudoVacuumCoordinator:
                 )
             ):
                 session.defer_full_clean(room.room_id, reason)
+                self._record_deferral_outcome(room, reason)
 
     def _sorted_auto_clean_rooms(self) -> list[RoomConfig]:
         """Return enabled rooms in the normal fairness order."""
@@ -2781,6 +4054,7 @@ class ValetudoVacuumCoordinator:
             requested_iterations=requested_iterations,
         )
         self.active_run = run
+        self._set_retained_task_guard_for_run(run)
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline = None
         if self._status_flag() == "segment":
@@ -2828,19 +4102,22 @@ class ValetudoVacuumCoordinator:
             self._clear_active_run()
             if self.session is session:
                 failure_reason = f"Could not dispatch {room.name}: {err}"
+                when = utcnow_iso()
                 mark_failure(
                     self.ledgers.setdefault(room.room_id, RoomLedger()),
-                    utcnow_iso(),
+                    when,
                     failure_reason,
                 )
                 if fallback_vacuum:
                     session.mark_fallback_failed(room.room_id, failure_reason)
                 else:
                     session.mark_failed(room.room_id, failure_reason)
-                self._record_while_away_outcome(
-                    "failed",
-                    room.room_id,
-                    failure_reason,
+                self._record_attempt_outcome(
+                    kind="failed",
+                    run=run,
+                    result="failed",
+                    reason=failure_reason,
+                    occurred_at=when,
                 )
                 if not fallback_vacuum:
                     self._set_needs_help_state(failure_reason)
@@ -2975,6 +4252,7 @@ class ValetudoVacuumCoordinator:
         failure_reason: str | None = None,
         continue_session: bool = True,
         send_summary: bool = True,
+        retain_task_guard: bool = False,
     ) -> None:
         """Finalize the active commanded run."""
         run = self.active_run
@@ -3008,13 +4286,18 @@ class ValetudoVacuumCoordinator:
                 mark_fallback_vacuum_success(ledger, when)
                 if self.session:
                     self.session.mark_fallback_completed(room.room_id)
-                    self._record_while_away_outcome(
-                        "fallback",
-                        room.room_id,
+                    deferred_reason = (
                         self.session.deferred_full_clean_reasons.get(
                             room.room_id,
                             self.session.degraded_reason,
-                        ),
+                        )
+                    )
+                    self._record_attempt_outcome(
+                        kind="fallback",
+                        run=run,
+                        result="completed",
+                        legacy_reason=deferred_reason,
+                        occurred_at=when,
                     )
             else:
                 mark_success(
@@ -3026,19 +4309,31 @@ class ValetudoVacuumCoordinator:
                 )
                 if self.session:
                     self.session.mark_completed(room.room_id)
-                    self._record_while_away_outcome("cleaned", room.room_id)
+                    self._record_attempt_outcome(
+                        kind="cleaned",
+                        run=run,
+                        result="completed",
+                        occurred_at=when,
+                    )
         else:
-            mark_failure(ledger, utcnow_iso(), reason)
+            when = utcnow_iso()
+            mark_failure(ledger, when, reason)
             if self.session:
                 if run.fallback_vacuum:
                     self.session.mark_fallback_failed(room.room_id, reason)
                 else:
                     self.session.mark_failed(room.room_id, reason)
-                self._record_while_away_outcome("failed", room.room_id, reason)
+                self._record_attempt_outcome(
+                    kind="failed",
+                    run=run,
+                    result="failed",
+                    reason=reason,
+                    occurred_at=when,
+                )
                 if wrong_room_failure:
                     self._set_needs_help_state(reason or "Wrong room observed")
 
-        self._clear_active_run()
+        self._clear_active_run(retain_task_guard=retain_task_guard)
 
         await self._async_save_store()
         self._notify_listeners()
@@ -3075,10 +4370,11 @@ class ValetudoVacuumCoordinator:
                 and not self._error_needs_help(error)
             )
             if run.room_id:
-                self._record_while_away_outcome(
-                    "failed",
-                    run.room_id,
-                    error,
+                self._record_attempt_outcome(
+                    kind="failed",
+                    run=run,
+                    result="failed",
+                    reason=error,
                 )
             if self.session:
                 self.session.native_resume_guard_latched = True
@@ -3116,12 +4412,16 @@ class ValetudoVacuumCoordinator:
         needs_help = changed_allowed_error or self._error_needs_help(error)
         if needs_help:
             self._set_needs_help_state(error)
+        retain_task_guard = bool(run and run.command_published)
+        if retain_task_guard:
+            self._mark_retained_task_abandoned(error)
 
         await self._async_finish_active_run(
             success_override=False,
             failure_reason=error,
             continue_session=False,
             send_summary=not needs_help,
+            retain_task_guard=retain_task_guard,
         )
         try:
             await self._async_return_to_dock_or_stop_resumable(error)
@@ -3241,7 +4541,11 @@ class ValetudoVacuumCoordinator:
         if not room_id:
             return
 
-        self._remove_while_away_failure(room_id, previous_reason)
+        replaced_outcome = self._replace_while_away_failure(
+            room_id,
+            previous_reason,
+            error,
+        )
         self.session.discard_retry(room_id)
         if self.session.pending_recovery_room_id == room_id:
             self.session.resolve_recoverable_failure(room_id, queue_retry=False)
@@ -3252,7 +4556,8 @@ class ValetudoVacuumCoordinator:
             error,
         )
         self.session.mark_failed(room_id, error)
-        self._record_while_away_outcome("failed", room_id, error)
+        if not replaced_outcome:
+            self._record_legacy_while_away_outcome("failed", room_id, error)
 
         if is_low_battery_error(error):
             await self._async_mark_needs_help(
@@ -3537,74 +4842,116 @@ class ValetudoVacuumCoordinator:
             return
         if self.session.notification_sent and self.settings_snapshot is None:
             return
-        if not self._vacuum_at_safe_terminal_point() and not self.session.needs_help:
-            return
         guarded_cleanup = bool(
             self.session.native_resume_guard_latched
             or self.session.native_guard_cancel_pending
         )
-        if not guarded_cleanup:
-            if self._terminal_cleanup_retry_attempts >= _MAX_TERMINAL_CLEANUP_RETRIES:
-                return
-            self._terminal_cleanup_retry_attempts += 1
+        retry_budget_exhausted = (
+            self._terminal_cleanup_retry_attempts
+            >= _MAX_TERMINAL_CLEANUP_RETRIES
+        )
 
         notification_failed = False
         if not self.session.notification_sent:
-            summary = build_auto_clean_summary(
-                vacuum_name=self.name.replace(" Coordinator", ""),
-                completed_room_names=[
-                    self.room_by_id[room_id].name
-                    for room_id in self.session.completed_room_ids
-                ],
-                skipped_room_reasons=self._named_reasons(
-                    self.session.skipped_room_reasons
-                ),
-                failed_room_reasons=self._named_reasons(
-                    self.session.failed_room_reasons
-                ),
-                terminal_reason=self.session.terminal_reason,
-                terminal_message=self.session.terminal_message,
-                needs_help=self.session.needs_help,
-                all_rooms_cleaned=self._all_enabled_rooms_completed(),
-                total_room_count=len(self._auto_clean_rooms()),
-                fallback_room_names=[
-                    self.room_by_id[room_id].name
-                    for room_id in self.session.fallback_completed_room_ids
-                    if room_id in self.room_by_id
-                ],
-                deferred_room_names=[
-                    self.room_by_id[room_id].name
-                    for room_id in self.session.deferred_full_clean_room_ids
-                    if room_id in self.room_by_id
-                ],
-            )
-            if summary:
-                try:
-                    await self._async_send_notification(summary.title, summary.message)
-                except Exception:  # noqa: BLE001
-                    _LOGGER.exception("Could not send auto-clean summary for %s", self.name)
-                    notification_failed = True
-            if not notification_failed:
-                self.session.notification_sent = True
+            if retry_budget_exhausted:
+                notification_failed = True
+            else:
+                summary = build_auto_clean_summary(
+                    vacuum_name=self.name.replace(" Coordinator", ""),
+                    completed_room_names=[
+                        self.room_by_id[room_id].name
+                        for room_id in self.session.completed_room_ids
+                    ],
+                    skipped_room_reasons=self._named_reasons(
+                        self.session.skipped_room_reasons
+                    ),
+                    failed_room_reasons=self._named_reasons(
+                        self.session.failed_room_reasons
+                    ),
+                    terminal_reason=self.session.terminal_reason,
+                    terminal_message=self.session.terminal_message,
+                    needs_help=self.session.needs_help,
+                    all_rooms_cleaned=self._all_enabled_rooms_completed(),
+                    total_room_count=len(self._auto_clean_rooms()),
+                    fallback_room_names=[
+                        self.room_by_id[room_id].name
+                        for room_id in self.session.fallback_completed_room_ids
+                        if room_id in self.room_by_id
+                    ],
+                    deferred_room_names=[
+                        self.room_by_id[room_id].name
+                        for room_id in self.session.deferred_full_clean_room_ids
+                        if room_id in self.room_by_id
+                    ],
+                )
+                if summary:
+                    try:
+                        await self._async_send_notification(
+                            summary.title,
+                            summary.message,
+                        )
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception(
+                            "Could not send auto-clean summary for %s",
+                            self.name,
+                        )
+                        notification_failed = True
+                if not notification_failed:
+                    self.session.notification_sent = True
 
         if guarded_cleanup:
+            if self.settings_snapshot is not None:
+                self._terminal_settings_restore_deferred = True
+            retry_needed = notification_failed and not retry_budget_exhausted
+            if retry_needed:
+                self._terminal_cleanup_retry_attempts += 1
+            elif not notification_failed:
+                self._terminal_cleanup_retry_attempts = 0
             await self._async_save_store()
             self._notify_listeners()
+            if retry_needed:
+                self._schedule_terminal_cleanup_retry()
+            else:
+                self._cancel_terminal_cleanup_retry()
             return
 
+        restoration_deferred = bool(
+            self.settings_snapshot is not None
+            and not self._settings_restoration_safe()
+        )
+        if restoration_deferred:
+            self._terminal_settings_restore_deferred = True
         restoration_failed = False
-        try:
-            restoration_failed = not await self._async_restore_auto_clean_settings()
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("Could not restore auto-clean settings for %s", self.name)
-            restoration_failed = True
+        if self.settings_snapshot is not None and not restoration_deferred:
+            deferred_allowance = self._terminal_settings_restore_deferred
+            if retry_budget_exhausted and not deferred_allowance:
+                restoration_failed = True
+            else:
+                self._terminal_settings_restore_deferred = False
+                try:
+                    restoration_failed = (
+                        not await self._async_restore_auto_clean_settings()
+                    )
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "Could not restore auto-clean settings for %s",
+                        self.name,
+                    )
+                    restoration_failed = True
+        elif self.settings_snapshot is None:
+            self._terminal_settings_restore_deferred = False
+
+        retry_needed = bool(notification_failed or restoration_failed)
+        if retry_needed and not retry_budget_exhausted:
+            self._terminal_cleanup_retry_attempts += 1
+        elif not retry_needed:
+            self._terminal_cleanup_retry_attempts = 0
         await self._async_save_store()
         self._notify_listeners()
-        if notification_failed or restoration_failed:
+        if retry_needed and not retry_budget_exhausted:
             self._schedule_terminal_cleanup_retry()
         else:
             self._cancel_terminal_cleanup_retry()
-            self._terminal_cleanup_retry_attempts = 0
 
     def _schedule_terminal_cleanup_retry(self) -> None:
         """Schedule a bounded retry for notification or settings cleanup."""
@@ -3761,66 +5108,13 @@ class ValetudoVacuumCoordinator:
                 return reason
         return None
 
-    def _vacuum_at_safe_terminal_point(self) -> bool:
-        """Return whether it is safe to clear auto-cleaning and notify."""
+    def _settings_restoration_safe(self) -> bool:
+        """Return whether terminal cleanup may mutate cleaning settings."""
+        if self.active_run or self.manual_run:
+            return False
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
-        resources = self._resource_state()
-        status_entity = self.config.get(CONF_STATUS_FLAG_ENTITY)
-        status_flag = self._status_flag()
-        status_safe = not status_entity or status_flag not in {
-            None,
-            "unknown",
-            "unavailable",
-            "resumable",
-        }
-        dock_entity = self.config.get(CONF_DOCK_STATUS_ENTITY)
-        dock_status = normalize_state(self._state(dock_entity))
-        dock_safe = not dock_entity or (
-            dock_status is not None
-            and dock_status.lower() in {"idle", "pause"}
-        )
-        resource_blocked = bool(
-            self.session
-            and (
-                self.session.terminal_reason == "mop_resource_deferred"
-                or self._error_is_mop_resource(self.error_state)
-                or (
-                    normalize_state(resources.dustbag) is not None
-                    and normalize_state(resources.dustbag).lower()
-                    in {"full", "missing", "unknown", "unavailable"}
-                )
-                or any(
-                    mop_block_reason(room, resources)
-                    for room in self._auto_clean_rooms()
-                    if room.mop_required
-                )
-            )
-        )
-        if (
-            self.session
-            and self.session.terminal_reason in {
-                "mop_resource_deferred",
-                "blocked",
-            }
-            and not self.active_run
-            and not self.session.native_resume_guard_latched
-            and not self.session.native_guard_cancel_pending
-            and (
-                is_error_clear(self.error_state)
-                or self._error_is_mop_resource(self.error_state)
-            )
-            and vacuum_state in {"error", "docked", "idle"}
-            and status_safe
-            and dock_safe
-            and resource_blocked
-        ):
-            return True
-        if not status_entity:
-            return vacuum_state in _READY_VACUUM_STATES
-        return (
-            vacuum_state in _READY_VACUUM_STATES
-            and status_flag not in {None, "unknown", "unavailable", "resumable"}
-        )
+        vacuum_state = vacuum_state.lower() if vacuum_state else None
+        return vacuum_state not in _ACTIVE_RETAINED_VACUUM_STATES
 
     def _vacuum_successfully_docked(self) -> bool:
         """Return whether the robot reached the dock and is no longer resumable."""
@@ -3855,10 +5149,10 @@ class ValetudoVacuumCoordinator:
         """Return whether an error is a recoverable mop resource issue."""
         return error_contains_any(error, RECOVERABLE_MOP_ERROR_KEYWORDS)
 
-    def _start_manual_run(self, now: datetime) -> None:
+    def _start_manual_run(self, now: datetime) -> bool:
         """Begin observing a manual segment run."""
         if self.manual_run:
-            return
+            return False
         self.manual_run = ActiveRun(
             room_id=None,
             segment_id=None,
@@ -3871,7 +5165,15 @@ class ValetudoVacuumCoordinator:
         )
         if self._status_flag() == "segment":
             self.manual_run.observed_segment_cleaning = True
+        self._ensure_retained_task_guard(
+            now,
+            owner=RETAINED_TASK_OWNER_MANUAL,
+            phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+            reason="Observed manual cleaning",
+            run=self.manual_run,
+        )
         self._notify_listeners()
+        return True
 
     async def _async_finish_manual_run(self, now: datetime) -> None:
         """Credit rooms observed during a manual run."""
@@ -3885,6 +5187,18 @@ class ValetudoVacuumCoordinator:
                 mark_success(self.ledgers.setdefault(room.room_id, RoomLedger()), utcnow_iso(), mop=room.mop_required)
 
         self.manual_run = None
+        guard = self.retained_task_guard
+        if guard and guard.owner == RETAINED_TASK_OWNER_MANUAL:
+            guard.phase = RETAINED_TASK_PHASE_CLEARED
+            guard.reason = "Manual task reached a clear docked state"
+            guard.clear_acknowledged_at = (
+                guard.clear_acknowledged_at or now.isoformat()
+            )
+            guard.operator_required_reason = None
+            guard.stale_deadline = None
+            guard.observation_deadline = None
+            guard.clear_deadline = None
+            self._cancel_retained_task_timer()
         self._clear_terminal_session_after_manual_run()
         await self._async_save_store()
         self._notify_listeners()
@@ -3926,35 +5240,218 @@ class ValetudoVacuumCoordinator:
             changed = True
         return changed
 
-    def _record_while_away_outcome(
+    def _next_while_away_outcome_sequence(self) -> int:
+        """Return the next persisted monotonic typed-outcome sequence."""
+        self._while_away_outcome_sequence = max(
+            int(getattr(self, "_while_away_outcome_sequence", 0)),
+            max(
+                (
+                    outcome.sequence or 0
+                    for outcome in self.while_away_outcomes
+                ),
+                default=0,
+            ),
+        )
+        self._while_away_outcome_sequence += 1
+        return self._while_away_outcome_sequence
+
+    def _append_while_away_outcome(
+        self,
+        outcome: WhileAwayOutcome,
+    ) -> WhileAwayOutcome:
+        """Append one outcome unless its stable event ID already exists."""
+        day = self._current_auto_clean_day()
+        self._prune_while_away_outcomes_for_day(day)
+        if outcome.outcome_id:
+            existing = next(
+                (
+                    item
+                    for item in self.while_away_outcomes
+                    if item.outcome_id == outcome.outcome_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+        if outcome.event_type and outcome.sequence is None:
+            outcome.sequence = self._next_while_away_outcome_sequence()
+        self.while_away_outcomes.append(outcome)
+        self._schedule_next_day_timer_if_needed()
+        return outcome
+
+    def _record_attempt_outcome(
+        self,
+        *,
+        kind: str,
+        run: ActiveRun,
+        result: str,
+        reason: str | None = None,
+        legacy_reason: str | None = None,
+        occurred_at: str | None = None,
+    ) -> WhileAwayOutcome | None:
+        """Record one immutable terminal result for a room command attempt."""
+        if not run.room_id or not run.session_id:
+            return None
+        room = self.room_by_id.get(run.room_id)
+        if room is None:
+            return None
+        when = occurred_at or utcnow_iso()
+        outcome_id = (
+            f"{run.session_id}:{room.room_id}:attempt:{run.started_at}"
+        )
+        reason_descriptor = (
+            None
+            if result == "completed"
+            else classify_outcome_reason(reason)
+        )
+        existing = next(
+            (
+                outcome
+                for outcome in self.while_away_outcomes
+                if outcome.outcome_id == outcome_id
+            ),
+            None,
+        )
+        if existing is not None:
+            existing_reason = (
+                existing.reason_descriptor.to_dict()
+                if existing.reason_descriptor
+                else None
+            )
+            incoming_reason = (
+                reason_descriptor.to_dict()
+                if reason_descriptor
+                else None
+            )
+            if (
+                existing.event_type != "attempt"
+                or existing.attempt_mode != attempt_mode_for_run(run)
+                or existing.attempt_result != result
+                or existing_reason != incoming_reason
+            ):
+                _LOGGER.warning(
+                    "Ignoring conflicting terminal outcome for run %s; "
+                    "retaining immutable %s result instead of %s",
+                    outcome_id,
+                    existing.attempt_result,
+                    result,
+                )
+            return existing
+        return self._append_while_away_outcome(
+            WhileAwayOutcome(
+                day=self._current_auto_clean_day(),
+                room_id=room.room_id,
+                kind=kind,
+                reason=legacy_reason if legacy_reason is not None else reason,
+                outcome_id=outcome_id,
+                session_id=run.session_id,
+                occurred_at=when,
+                room_name=room.name,
+                event_type="attempt",
+                attempt_mode=attempt_mode_for_run(run),
+                attempt_result=result,
+                reason_descriptor=reason_descriptor,
+            )
+        )
+
+    def _record_deferral_outcome(
+        self,
+        room: RoomConfig,
+        reason: str,
+        *,
+        event_key: str = "full_clean",
+        kind: str = "skipped",
+        legacy_visible: bool = False,
+        occurred_at: str | None = None,
+    ) -> WhileAwayOutcome | None:
+        """Record one idempotent typed no-attempt outstanding obligation."""
+        if not self.session:
+            return None
+        when = occurred_at or utcnow_iso()
+        return self._append_while_away_outcome(
+            WhileAwayOutcome(
+                day=self._current_auto_clean_day(),
+                room_id=room.room_id,
+                kind=kind,
+                reason=reason,
+                outcome_id=(
+                    f"{self.session.session_id}:{room.room_id}:deferral:{event_key}"
+                ),
+                session_id=self.session.session_id,
+                occurred_at=when,
+                room_name=room.name,
+                event_type="deferral",
+                outstanding_operation=required_operation_for_room(room),
+                reason_descriptor=classify_outcome_reason(reason),
+                legacy_visible=legacy_visible,
+            )
+        )
+
+    def _record_legacy_while_away_outcome(
         self,
         kind: str,
         room_id: str,
         reason: str | None = None,
     ) -> None:
-        """Record one retained auto-clean outcome for dashboard display."""
-        day = self._current_auto_clean_day()
-        self._prune_while_away_outcomes_for_day(day)
-        self.while_away_outcomes.append(
-            WhileAwayOutcome(day=day, room_id=room_id, kind=kind, reason=reason)
+        """Record a compatibility outcome when precise run metadata is absent."""
+        room = self.room_by_id.get(room_id)
+        self._append_while_away_outcome(
+            WhileAwayOutcome(
+                day=self._current_auto_clean_day(),
+                room_id=room_id,
+                kind=kind,
+                reason=reason,
+                session_id=(
+                    self.session.session_id
+                    if self.session
+                    else None
+                ),
+                occurred_at=utcnow_iso(),
+                room_name=room.name if room else None,
+            )
         )
-        self._schedule_next_day_timer_if_needed()
+
+    def _replace_while_away_failure(
+        self,
+        room_id: str,
+        previous_reason: str | None,
+        reason: str,
+    ) -> bool:
+        """Update only current-session compatibility copy for one failure."""
+        if not self.session:
+            return False
+        current_session_id = self.session.session_id
+        for outcome in reversed(self.while_away_outcomes):
+            if (
+                outcome.day == self._current_auto_clean_day()
+                and outcome.session_id == current_session_id
+                and outcome.room_id == room_id
+                and outcome.kind == "failed"
+                and outcome.legacy_visible
+                and (
+                    previous_reason is None
+                    or outcome.reason == previous_reason
+                )
+            ):
+                outcome.reason = reason
+                return True
+        return False
 
     def _remove_while_away_failure(self, room_id: str, reason: str | None) -> None:
-        """Remove a failed retained outcome after a recoverable failure clears."""
-        retained = [
-            outcome
-            for outcome in self.while_away_outcomes
-            if not (
+        """Hide only the latest current-session failure from legacy copy."""
+        if not self.session:
+            return
+        current_session_id = self.session.session_id
+        for outcome in reversed(self.while_away_outcomes):
+            if (
                 outcome.kind == "failed"
+                and outcome.session_id == current_session_id
                 and outcome.room_id == room_id
+                and outcome.legacy_visible
                 and (reason is None or outcome.reason == reason)
-            )
-        ]
-        if len(retained) != len(self.while_away_outcomes):
-            self.while_away_outcomes = retained
-            if not retained:
-                self._cancel_next_day_timer()
+            ):
+                outcome.legacy_visible = False
+                return
 
     def _prune_while_away_outcomes_for_day(self, day: str) -> bool:
         """Keep only retained outcomes for the requested local day."""
@@ -4299,7 +5796,12 @@ class ValetudoVacuumCoordinator:
         self.active_run = ActiveRun.from_dict(stored.get("active_run"))
         self._active_run_restored = self.active_run is not None
         self.manual_run = ActiveRun.from_dict(stored.get("manual_run"))
+        self.retained_task_guard = RetainedTaskGuard.from_dict(
+            stored.get("retained_task_guard")
+        )
         self.settings_snapshot = AutoCleanSettingsSnapshot.from_dict(stored.get("settings_snapshot"))
+        if self.session and self.settings_snapshot is not None:
+            self.session.settings_prepared = True
         stored_outcomes = stored.get("while_away_outcomes", [])
         if isinstance(stored_outcomes, list):
             self.while_away_outcomes = [
@@ -4310,6 +5812,21 @@ class ValetudoVacuumCoordinator:
                 )
                 if outcome is not None
             ]
+        stored_sequence = stored.get("while_away_outcome_sequence", 0)
+        try:
+            persisted_sequence = int(stored_sequence)
+        except (TypeError, ValueError):
+            persisted_sequence = 0
+        self._while_away_outcome_sequence = max(
+            persisted_sequence,
+            max(
+                (
+                    outcome.sequence or 0
+                    for outcome in self.while_away_outcomes
+                ),
+                default=0,
+            ),
+        )
         stored_rooms = stored.get("rooms", {})
         if isinstance(stored_rooms, dict):
             for room in self.rooms:
@@ -4333,8 +5850,14 @@ class ValetudoVacuumCoordinator:
                 "session": self.session.to_dict() if self.session else None,
                 "active_run": self.active_run.to_dict() if self.active_run else None,
                 "manual_run": self.manual_run.to_dict() if self.manual_run else None,
+                "retained_task_guard": (
+                    self.retained_task_guard.to_dict()
+                    if self.retained_task_guard
+                    else None
+                ),
                 "settings_snapshot": self.settings_snapshot.to_dict() if self.settings_snapshot else None,
                 "while_away_outcomes": [outcome.to_dict() for outcome in self.while_away_outcomes],
+                "while_away_outcome_sequence": self._while_away_outcome_sequence,
                 "disabled_room_ids": sorted(self.disabled_room_ids),
                 "rooms": {room_id: ledger.to_dict() for room_id, ledger in self.ledgers.items()},
             }

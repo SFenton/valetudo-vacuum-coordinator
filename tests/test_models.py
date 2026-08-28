@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "custom_components" / "valetudo_vacuum_coordinator"
@@ -26,6 +28,62 @@ package.__path__ = [str(PACKAGE)]
 sys.modules[package.__name__] = package
 const = load_module(f"{package.__name__}.const", PACKAGE / "const.py")
 logic = load_module(f"{package.__name__}.logic", PACKAGE / "logic.py")
+
+
+def typed_attempt(
+    *,
+    sequence: int,
+    room_id: str,
+    mode: str,
+    result: str,
+    reason: str | None = None,
+    session_id: str = "session",
+) -> object:
+    return logic.WhileAwayOutcome(
+        day="2026-08-19",
+        room_id=room_id,
+        kind="cleaned" if result == "completed" and mode != "fallback_vacuum" else (
+            "fallback" if result == "completed" else "failed"
+        ),
+        reason=reason,
+        outcome_id=f"{session_id}:{room_id}:{sequence}",
+        session_id=session_id,
+        sequence=sequence,
+        occurred_at=f"2026-08-19T12:{sequence:02d}:00+00:00",
+        room_name=room_id.replace("_", " ").title(),
+        event_type="attempt",
+        attempt_mode=mode,
+        attempt_result=result,
+        reason_descriptor=(
+            logic.classify_outcome_reason(reason)
+            if reason is not None
+            else None
+        ),
+    )
+
+
+def typed_deferral(
+    *,
+    sequence: int,
+    room_id: str,
+    reason: str = "Mop Dock Clean Water Tank empty",
+    session_id: str = "session",
+) -> object:
+    return logic.WhileAwayOutcome(
+        day="2026-08-19",
+        room_id=room_id,
+        kind="skipped",
+        reason=reason,
+        outcome_id=f"{session_id}:{room_id}:deferral:{sequence}",
+        session_id=session_id,
+        sequence=sequence,
+        occurred_at=f"2026-08-19T12:{sequence:02d}:00+00:00",
+        room_name=room_id.replace("_", " ").title(),
+        event_type="deferral",
+        outstanding_operation="vacuum_mop",
+        reason_descriptor=logic.classify_outcome_reason(reason),
+        legacy_visible=False,
+    )
 
 
 def test_clean_water_fallback_is_enabled_by_default():
@@ -823,6 +881,387 @@ def test_while_away_outcome_round_trips():
     assert restored == outcome
 
 
+@pytest.mark.parametrize(
+    ("raw", "code", "category"),
+    [
+        (
+            "Mop Dock Clean Water Tank empty",
+            "mop.clean_water_empty",
+            "mop_resource",
+        ),
+        (
+            "fresh water is missing",
+            "mop.fresh_water_unavailable",
+            "mop_resource",
+        ),
+        (
+            "fresh water is unknown",
+            "mop.fresh_water_unavailable",
+            "mop_resource",
+        ),
+        (
+            "fresh water is unavailable",
+            "mop.fresh_water_unavailable",
+            "mop_resource",
+        ),
+        (
+            "Auto-Empty Dock dust bag full or dust duct clogged",
+            "dock.dustbag_full_or_duct_blocked",
+            "dock",
+        ),
+        (
+            "Tracked person arrived home",
+            "occupancy.person_arrived",
+            "occupancy",
+        ),
+        ("Cannot reach target", "navigation.room_unreachable", "navigation"),
+        ("Unknown error 95", "navigation.stuck", "navigation"),
+        ("Low battery", "power.low_battery", "power"),
+        (
+            "Segment dispatch did not start within 90s",
+            "dispatch.timeout",
+            "dispatch",
+        ),
+        ("Unexpected vendor failure", "unknown", "unknown"),
+    ],
+)
+def test_outcome_reason_classification(raw, code, category):
+    reason = logic.classify_outcome_reason(raw)
+
+    assert reason.code == code
+    assert reason.category == category
+    assert reason.raw == raw
+
+
+@pytest.mark.parametrize("state", ["missing", "unknown", "unavailable"])
+def test_fresh_water_unavailable_reason_preserves_state(state):
+    reason = logic.classify_outcome_reason(f"fresh water is {state}")
+
+    assert reason.code == "mop.fresh_water_unavailable"
+    assert reason.data == {"state": state}
+
+
+@pytest.mark.parametrize(
+    ("raw", "code", "data"),
+    [
+        (
+            "Cleaned for 60s, below 120s threshold",
+            "verification.duration_below_minimum",
+            {"observed_seconds": 60, "minimum_seconds": 120},
+        ),
+        (
+            "Cleaned area 2.5, below 4.0 threshold",
+            "verification.area_below_minimum",
+            {"observed_area": 2.5, "minimum_area": 4},
+        ),
+        (
+            "Estimated in-room dwell 12s, below 30s threshold",
+            "verification.estimated_dwell_below_minimum",
+            {"observed_seconds": 12, "minimum_seconds": 30},
+        ),
+        (
+            "Estimated segment dwell was dominated by hallway "
+            "(45s versus 20s in office)",
+            "verification.wrong_room",
+            {
+                "dominant_room_id": "hallway",
+                "dominant_seconds": 45,
+                "commanded_seconds": 20,
+                "commanded_room_id": "office",
+            },
+        ),
+    ],
+)
+def test_outcome_reason_classification_extracts_structured_data(raw, code, data):
+    reason = logic.classify_outcome_reason(raw)
+
+    assert reason.code == code
+    assert reason.data == data
+
+
+def test_typed_while_away_outcome_round_trips_and_legacy_is_incomplete():
+    typed = typed_attempt(
+        sequence=7,
+        room_id="office",
+        mode="vacuum",
+        result="failed",
+        reason="Auto-Empty Dock dust bag full or dust duct clogged",
+    )
+    restored_typed = logic.WhileAwayOutcome.from_dict(typed.to_dict())
+    restored_legacy = logic.WhileAwayOutcome.from_dict(
+        {
+            "day": "2026-08-19",
+            "room_id": "office",
+            "kind": "failed",
+            "reason": "Legacy failure",
+        }
+    )
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+
+    assert restored_typed == typed
+    assert restored_typed.is_typed is True
+    assert restored_legacy is not None
+    assert restored_legacy.is_typed is False
+    contract = logic.build_while_away_outcome_contract(
+        [restored_legacy, restored_typed],
+        {"office": room},
+        "2026-08-19",
+    )
+    assert contract["complete"] is False
+    assert [event["id"] for event in contract["events"]] == [typed.outcome_id]
+
+
+def test_projection_combines_full_failure_with_one_outstanding_room_row():
+    room = logic.RoomConfig(
+        room_id="dining_room",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    outcomes = [
+        typed_deferral(sequence=1, room_id=room.room_id),
+        typed_attempt(
+            sequence=2,
+            room_id=room.room_id,
+            mode="vacuum_mop",
+            result="failed",
+            reason="Mop Dock Clean Water Tank empty",
+        ),
+    ]
+
+    contract = logic.build_while_away_outcome_contract(
+        outcomes,
+        {room.room_id: room},
+        "2026-08-19",
+    )
+
+    assert contract["complete"] is True
+    assert len(contract["rooms"]) == 1
+    projection = contract["rooms"][0]
+    assert projection["status"] == "failed"
+    assert projection["latest_attempt"]["mode"] == "vacuum_mop"
+    assert projection["credit"] == {"status": "none", "operation": None}
+    assert projection["outstanding"]["operation"] == "vacuum_mop"
+    assert projection["reasons_coincide"] is True
+    assert projection["occurrence_count"] == 1
+
+
+def test_projection_fallback_success_grants_partial_credit_and_keeps_mop_due():
+    room = logic.RoomConfig(
+        room_id="dining_room",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    outcomes = [
+        typed_deferral(sequence=1, room_id=room.room_id),
+        typed_attempt(
+            sequence=2,
+            room_id=room.room_id,
+            mode="vacuum_mop",
+            result="failed",
+            reason="Mop Dock Clean Water Tank empty",
+        ),
+        typed_attempt(
+            sequence=3,
+            room_id=room.room_id,
+            mode="fallback_vacuum",
+            result="completed",
+            reason=None,
+        ),
+    ]
+
+    projection = logic.build_while_away_outcome_contract(
+        outcomes,
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "partial"
+    assert projection["latest_attempt"]["mode"] == "fallback_vacuum"
+    assert projection["credit"] == {
+        "status": "partial",
+        "operation": "vacuum",
+    }
+    assert projection["outstanding"]["operation"] == "mop"
+    assert projection["outstanding"]["reason"]["code"] == "mop.clean_water_empty"
+    assert projection["occurrence_count"] == 2
+
+
+def test_projection_fallback_failure_keeps_distinct_result_and_outstanding_reasons():
+    room = logic.RoomConfig(
+        room_id="dining_room",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    outcomes = [
+        typed_deferral(sequence=1, room_id=room.room_id),
+        typed_attempt(
+            sequence=2,
+            room_id=room.room_id,
+            mode="fallback_vacuum",
+            result="failed",
+            reason="Cannot reach target",
+        ),
+    ]
+
+    projection = logic.build_while_away_outcome_contract(
+        outcomes,
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "failed"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
+    assert projection["outstanding"]["reason"]["code"] == (
+        "mop.clean_water_empty"
+    )
+    assert projection["reasons_coincide"] is False
+
+
+def test_projection_interruption_is_not_suppressed():
+    room = logic.RoomConfig(
+        room_id="hallway",
+        name="Hallway",
+        segment_id="1",
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_attempt(
+                sequence=1,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="interrupted",
+                reason="Tracked person arrived home",
+            )
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "interrupted"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "occupancy.person_arrived"
+    )
+    assert projection["outstanding"]["operation"] == "vacuum"
+
+
+def test_projection_later_success_resolves_primary_but_retains_repeated_history():
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    outcomes = [
+        typed_attempt(
+            sequence=1,
+            room_id=room.room_id,
+            mode="vacuum",
+            result="failed",
+            reason="Auto-Empty Dock dust bag full or dust duct clogged",
+            session_id="session-one",
+        ),
+        typed_attempt(
+            sequence=2,
+            room_id=room.room_id,
+            mode="vacuum",
+            result="failed",
+            reason="Auto-Empty Dock dust bag full or dust duct clogged",
+            session_id="session-one-retry",
+        ),
+        typed_attempt(
+            sequence=3,
+            room_id=room.room_id,
+            mode="vacuum",
+            result="completed",
+            session_id="session-two",
+        ),
+    ]
+
+    contract = logic.build_while_away_outcome_contract(
+        outcomes,
+        {room.room_id: room},
+        "2026-08-19",
+    )
+    projection = contract["rooms"][0]
+
+    assert projection["status"] == "completed"
+    assert projection["credit"] == {
+        "status": "full",
+        "operation": "vacuum",
+    }
+    assert projection["outstanding"] is None
+    assert projection["occurrence_count"] == 3
+    assert projection["event_ids"] == [
+        outcome.outcome_id for outcome in outcomes
+    ]
+    assert len(contract["events"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("later_result", "later_reason"),
+    [
+        (
+            "failed",
+            "Auto-Empty Dock dust bag full or dust duct clogged",
+        ),
+        ("interrupted", "Tracked person arrived home"),
+    ],
+)
+def test_projection_full_credit_remains_primary_after_later_anomaly(
+    later_result,
+    later_reason,
+):
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    completed = typed_attempt(
+        sequence=1,
+        room_id=room.room_id,
+        mode="vacuum",
+        result="completed",
+        session_id="session-one",
+    )
+    anomaly = typed_attempt(
+        sequence=2,
+        room_id=room.room_id,
+        mode="vacuum",
+        result=later_result,
+        reason=later_reason,
+        session_id="session-two",
+    )
+
+    contract = logic.build_while_away_outcome_contract(
+        [completed, anomaly],
+        {room.room_id: room},
+        "2026-08-19",
+    )
+    projection = contract["rooms"][0]
+
+    assert projection["status"] == "completed"
+    assert projection["latest_attempt"]["event_id"] == completed.outcome_id
+    assert projection["latest_attempt"]["result"] == "completed"
+    assert projection["credit"] == {
+        "status": "full",
+        "operation": "vacuum",
+    }
+    assert projection["outstanding"] is None
+    assert projection["occurrence_count"] == 2
+    assert [event["id"] for event in contract["events"]] == [
+        completed.outcome_id,
+        anomaly.outcome_id,
+    ]
+
+
 def test_while_away_fallback_reports_vacuumed_but_mopping_due():
     cleaned, issues = logic.build_while_away_messages(
         [
@@ -1170,3 +1609,37 @@ def test_session_state_round_trips_terminal_details():
     assert restored.native_guard_stop_confirmed is True
     assert restored.native_guard_return_confirmed is False
     assert restored.native_guard_cancel_reason == "test cancel"
+
+
+def test_retained_task_guard_round_trips_recovery_state():
+    guard = logic.RetainedTaskGuard(
+        owner=logic.RETAINED_TASK_OWNER_MANUAL,
+        phase=logic.RETAINED_TASK_PHASE_VERIFYING,
+        first_observed_at="2026-08-24T17:48:09+00:00",
+        last_material_activity_at="2026-08-24T22:28:08+00:00",
+        origin_session_id="session",
+        origin_run_started_at="2026-08-24T17:48:09+00:00",
+        reason="waiting for acknowledgement",
+        coherent_since="2026-08-25T09:29:11+00:00",
+        stale_deadline="2026-08-25T09:30:11+00:00",
+        observation_deadline="2026-08-25T12:29:11+00:00",
+        clear_requested_at="2026-08-25T09:30:11+00:00",
+        clear_published_at="2026-08-25T09:30:12+00:00",
+        clear_deadline="2026-08-25T09:30:42+00:00",
+        clear_attempts=1,
+        clear_acknowledged_at="2026-08-25T09:30:14+00:00",
+        dock_clear_requested_at="2026-08-25T09:31:14+00:00",
+        dock_clear_published_at="2026-08-25T09:31:15+00:00",
+        dock_clear_deadline="2026-08-25T09:31:45+00:00",
+        dock_clear_attempts=1,
+        dock_clear_acknowledged_at="2026-08-25T09:31:18+00:00",
+        operator_notification_sent=True,
+        last_vacuum_state="docked",
+        last_status_flag="resumable",
+        last_dock_status="pause",
+        last_error="No error",
+    )
+
+    restored = logic.RetainedTaskGuard.from_dict(guard.to_dict())
+
+    assert restored == guard

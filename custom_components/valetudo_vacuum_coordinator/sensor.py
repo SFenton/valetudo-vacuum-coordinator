@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -55,8 +56,11 @@ from .const import (
     ATTR_VACUUM_ONLY,
     ATTR_WHILE_AWAY_CLEANED,
     ATTR_WHILE_AWAY_ISSUES,
+    ATTR_WHILE_AWAY_OUTCOMES,
+    DOMAIN,
 )
 from .entity import ValetudoCoordinatorEntity, get_coordinator_from_discovery
+from .status import ValetudoVacuumStatusObserver, get_status_observer
 
 
 async def async_setup_platform(
@@ -66,6 +70,14 @@ async def async_setup_platform(
     discovery_info: dict[str, Any] | None = None,
 ) -> None:
     """Set up sensors from YAML discovery."""
+    if discovery_info and "status_observer_id" in discovery_info:
+        observer = get_status_observer(
+            hass.data[DOMAIN],
+            str(discovery_info["status_observer_id"]),
+        )
+        async_add_entities([ValetudoVacuumStatusSensor(observer)])
+        return
+
     coordinator = get_coordinator_from_discovery(hass.data, discovery_info)
     entities: list[SensorEntity] = [
         ValetudoSessionStateSensor(coordinator),
@@ -74,6 +86,49 @@ async def async_setup_platform(
     ]
     entities.extend(ValetudoRoomLedgerSensor(coordinator, room.room_id) for room in coordinator.rooms)
     async_add_entities(entities)
+
+
+class ValetudoVacuumStatusSensor(SensorEntity):
+    """Read-only versioned vacuum status contract."""
+
+    _attr_has_entity_name = False
+    _attr_icon = "mdi:robot-vacuum"
+
+    def __init__(self, observer: ValetudoVacuumStatusObserver) -> None:
+        """Initialize a status observer sensor."""
+        self.observer = observer
+        self._attr_name = f"{observer.name} Status"
+        self._attr_unique_id = f"{observer.observer_id}_vacuum_status"
+        self._attr_suggested_object_id = f"{observer.observer_id}_vacuum_status"
+
+    @property
+    def native_value(self) -> str:
+        """Return the observer's compact primary value."""
+        return self.observer.native_value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the complete status contract."""
+        return self.observer.contract
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return a distinct status-observer device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"status_observer_{self.observer.observer_id}")},
+            name=self.observer.name,
+            manufacturer="Valetudo",
+            model="Vacuum Status Observer",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe entity state writes to observer changes."""
+        self.async_on_remove(self.observer.async_add_listener(self._handle_update))
+
+    @callback
+    def _handle_update(self) -> None:
+        """Write an updated contract state."""
+        self.async_write_ha_state()
 
 
 class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
@@ -130,8 +185,15 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_TERMINAL_CAUSE: session.terminal_cause if session else None,
             ATTR_NEEDS_HELP: session.needs_help if session else False,
             ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
+            "preflight_complete": (
+                session.preflight_complete if session else False
+            ),
+            "settings_prepared": (
+                session.settings_prepared if session else False
+            ),
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
             ATTR_WHILE_AWAY_ISSUES: self.coordinator.while_away_issue_messages,
+            ATTR_WHILE_AWAY_OUTCOMES: self.coordinator.while_away_outcome_contract,
             **self.coordinator.native_resume_attributes,
         }
 

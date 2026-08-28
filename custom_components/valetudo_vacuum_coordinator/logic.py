@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import re
 from typing import Any
 
 DOCK_COMPONENT_BAD_VALUES = {"empty", "full", "missing", "unknown", "unavailable"}
@@ -81,7 +82,43 @@ NATIVE_RESUME_PENDING_PHASES = {
     RUN_PHASE_RECOVERY_STALLED,
 }
 
+RETAINED_TASK_OWNER_COORDINATOR = "coordinator"
+RETAINED_TASK_OWNER_MANUAL = "manual"
+RETAINED_TASK_OWNER_UNKNOWN = "unknown"
+RETAINED_TASK_OWNERS = {
+    RETAINED_TASK_OWNER_COORDINATOR,
+    RETAINED_TASK_OWNER_MANUAL,
+    RETAINED_TASK_OWNER_UNKNOWN,
+}
+
+RETAINED_TASK_PHASE_OBSERVED_ACTIVE = "observed_active"
+RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME = "owned_native_resume"
+RETAINED_TASK_PHASE_STALE_CANDIDATE = "stale_candidate"
+RETAINED_TASK_PHASE_CLEAR_PENDING = "clear_pending"
+RETAINED_TASK_PHASE_VERIFYING = "verifying"
+RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING = "dock_clear_pending"
+RETAINED_TASK_PHASE_DOCK_VERIFYING = "dock_verifying"
+RETAINED_TASK_PHASE_OPERATOR_REQUIRED = "operator_required"
+RETAINED_TASK_PHASE_CLEARED = "cleared"
+RETAINED_TASK_PHASES = {
+    RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+    RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME,
+    RETAINED_TASK_PHASE_STALE_CANDIDATE,
+    RETAINED_TASK_PHASE_CLEAR_PENDING,
+    RETAINED_TASK_PHASE_VERIFYING,
+    RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING,
+    RETAINED_TASK_PHASE_DOCK_VERIFYING,
+    RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+    RETAINED_TASK_PHASE_CLEARED,
+}
+
 WRONG_ROOM_FAILURE_PREFIX = "Estimated segment dwell was dominated by"
+
+OUTCOME_CONTRACT_VERSION = 1
+OUTCOME_EVENT_TYPES = {"attempt", "deferral"}
+OUTCOME_ATTEMPT_MODES = {"vacuum", "vacuum_mop", "fallback_vacuum"}
+OUTCOME_ATTEMPT_RESULTS = {"completed", "failed", "interrupted"}
+OUTCOME_OPERATIONS = {"vacuum", "vacuum_mop", "mop"}
 
 
 def schedule_hass_task(hass: Any, coroutine: Any) -> None:
@@ -402,6 +439,131 @@ class ActiveRun:
 
 
 @dataclass(slots=True)
+class RetainedTaskGuard:
+    """Persisted ownership and recovery state for a robot-retained task."""
+
+    owner: str
+    phase: str
+    first_observed_at: str
+    last_material_activity_at: str
+    origin_session_id: str | None = None
+    origin_run_started_at: str | None = None
+    reason: str | None = None
+    coherent_since: str | None = None
+    stale_deadline: str | None = None
+    observation_deadline: str | None = None
+    clear_requested_at: str | None = None
+    clear_published_at: str | None = None
+    clear_deadline: str | None = None
+    clear_attempts: int = 0
+    clear_acknowledged_at: str | None = None
+    dock_clear_requested_at: str | None = None
+    dock_clear_published_at: str | None = None
+    dock_clear_deadline: str | None = None
+    dock_clear_attempts: int = 0
+    dock_clear_acknowledged_at: str | None = None
+    operator_required_reason: str | None = None
+    operator_notification_sent: bool = False
+    last_vacuum_state: str | None = None
+    last_status_flag: str | None = None
+    last_dock_status: str | None = None
+    last_error: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any] | None,
+    ) -> "RetainedTaskGuard | None":
+        """Build retained-task state from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        now = utcnow_iso()
+        owner = str(data.get("owner") or RETAINED_TASK_OWNER_UNKNOWN)
+        if owner not in RETAINED_TASK_OWNERS:
+            owner = RETAINED_TASK_OWNER_UNKNOWN
+        phase = str(
+            data.get("phase") or RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+        )
+        if phase not in RETAINED_TASK_PHASES:
+            phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+        return cls(
+            owner=owner,
+            phase=phase,
+            first_observed_at=data.get("first_observed_at") or now,
+            last_material_activity_at=(
+                data.get("last_material_activity_at")
+                or data.get("first_observed_at")
+                or now
+            ),
+            origin_session_id=data.get("origin_session_id"),
+            origin_run_started_at=data.get("origin_run_started_at"),
+            reason=data.get("reason"),
+            coherent_since=data.get("coherent_since"),
+            stale_deadline=data.get("stale_deadline"),
+            observation_deadline=data.get("observation_deadline"),
+            clear_requested_at=data.get("clear_requested_at"),
+            clear_published_at=data.get("clear_published_at"),
+            clear_deadline=data.get("clear_deadline"),
+            clear_attempts=max(
+                0,
+                int(parse_float(data.get("clear_attempts")) or 0),
+            ),
+            clear_acknowledged_at=data.get("clear_acknowledged_at"),
+            dock_clear_requested_at=data.get("dock_clear_requested_at"),
+            dock_clear_published_at=data.get("dock_clear_published_at"),
+            dock_clear_deadline=data.get("dock_clear_deadline"),
+            dock_clear_attempts=max(
+                0,
+                int(parse_float(data.get("dock_clear_attempts")) or 0),
+            ),
+            dock_clear_acknowledged_at=data.get(
+                "dock_clear_acknowledged_at"
+            ),
+            operator_required_reason=data.get("operator_required_reason"),
+            operator_notification_sent=bool(
+                data.get("operator_notification_sent", False)
+            ),
+            last_vacuum_state=data.get("last_vacuum_state"),
+            last_status_flag=data.get("last_status_flag"),
+            last_dock_status=data.get("last_dock_status"),
+            last_error=data.get("last_error"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize retained-task state to JSON-safe data."""
+        return {
+            "owner": self.owner,
+            "phase": self.phase,
+            "first_observed_at": self.first_observed_at,
+            "last_material_activity_at": self.last_material_activity_at,
+            "origin_session_id": self.origin_session_id,
+            "origin_run_started_at": self.origin_run_started_at,
+            "reason": self.reason,
+            "coherent_since": self.coherent_since,
+            "stale_deadline": self.stale_deadline,
+            "observation_deadline": self.observation_deadline,
+            "clear_requested_at": self.clear_requested_at,
+            "clear_published_at": self.clear_published_at,
+            "clear_deadline": self.clear_deadline,
+            "clear_attempts": self.clear_attempts,
+            "clear_acknowledged_at": self.clear_acknowledged_at,
+            "dock_clear_requested_at": self.dock_clear_requested_at,
+            "dock_clear_published_at": self.dock_clear_published_at,
+            "dock_clear_deadline": self.dock_clear_deadline,
+            "dock_clear_attempts": self.dock_clear_attempts,
+            "dock_clear_acknowledged_at": (
+                self.dock_clear_acknowledged_at
+            ),
+            "operator_required_reason": self.operator_required_reason,
+            "operator_notification_sent": self.operator_notification_sent,
+            "last_vacuum_state": self.last_vacuum_state,
+            "last_status_flag": self.last_status_flag,
+            "last_dock_status": self.last_dock_status,
+            "last_error": self.last_error,
+        }
+
+
+@dataclass(slots=True)
 class AutoCleanSettingsSnapshot:
     """User cleaning settings captured before an auto-clean session mutates them."""
 
@@ -433,6 +595,43 @@ class AutoCleanSettingsSnapshot:
 
 
 @dataclass(slots=True)
+class OutcomeReason:
+    """Stable typed reason with raw backend diagnostics."""
+
+    code: str
+    category: str
+    raw: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "OutcomeReason | None":
+        """Build a typed reason from stored JSON."""
+        if not isinstance(data, dict):
+            return None
+        code = normalize_state(data.get("code"))
+        category = normalize_state(data.get("category"))
+        raw = normalize_state(data.get("raw"))
+        if not code or not category or raw is None:
+            return None
+        reason_data = data.get("data")
+        return cls(
+            code=code,
+            category=category,
+            raw=raw,
+            data=dict(reason_data) if isinstance(reason_data, dict) else {},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize a typed reason to JSON-safe data."""
+        return {
+            "code": self.code,
+            "category": self.category,
+            "raw": self.raw,
+            "data": self.data,
+        }
+
+
+@dataclass(slots=True)
 class WhileAwayOutcome:
     """One retained while-away outcome for dashboard display."""
 
@@ -440,6 +639,42 @@ class WhileAwayOutcome:
     room_id: str
     kind: str
     reason: str | None = None
+    outcome_id: str | None = None
+    session_id: str | None = None
+    sequence: int | None = None
+    occurred_at: str | None = None
+    room_name: str | None = None
+    event_type: str | None = None
+    attempt_mode: str | None = None
+    attempt_result: str | None = None
+    outstanding_operation: str | None = None
+    reason_descriptor: OutcomeReason | None = None
+    legacy_visible: bool = True
+
+    @property
+    def is_typed(self) -> bool:
+        """Return whether this outcome fully satisfies the v1 event contract."""
+        if (
+            not self.outcome_id
+            or not self.session_id
+            or self.sequence is None
+            or self.sequence < 1
+            or not self.occurred_at
+            or self.event_type not in OUTCOME_EVENT_TYPES
+        ):
+            return False
+        if self.event_type == "attempt":
+            return (
+                self.attempt_mode in OUTCOME_ATTEMPT_MODES
+                and self.attempt_result in OUTCOME_ATTEMPT_RESULTS
+                and self.outstanding_operation is None
+            )
+        return (
+            self.attempt_mode is None
+            and self.attempt_result is None
+            and self.outstanding_operation in OUTCOME_OPERATIONS
+            and self.reason_descriptor is not None
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "WhileAwayOutcome | None":
@@ -451,7 +686,42 @@ class WhileAwayOutcome:
         kind = normalize_state(data.get("kind"))
         if not day or not room_id or kind not in {"cleaned", "skipped", "failed", "fallback"}:
             return None
-        return cls(day=day, room_id=room_id, kind=kind, reason=data.get("reason"))
+        raw_sequence = data.get("sequence")
+        try:
+            sequence = int(raw_sequence) if raw_sequence is not None else None
+        except (TypeError, ValueError):
+            sequence = None
+        event_type = normalize_state(data.get("type"))
+        attempt_mode = normalize_state(data.get("attempt_mode"))
+        attempt_result = normalize_state(data.get("attempt_result"))
+        outstanding_operation = normalize_state(data.get("outstanding_operation"))
+        return cls(
+            day=day,
+            room_id=room_id,
+            kind=kind,
+            reason=data.get("reason"),
+            outcome_id=normalize_state(data.get("id")),
+            session_id=normalize_state(data.get("session_id")),
+            sequence=sequence,
+            occurred_at=normalize_state(data.get("occurred_at")),
+            room_name=normalize_state(data.get("room_name")),
+            event_type=event_type if event_type in OUTCOME_EVENT_TYPES else None,
+            attempt_mode=(
+                attempt_mode if attempt_mode in OUTCOME_ATTEMPT_MODES else None
+            ),
+            attempt_result=(
+                attempt_result
+                if attempt_result in OUTCOME_ATTEMPT_RESULTS
+                else None
+            ),
+            outstanding_operation=(
+                outstanding_operation
+                if outstanding_operation in OUTCOME_OPERATIONS
+                else None
+            ),
+            reason_descriptor=OutcomeReason.from_dict(data.get("typed_reason")),
+            legacy_visible=bool(data.get("legacy_visible", True)),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize outcome state to JSON-safe data."""
@@ -460,7 +730,49 @@ class WhileAwayOutcome:
             "room_id": self.room_id,
             "kind": self.kind,
             "reason": self.reason,
+            "id": self.outcome_id,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "occurred_at": self.occurred_at,
+            "room_name": self.room_name,
+            "type": self.event_type,
+            "attempt_mode": self.attempt_mode,
+            "attempt_result": self.attempt_result,
+            "outstanding_operation": self.outstanding_operation,
+            "typed_reason": (
+                self.reason_descriptor.to_dict()
+                if self.reason_descriptor
+                else None
+            ),
+            "legacy_visible": self.legacy_visible,
         }
+
+    def to_contract_event(self) -> dict[str, Any] | None:
+        """Return the public v1 event representation."""
+        if not self.is_typed:
+            return None
+        event: dict[str, Any] = {
+            "id": self.outcome_id,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "occurred_at": self.occurred_at,
+            "day": self.day,
+            "room_id": self.room_id,
+            "room_name": self.room_name,
+            "kind": self.kind,
+            "type": self.event_type,
+            "reason": (
+                self.reason_descriptor.to_dict()
+                if self.reason_descriptor
+                else None
+            ),
+        }
+        if self.event_type == "attempt":
+            event["attempt_mode"] = self.attempt_mode
+            event["attempt_result"] = self.attempt_result
+        else:
+            event["outstanding_operation"] = self.outstanding_operation
+        return event
 
 
 def build_while_away_messages(
@@ -475,7 +787,7 @@ def build_while_away_messages(
     fallback_reasons: dict[str, str] = {}
 
     for outcome in outcomes:
-        if outcome.day != day:
+        if outcome.day != day or not outcome.legacy_visible:
             continue
         room_name = room_names_by_id.get(outcome.room_id)
         if not room_name:
@@ -505,6 +817,182 @@ def build_while_away_messages(
         for room_name, reason in fallback_reasons.items()
     )
     return build_cleaned_messages(cleaned_room_names), issues
+
+
+def required_operation_for_room(room: RoomConfig) -> str:
+    """Return the configured operation derived from RoomConfig.mop_required."""
+    return "vacuum_mop" if room.mop_required else "vacuum"
+
+
+def attempt_mode_for_run(run: ActiveRun) -> str:
+    """Return the typed operation attempted by an active run."""
+    if run.fallback_vacuum:
+        return "fallback_vacuum"
+    return "vacuum" if run.vacuum_only else "vacuum_mop"
+
+
+def build_while_away_outcome_contract(
+    outcomes: list[WhileAwayOutcome],
+    rooms_by_id: dict[str, RoomConfig],
+    day: str,
+) -> dict[str, Any]:
+    """Build authoritative current-day room projections and typed history."""
+    retained = [outcome for outcome in outcomes if outcome.day == day]
+    typed = sorted(
+        (outcome for outcome in retained if outcome.is_typed),
+        key=lambda outcome: (
+            outcome.sequence or 0,
+            outcome.occurred_at or "",
+            outcome.outcome_id or "",
+        ),
+    )
+    complete = all(
+        outcome.is_typed and outcome.room_id in rooms_by_id
+        for outcome in retained
+    )
+    events = [
+        event
+        for outcome in typed
+        if (event := outcome.to_contract_event()) is not None
+    ]
+    projections: dict[str, dict[str, Any]] = {}
+    room_order: list[str] = []
+
+    for outcome in typed:
+        room = rooms_by_id.get(outcome.room_id)
+        if room is None:
+            continue
+        projection = projections.get(outcome.room_id)
+        if projection is None:
+            projection = {
+                "room_id": room.room_id,
+                "room_name": outcome.room_name or room.name,
+                "required_operation": required_operation_for_room(room),
+                "status": "deferred",
+                "latest_attempt": None,
+                "credit": {"status": "none", "operation": None},
+                "outstanding": None,
+                "reasons_coincide": False,
+                "occurrence_count": 0,
+                "first_occurred_at": outcome.occurred_at,
+                "last_occurred_at": outcome.occurred_at,
+                "last_sequence": outcome.sequence,
+                "event_ids": [],
+            }
+            projections[outcome.room_id] = projection
+            room_order.append(outcome.room_id)
+
+        projection["room_name"] = outcome.room_name or projection["room_name"]
+        projection["last_occurred_at"] = outcome.occurred_at
+        projection["last_sequence"] = outcome.sequence
+        projection["event_ids"].append(outcome.outcome_id)
+        reason = (
+            outcome.reason_descriptor.to_dict()
+            if outcome.reason_descriptor
+            else None
+        )
+
+        if outcome.event_type == "deferral":
+            if projection["credit"]["status"] == "full":
+                continue
+            outstanding_operation = outcome.outstanding_operation
+            if projection["credit"]["status"] == "partial":
+                outstanding_operation = "mop"
+            projection["outstanding"] = {
+                "operation": outstanding_operation,
+                "reason": reason,
+            }
+            if projection["latest_attempt"] is None:
+                projection["status"] = "deferred"
+            continue
+
+        projection["occurrence_count"] += 1
+        attempt = {
+            "event_id": outcome.outcome_id,
+            "mode": outcome.attempt_mode,
+            "result": outcome.attempt_result,
+            "reason": reason,
+        }
+        if (
+            projection["credit"]["status"] == "full"
+            and not (
+                outcome.attempt_result == "completed"
+                and outcome.attempt_mode != "fallback_vacuum"
+            )
+        ):
+            continue
+        projection["latest_attempt"] = attempt
+
+        if outcome.attempt_result == "completed":
+            if outcome.attempt_mode == "fallback_vacuum":
+                projection["status"] = "partial"
+                projection["credit"] = {
+                    "status": "partial",
+                    "operation": "vacuum",
+                }
+                outstanding_reason = (
+                    projection["outstanding"]["reason"]
+                    if projection["outstanding"]
+                    else (
+                        classify_outcome_reason(outcome.reason).to_dict()
+                        if outcome.reason
+                        else None
+                    )
+                )
+                projection["outstanding"] = {
+                    "operation": "mop",
+                    "reason": outstanding_reason,
+                }
+            else:
+                projection["status"] = "completed"
+                projection["credit"] = {
+                    "status": "full",
+                    "operation": outcome.attempt_mode,
+                }
+                projection["outstanding"] = None
+        elif outcome.attempt_result in {"failed", "interrupted"}:
+            projection["status"] = outcome.attempt_result
+            if projection["credit"]["status"] != "partial":
+                projection["credit"] = {
+                    "status": "none",
+                    "operation": None,
+                }
+            if projection["outstanding"] is None:
+                outstanding_operation = projection["required_operation"]
+                if projection["credit"]["status"] == "partial":
+                    outstanding_operation = "mop"
+                projection["outstanding"] = {
+                    "operation": outstanding_operation,
+                    "reason": reason,
+                }
+            elif projection["credit"]["status"] == "partial":
+                projection["outstanding"]["operation"] = "mop"
+
+    for projection in projections.values():
+        result_reason = (
+            projection["latest_attempt"]["reason"]
+            if projection["latest_attempt"]
+            else None
+        )
+        outstanding_reason = (
+            projection["outstanding"]["reason"]
+            if projection["outstanding"]
+            else None
+        )
+        projection["reasons_coincide"] = bool(
+            result_reason
+            and outstanding_reason
+            and result_reason["code"] == outstanding_reason["code"]
+            and result_reason["raw"] == outstanding_reason["raw"]
+        )
+
+    return {
+        "version": OUTCOME_CONTRACT_VERSION,
+        "complete": complete,
+        "day": day,
+        "rooms": [projections[room_id] for room_id in room_order],
+        "events": events,
+    }
 
 
 @dataclass(slots=True)
@@ -550,6 +1038,8 @@ class SessionState:
     native_guard_stop_confirmed: bool = False
     native_guard_return_confirmed: bool = False
     native_guard_cancel_reason: str | None = None
+    preflight_complete: bool = False
+    settings_prepared: bool = False
 
     def mark_attempted(self, room_id: str) -> None:
         """Record that a room has consumed its one attempt for this session."""
@@ -763,6 +1253,8 @@ class SessionState:
                 data.get("native_guard_return_confirmed", False)
             ),
             native_guard_cancel_reason=data.get("native_guard_cancel_reason"),
+            preflight_complete=bool(data.get("preflight_complete", False)),
+            settings_prepared=bool(data.get("settings_prepared", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -807,6 +1299,8 @@ class SessionState:
             "native_guard_stop_confirmed": self.native_guard_stop_confirmed,
             "native_guard_return_confirmed": self.native_guard_return_confirmed,
             "native_guard_cancel_reason": self.native_guard_cancel_reason,
+            "preflight_complete": self.preflight_complete,
+            "settings_prepared": self.settings_prepared,
         }
 
 
@@ -1119,6 +1613,234 @@ def is_clean_water_empty_error(error: str | None) -> bool:
     """Return whether Valetudo reports the supported clean-water-empty fault."""
     normalized = normalize_state(error)
     return bool(normalized and normalized.lower() in CLEAN_WATER_EMPTY_ERROR_VALUES)
+
+
+def _reason_number(value: str) -> int | float:
+    """Return an integer where possible, otherwise a float."""
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def classify_outcome_reason(reason: str | None) -> OutcomeReason:
+    """Classify a backend failure without discarding its raw diagnostics."""
+    normalized = normalize_state(reason) or "Unknown failure"
+    lowered = normalized.lower()
+
+    fresh_water_unavailable_state = next(
+        (
+            state
+            for state in ("missing", "unknown", "unavailable")
+            if state in lowered
+        ),
+        None,
+    )
+    if (
+        fresh_water_unavailable_state
+        and (
+            "clean water" in lowered
+            or "fresh water" in lowered
+            or "freshwater" in lowered
+        )
+    ):
+        return OutcomeReason(
+            "mop.fresh_water_unavailable",
+            "mop_resource",
+            normalized,
+            {"state": fresh_water_unavailable_state},
+        )
+    if (
+        is_clean_water_empty_error(normalized)
+        or (
+            (
+                "clean water" in lowered
+                or "fresh water" in lowered
+                or "freshwater" in lowered
+            )
+            and "empty" in lowered
+        )
+    ):
+        return OutcomeReason("mop.clean_water_empty", "mop_resource", normalized)
+    if "dustbag" in lowered or "dust bag" in lowered or "dust duct" in lowered:
+        return OutcomeReason(
+            "dock.dustbag_full_or_duct_blocked",
+            "dock",
+            normalized,
+        )
+    if "tracked person arrived home" in lowered:
+        return OutcomeReason(
+            "occupancy.person_arrived",
+            "occupancy",
+            normalized,
+        )
+    if is_low_battery_error(normalized):
+        return OutcomeReason("power.low_battery", "power", normalized)
+
+    dispatch_timeout = re.fullmatch(
+        r"Segment dispatch did not start within ([0-9]+)s",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if dispatch_timeout:
+        return OutcomeReason(
+            "dispatch.timeout",
+            "dispatch",
+            normalized,
+            {"timeout_seconds": int(dispatch_timeout.group(1))},
+        )
+    if lowered.startswith("could not dispatch "):
+        return OutcomeReason("dispatch.failed", "dispatch", normalized)
+
+    duration = re.fullmatch(
+        r"Cleaned for ([0-9]+(?:\.[0-9]+)?)s, below ([0-9]+(?:\.[0-9]+)?)s threshold",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if duration:
+        return OutcomeReason(
+            "verification.duration_below_minimum",
+            "verification",
+            normalized,
+            {
+                "observed_seconds": _reason_number(duration.group(1)),
+                "minimum_seconds": _reason_number(duration.group(2)),
+            },
+        )
+    area = re.fullmatch(
+        r"Cleaned area ([0-9]+(?:\.[0-9]+)?), below ([0-9]+(?:\.[0-9]+)?) threshold",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if area:
+        return OutcomeReason(
+            "verification.area_below_minimum",
+            "verification",
+            normalized,
+            {
+                "observed_area": _reason_number(area.group(1)),
+                "minimum_area": _reason_number(area.group(2)),
+            },
+        )
+    dwell = re.fullmatch(
+        r"Estimated in-room dwell ([0-9]+(?:\.[0-9]+)?)s, below ([0-9]+(?:\.[0-9]+)?)s threshold",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if dwell:
+        return OutcomeReason(
+            "verification.estimated_dwell_below_minimum",
+            "verification",
+            normalized,
+            {
+                "observed_seconds": _reason_number(dwell.group(1)),
+                "minimum_seconds": _reason_number(dwell.group(2)),
+            },
+        )
+    wrong_room = re.fullmatch(
+        rf"{re.escape(WRONG_ROOM_FAILURE_PREFIX)} (.+) "
+        r"\(([0-9]+(?:\.[0-9]+)?)s versus "
+        r"([0-9]+(?:\.[0-9]+)?)s in (.+)\)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if wrong_room:
+        return OutcomeReason(
+            "verification.wrong_room",
+            "verification",
+            normalized,
+            {
+                "dominant_room_id": wrong_room.group(1),
+                "dominant_seconds": _reason_number(wrong_room.group(2)),
+                "commanded_seconds": _reason_number(wrong_room.group(3)),
+                "commanded_room_id": wrong_room.group(4),
+            },
+        )
+
+    if (
+        "unknown error 95" in lowered
+        or "easy-to-fall" in lowered
+        or "fall hazard" in lowered
+        or "stuck on ramp" in lowered
+        or "robot_stuck_on_ramp" in lowered
+        or "robot is stuck" in lowered
+    ):
+        return OutcomeReason("navigation.stuck", "navigation", normalized)
+    if (
+        "cannot reach target" in lowered
+        or "cannot arrive" in lowered
+        or (
+            "cannot navigate" in lowered
+            and "dock" not in lowered
+        )
+    ):
+        return OutcomeReason(
+            "navigation.room_unreachable",
+            "navigation",
+            normalized,
+        )
+    if "dock" in lowered and any(
+        phrase in lowered
+        for phrase in ("cannot reach", "cannot arrive", "cannot navigate")
+    ):
+        return OutcomeReason(
+            "navigation.dock_unreachable",
+            "navigation",
+            normalized,
+        )
+    if lowered.startswith("native resume timed out after "):
+        timeout = re.search(r"([0-9]+)s", lowered)
+        return OutcomeReason(
+            "recovery.native_resume_timeout",
+            "recovery",
+            normalized,
+            {"timeout_seconds": int(timeout.group(1))} if timeout else {},
+        )
+    if "vacuum never entered cleaning state" in lowered:
+        return OutcomeReason(
+            "execution.cleaning_not_observed",
+            "execution",
+            normalized,
+        )
+    if "vacuum never reported segment cleaning" in lowered:
+        return OutcomeReason(
+            "execution.segment_not_observed",
+            "execution",
+            normalized,
+        )
+    if "run was cancelled" in lowered or lowered == "cancelled":
+        return OutcomeReason("operation.cancelled", "operation", normalized)
+    if "mop attachment is missing" in lowered:
+        return OutcomeReason(
+            "mop.attachment_missing",
+            "mop_resource",
+            normalized,
+        )
+    if (
+        "dirty tank" in lowered
+        or "dirty water" in lowered
+        or "wastewater" in lowered
+    ):
+        return OutcomeReason(
+            "mop.dirty_water_unavailable",
+            "mop_resource",
+            normalized,
+        )
+    if (
+        "detergent" in lowered
+        or "cleaning liquid" in lowered
+        or "fortified liquid" in lowered
+    ):
+        return OutcomeReason(
+            "mop.detergent_unavailable",
+            "mop_resource",
+            normalized,
+        )
+    if "unknown error 120" in lowered:
+        return OutcomeReason(
+            "mop.hardware_unavailable",
+            "mop_resource",
+            normalized,
+        )
+    return OutcomeReason("unknown", "unknown", normalized)
 
 
 def clean_water_empty_reason(resources: ResourceState) -> str | None:

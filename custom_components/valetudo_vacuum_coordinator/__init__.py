@@ -23,6 +23,7 @@ from .const import (
     CONF_BATTERY_ENTITY,
     CONF_BLOCKED_SESSION_TIMEOUT,
     CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL,
+    CONF_COORDINATORS,
     CONF_CURRENT_AREA_ENTITY,
     CONF_CURRENT_TIME_ENTITY,
     CONF_DETERGENT_ENTITY,
@@ -63,6 +64,18 @@ from .const import (
     CONF_ROOMS,
     CONF_SEGMENT_COMMAND_TOPIC,
     CONF_STATUS_FLAG_ENTITY,
+    CONF_STATUS_CONDITION_ACTIVE_STATES,
+    CONF_STATUS_CONDITION_CODE,
+    CONF_STATUS_CONDITION_ENTITY,
+    CONF_STATUS_CONDITION_SOURCE,
+    CONF_STATUS_CONDITIONS,
+    CONF_STATUS_OBSERVER_ID,
+    CONF_STATUS_OBSERVERS,
+    CONF_STATUS_OUTAGE_CONFIRMATION,
+    CONF_STALE_RESUME_AGE,
+    CONF_STALE_RESUME_AUTO_CLEAR,
+    CONF_STALE_RESUME_CLEAR_TIMEOUT,
+    CONF_STALE_RESUME_SETTLE,
     CONF_TRACK_MANUAL_WHEN_PAUSED,
     CONF_VACUUM_ENTITY,
     CONF_WATER_ENTITY,
@@ -85,9 +98,15 @@ from .const import (
     DEFAULT_ROOM_MIN_AREA,
     DEFAULT_ROOM_MIN_DURATION,
     DEFAULT_ROOM_MIN_ESTIMATED_DWELL,
+    DEFAULT_STALE_RESUME_AGE,
+    DEFAULT_STALE_RESUME_AUTO_CLEAR,
+    DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
+    DEFAULT_STALE_RESUME_SETTLE,
+    DEFAULT_STATUS_OUTAGE_CONFIRMATION,
     DEFAULT_TRACK_MANUAL_WHEN_PAUSED,
     DEFAULT_WATER_MOP_OPTION,
     DOMAIN,
+    PLATFORM_SENSOR,
     PLATFORMS,
     SERVICE_CANCEL_SESSION,
     SERVICE_DOCK_ACTION,
@@ -95,6 +114,8 @@ from .const import (
     SERVICE_RESET_ROOM,
     SERVICE_SET_PAUSED,
     SERVICE_START_SESSION,
+    STATUS_CONDITION_SOURCES,
+    STATUS_DATA_KEY,
 )
 from .coordinator import ValetudoVacuumCoordinator
 from .dock import (
@@ -103,6 +124,11 @@ from .dock import (
     build_dock_action_url,
 )
 from .logic import RoomConfig
+from .status import (
+    StatusObserverConfig,
+    ValetudoVacuumStatusObserver,
+    split_integration_config,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -155,6 +181,22 @@ COORDINATOR_SCHEMA = vol.Schema(
             default=DEFAULT_BLOCKED_SESSION_TIMEOUT,
         ): cv.positive_int,
         vol.Optional(
+            CONF_STALE_RESUME_AUTO_CLEAR,
+            default=DEFAULT_STALE_RESUME_AUTO_CLEAR,
+        ): cv.boolean,
+        vol.Optional(
+            CONF_STALE_RESUME_AGE,
+            default=DEFAULT_STALE_RESUME_AGE,
+        ): cv.positive_int,
+        vol.Optional(
+            CONF_STALE_RESUME_SETTLE,
+            default=DEFAULT_STALE_RESUME_SETTLE,
+        ): vol.All(vol.Coerce(int), vol.Range(min=0)),
+        vol.Optional(
+            CONF_STALE_RESUME_CLEAR_TIMEOUT,
+            default=DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
+        ): cv.positive_int,
+        vol.Optional(
             CONF_RESUME_NUDGE_ENABLED,
             default=DEFAULT_RESUME_NUDGE_ENABLED,
         ): cv.boolean,
@@ -197,9 +239,64 @@ COORDINATOR_SCHEMA = vol.Schema(
     }
 )
 
+STATUS_CONDITION_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_STATUS_CONDITION_ENTITY): cv.entity_id,
+        vol.Required(CONF_STATUS_CONDITION_CODE): cv.string,
+        vol.Optional(
+            CONF_STATUS_CONDITION_SOURCE,
+            default="automation",
+        ): vol.In(STATUS_CONDITION_SOURCES),
+        vol.Optional(
+            CONF_STATUS_CONDITION_ACTIVE_STATES,
+            default=["on"],
+        ): vol.All(cv.ensure_list, [cv.string]),
+    }
+)
+
+STATUS_OBSERVER_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_STATUS_OBSERVER_ID): vol.All(
+            cv.string,
+            vol.Match(r"^[a-z0-9_]+$"),
+        ),
+        vol.Optional(CONF_NAME): cv.string,
+        vol.Required(CONF_VACUUM_ENTITY): cv.entity_id,
+        vol.Required(CONF_ERROR_ENTITY): cv.entity_id,
+        vol.Required(CONF_STATUS_FLAG_ENTITY): cv.entity_id,
+        vol.Required(CONF_DOCK_STATUS_ENTITY): cv.entity_id,
+        vol.Required(CONF_BATTERY_ENTITY): cv.entity_id,
+        vol.Optional(CONF_STATUS_CONDITIONS, default=[]): vol.All(
+            cv.ensure_list,
+            [STATUS_CONDITION_SCHEMA],
+        ),
+        vol.Optional(
+            CONF_STATUS_OUTAGE_CONFIRMATION,
+            default=DEFAULT_STATUS_OUTAGE_CONFIRMATION,
+        ): cv.positive_int,
+    }
+)
+
+STRUCTURED_CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_COORDINATORS, default=[]): vol.All(
+            cv.ensure_list,
+            [COORDINATOR_SCHEMA],
+        ),
+        vol.Optional(CONF_STATUS_OBSERVERS, default=[]): vol.All(
+            cv.ensure_list,
+            [STATUS_OBSERVER_SCHEMA],
+        ),
+    }
+)
+
 CONFIG_SCHEMA = vol.Schema(
     {
-        DOMAIN: vol.Any(COORDINATOR_SCHEMA, vol.All(cv.ensure_list, [COORDINATOR_SCHEMA])),
+        DOMAIN: vol.Any(
+            COORDINATOR_SCHEMA,
+            vol.All(cv.ensure_list, [COORDINATOR_SCHEMA]),
+            STRUCTURED_CONFIG_SCHEMA,
+        ),
     },
     extra=vol.ALLOW_EXTRA,
 )
@@ -222,8 +319,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if raw_configs is None:
         return True
 
-    coordinator_configs = _as_list(raw_configs)
+    coordinator_configs, status_observer_configs = split_integration_config(raw_configs)
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault(STATUS_DATA_KEY, {})
+    _register_services(hass)
 
     for raw_config in coordinator_configs:
         coordinator = ValetudoVacuumCoordinator(
@@ -249,16 +348,28 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 )
             )
 
-    _register_services(hass)
+    observers: dict[str, ValetudoVacuumStatusObserver] = hass.data[DOMAIN][
+        STATUS_DATA_KEY
+    ]
+    for raw_config in status_observer_configs:
+        observer_config = StatusObserverConfig.from_mapping(raw_config)
+        if observer_config.observer_id in observers:
+            raise ValueError(
+                f"Duplicate status observer id: {observer_config.observer_id}"
+            )
+        observer = ValetudoVacuumStatusObserver(hass, observer_config)
+        await observer.async_setup()
+        observers[observer_config.observer_id] = observer
+        hass.async_create_task(
+            discovery.async_load_platform(
+                hass,
+                PLATFORM_SENSOR,
+                DOMAIN,
+                {"status_observer_id": observer_config.observer_id},
+                config,
+            )
+        )
     return True
-
-
-def _as_list(value: Any) -> list[Any]:
-    """Return a config value as a list."""
-    if isinstance(value, list):
-        return value
-    return [value]
-
 
 def _build_rooms(raw_rooms: Iterable[dict[str, Any]]) -> list[RoomConfig]:
     """Build room config objects."""
