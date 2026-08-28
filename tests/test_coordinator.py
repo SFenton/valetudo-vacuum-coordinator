@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "custom_components" / "valetudo_vacuum_coordinator"
@@ -47,11 +49,16 @@ def _install_homeassistant_stubs() -> None:
 
     components_module = types.ModuleType("homeassistant.components")
     binary_sensor_module = types.ModuleType("homeassistant.components.binary_sensor")
+    sensor_module = types.ModuleType("homeassistant.components.sensor")
 
     class BinarySensorEntity:
         pass
 
+    class SensorEntity:
+        pass
+
     binary_sensor_module.BinarySensorEntity = BinarySensorEntity
+    sensor_module.SensorEntity = SensorEntity
 
     helpers_module = types.ModuleType("homeassistant.helpers")
     event_module = types.ModuleType("homeassistant.helpers.event")
@@ -105,6 +112,7 @@ def _install_homeassistant_stubs() -> None:
         "homeassistant.components.binary_sensor",
         binary_sensor_module,
     )
+    sys.modules.setdefault("homeassistant.components.sensor", sensor_module)
     sys.modules.setdefault("homeassistant.const", const_module)
     sys.modules.setdefault("homeassistant.core", core_module)
     sys.modules.setdefault("homeassistant.helpers", helpers_module)
@@ -150,6 +158,10 @@ binary_sensor_module = _load_module(
     f"{package.__name__}.binary_sensor",
     PACKAGE / "binary_sensor.py",
 )
+sensor_module = _load_module(
+    f"{package.__name__}.sensor",
+    PACKAGE / "sensor.py",
+)
 
 
 class _EventHandlingCoordinator(coordinator_module.ValetudoVacuumCoordinator):
@@ -165,11 +177,15 @@ class _EventHandlingCoordinator(coordinator_module.ValetudoVacuumCoordinator):
         }
         self.active_run = None
         self.manual_run = None
+        self.retained_task_guard = None
         self.session = None
         self.next_room_checks = 0
         self._event_lock = asyncio.Lock()
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline = None
+        self._retained_task_timer_cancel = None
+        self._retained_task_timer_deadline = None
+        self._retained_task_reconcile_scheduled = False
 
     def _observe_active_run(self, entity_id, new_state, now) -> bool:
         return False
@@ -233,6 +249,17 @@ class _FakeHass:
         raise AssertionError("test calls awaited handlers directly")
 
 
+class _MemoryStore:
+    def __init__(self, data=None) -> None:
+        self.data = data
+
+    async def async_load(self):
+        return self.data
+
+    async def async_save(self, data) -> None:
+        self.data = data
+
+
 class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinator):
     """Coordinator fixture for recoverable room-failure flow."""
 
@@ -262,8 +289,14 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
             const.CONF_NATIVE_RESUME_ENABLED: True,
             const.CONF_NATIVE_RESUME_TIMEOUT: 10800,
             const.CONF_DOCK_SETTLE: 0,
+            const.CONF_STALE_RESUME_AUTO_CLEAR: False,
+            const.CONF_STALE_RESUME_AGE: 1800,
+            const.CONF_STALE_RESUME_SETTLE: 0,
+            const.CONF_STALE_RESUME_CLEAR_TIMEOUT: 30,
             const.CONF_RESUME_NUDGE_ENABLED: False,
             const.CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL: True,
+            const.CONF_MANUAL_TRACKING: True,
+            const.CONF_TRACK_MANUAL_WHEN_PAUSED: True,
         }
         self.ledgers = {room.room_id: logic.RoomLedger() for room in self.rooms}
         self.disabled_room_ids = set()
@@ -279,8 +312,10 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
             command_published=True,
         )
         self.manual_run = None
+        self.retained_task_guard = None
         self.settings_snapshot = None
         self.while_away_outcomes = []
+        self._while_away_outcome_sequence = 0
         self.last_error = None
         self.started_rooms = []
         self._away_timer_cancel = None
@@ -290,7 +325,11 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
         self._native_resume_timeout_cancel = None
         self._dispatch_start_timeout_cancel = None
         self._blocked_session_watchdog_cancel = None
+        self._retained_task_timer_cancel = None
+        self._retained_task_timer_deadline = None
+        self._retained_task_reconcile_scheduled = False
         self._terminal_cleanup_retry_attempts = 0
+        self._terminal_settings_restore_deferred = False
         self._event_lock = asyncio.Lock()
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline = None
@@ -407,6 +446,748 @@ def _trigger_final_resumable_return(
     assert active_run.phase == logic.RUN_PHASE_SUSPENDED
     assert active_run.resume_required is True
     return active_run
+
+
+def _prepare_preflight_coordinator(
+    *,
+    now: datetime,
+    auto_clear: bool,
+    stale: bool,
+    owner: str = logic.RETAINED_TASK_OWNER_UNKNOWN,
+    phase: str = logic.RETAINED_TASK_PHASE_STALE_CANDIDATE,
+) -> _RecoverableFailureCoordinator:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.manual_run = None
+    coordinator.session = logic.SessionState(
+        session_id="preflight-session",
+        started_at=now.isoformat(),
+    )
+    coordinator.config[const.CONF_STALE_RESUME_AUTO_CLEAR] = auto_clear
+    coordinator.config[const.CONF_STALE_RESUME_AGE] = 1800
+    coordinator.config[const.CONF_STALE_RESUME_SETTLE] = 0
+    coordinator.config[const.CONF_STALE_RESUME_CLEAR_TIMEOUT] = 30
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("sensor.robot_error", "No error")
+    observed_at = now - timedelta(seconds=3600 if stale else 60)
+    coordinator.retained_task_guard = logic.RetainedTaskGuard(
+        owner=owner,
+        phase=phase,
+        first_observed_at=observed_at.isoformat(),
+        last_material_activity_at=observed_at.isoformat(),
+        coherent_since=observed_at.isoformat(),
+        last_vacuum_state="docked",
+        last_status_flag="resumable",
+        last_dock_status="pause",
+        last_error="No error",
+    )
+    return coordinator
+
+
+def test_clean_water_degraded_records_idempotent_typed_room_deferrals() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    rooms = [
+        logic.RoomConfig(
+            room_id="dining",
+            name="Dining Room",
+            segment_id="1",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="kitchen",
+            name="Kitchen",
+            segment_id="2",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="office",
+            name="Office",
+            segment_id="3",
+        ),
+    ]
+    _set_rooms(coordinator, rooms)
+    reason = "Mop Dock Clean Water Tank empty"
+
+    coordinator._activate_clean_water_degraded(reason)
+    coordinator._activate_clean_water_degraded(reason)
+
+    assert coordinator.session is not None
+    assert coordinator.session.deferred_full_clean_room_ids == [
+        "dining",
+        "kitchen",
+    ]
+    assert len(coordinator.while_away_outcomes) == 2
+    assert [outcome.sequence for outcome in coordinator.while_away_outcomes] == [
+        1,
+        2,
+    ]
+    assert len(
+        {outcome.outcome_id for outcome in coordinator.while_away_outcomes}
+    ) == 2
+    contract = coordinator.while_away_outcome_contract
+    assert contract["complete"] is True
+    assert [room["status"] for room in contract["rooms"]] == [
+        "deferred",
+        "deferred",
+    ]
+    assert all(room["latest_attempt"] is None for room in contract["rooms"])
+    assert coordinator.while_away_cleaned_messages == []
+    assert coordinator.while_away_issue_messages == []
+
+
+@pytest.mark.parametrize(
+    ("fallback_vacuum", "vacuum_only", "expected_mode"),
+    [
+        (False, False, "vacuum_mop"),
+        (True, True, "fallback_vacuum"),
+    ],
+)
+def test_dispatch_service_failure_records_failed_typed_attempt(
+    fallback_vacuum,
+    vacuum_only,
+    expected_mode,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at="2026-08-19T10:00:00+00:00",
+        degraded_reason=(
+            "Mop Dock Clean Water Tank empty"
+            if fallback_vacuum
+            else None
+        ),
+        degraded_preparation_completed=fallback_vacuum,
+        deferred_full_clean_room_ids=(
+            [room.room_id] if fallback_vacuum else []
+        ),
+        deferred_full_clean_reasons=(
+            {room.room_id: "Mop Dock Clean Water Tank empty"}
+            if fallback_vacuum
+            else {}
+        ),
+    )
+    if fallback_vacuum:
+        coordinator._record_deferral_outcome(
+            room,
+            "Mop Dock Clean Water Tank empty",
+        )
+        coordinator.set_state(coordinator.vacuum_entity, "error")
+        coordinator.set_state(
+            "sensor.robot_error",
+            "Mop Dock Clean Water Tank empty",
+        )
+        coordinator.set_state("sensor.robot_dock_status", "pause")
+    else:
+        coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    original_async_call = coordinator.hass.services.async_call
+
+    async def fail_publish(domain, service, data, blocking=False) -> None:
+        if domain == "mqtt" and service == "publish":
+            raise RuntimeError("publish failed")
+        await original_async_call(domain, service, data, blocking)
+
+    coordinator.hass.services.async_call = fail_publish
+
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room(
+            coordinator,
+            room,
+            vacuum_only=vacuum_only,
+            fallback_vacuum=fallback_vacuum,
+        )
+    )
+
+    assert coordinator.active_run is None
+    contract = coordinator.while_away_outcome_contract
+    assert contract["complete"] is True
+    projection = contract["rooms"][0]
+    attempt_events = [
+        event for event in contract["events"] if event["type"] == "attempt"
+    ]
+    assert len(attempt_events) == 1
+    assert attempt_events[0]["attempt_mode"] == expected_mode
+    assert attempt_events[0]["attempt_result"] == "failed"
+    assert attempt_events[0]["reason"]["code"] == "dispatch.failed"
+    assert projection["status"] == "failed"
+    assert projection["latest_attempt"]["mode"] == expected_mode
+    assert projection["latest_attempt"]["result"] == "failed"
+    assert projection["occurrence_count"] == 1
+    assert projection["credit"] == {
+        "status": "none",
+        "operation": None,
+    }
+    assert projection["outstanding"]["operation"] == "vacuum_mop"
+    assert projection["credit"]["status"] != "full"
+    assert projection["outstanding"]["reason"]["code"] == (
+        "mop.clean_water_empty"
+        if fallback_vacuum
+        else "dispatch.failed"
+    )
+    assert projection["reasons_coincide"] is (not fallback_vacuum)
+
+
+def test_typed_outcome_sequence_survives_restart_and_duplicate_replay() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session-one",
+        started_at="2026-08-19T10:00:00+00:00",
+    )
+    coordinator._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            coordinator
+        )
+    )
+
+    restored = _RecoverableFailureCoordinator()
+    _set_rooms(restored, [room])
+    restored._store = _MemoryStore(coordinator._store.data)
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_load_store(restored)
+    )
+
+    assert restored._while_away_outcome_sequence == 1
+    assert len(restored.while_away_outcomes) == 1
+    restored._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
+    assert restored._while_away_outcome_sequence == 1
+    assert len(restored.while_away_outcomes) == 1
+
+    restored.session = logic.SessionState(
+        session_id="session-two",
+        started_at="2026-08-19T12:00:00+00:00",
+    )
+    restored._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
+    assert restored._while_away_outcome_sequence == 2
+    assert [outcome.sequence for outcome in restored.while_away_outcomes] == [
+        1,
+        2,
+    ]
+    restored._prune_while_away_outcomes_for_day("2099-01-01")
+    restored.session = logic.SessionState(
+        session_id="session-three",
+        started_at="2099-01-01T12:00:00+00:00",
+    )
+    restored._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
+    assert restored._while_away_outcome_sequence == 3
+    assert [outcome.sequence for outcome in restored.while_away_outcomes] == [
+        3
+    ]
+
+
+def test_attempt_event_ids_deduplicate_replay_not_identical_real_attempts() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at="2026-08-19T10:00:00+00:00",
+    )
+    first_run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id=coordinator.session.session_id,
+        started_at="2026-08-19T10:01:00+00:00",
+        vacuum_only=True,
+        command_published=True,
+    )
+    second_run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id=coordinator.session.session_id,
+        started_at="2026-08-19T10:05:00+00:00",
+        vacuum_only=True,
+        command_published=True,
+    )
+    reason = "Auto-Empty Dock dust bag full or dust duct clogged"
+
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=first_run,
+        result="failed",
+        reason=reason,
+    )
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=first_run,
+        result="failed",
+        reason=reason,
+    )
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=second_run,
+        result="failed",
+        reason=reason,
+    )
+
+    assert len(coordinator.while_away_outcomes) == 2
+    assert [outcome.sequence for outcome in coordinator.while_away_outcomes] == [
+        1,
+        2,
+    ]
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["occurrence_count"] == 2
+    assert len(projection["event_ids"]) == 2
+
+    coordinator._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            coordinator
+        )
+    )
+    restored = _RecoverableFailureCoordinator()
+    _set_rooms(restored, [room])
+    restored._store = _MemoryStore(coordinator._store.data)
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_load_store(restored)
+    )
+    restored._record_attempt_outcome(
+        kind="failed",
+        run=second_run,
+        result="failed",
+        reason=reason,
+    )
+    assert len(restored.while_away_outcomes) == 2
+    assert restored._while_away_outcome_sequence == 2
+
+
+def test_error_terminal_event_wins_over_later_cancel_collision(caplog) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    assert coordinator.active_run is not None
+    run = coordinator.active_run
+    run.vacuum_only = True
+    run.command_published = True
+    run.phase = logic.RUN_PHASE_SUSPENDED
+    run.resume_required = True
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    _handle_event(coordinator, "sensor.robot_error", "Robot is stuck")
+
+    contract = coordinator.while_away_outcome_contract
+    assert len(contract["events"]) == 1
+    original_event = json.loads(json.dumps(contract["events"][0]))
+    assert original_event["attempt_result"] == "failed"
+    assert original_event["reason"]["code"] == "navigation.stuck"
+    assert contract["rooms"][0]["status"] == "failed"
+
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=run,
+        result="interrupted",
+        reason="Tracked person arrived home",
+    )
+
+    updated_contract = coordinator.while_away_outcome_contract
+    assert updated_contract["events"] == [original_event]
+    assert updated_contract["rooms"][0]["status"] == "failed"
+    assert "Ignoring conflicting terminal outcome" in caplog.text
+
+
+def test_legacy_updates_are_session_scoped_and_typed_events_are_immutable() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    _set_rooms(coordinator, [room])
+    session_one = logic.SessionState(
+        session_id="session-one",
+        started_at="2026-08-19T10:00:00+00:00",
+    )
+    coordinator.session = session_one
+    first_run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id=session_one.session_id,
+        started_at="2026-08-19T10:01:00+00:00",
+        vacuum_only=True,
+        command_published=True,
+    )
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=first_run,
+        result="failed",
+        reason="Cannot reach target",
+    )
+
+    session_two = logic.SessionState(
+        session_id="session-two",
+        started_at="2026-08-19T12:00:00+00:00",
+    )
+    coordinator.session = session_two
+    second_run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id=session_two.session_id,
+        started_at="2026-08-19T12:01:00+00:00",
+        vacuum_only=True,
+        command_published=True,
+    )
+    coordinator._record_attempt_outcome(
+        kind="failed",
+        run=second_run,
+        result="failed",
+        reason="Cannot reach target",
+    )
+    cached_events = {
+        event["id"]: json.loads(json.dumps(event))
+        for event in coordinator.while_away_outcome_contract["events"]
+    }
+
+    assert coordinator._replace_while_away_failure(
+        room.room_id,
+        None,
+        "Unknown error 95",
+    )
+    outcomes_by_session = {
+        outcome.session_id: outcome
+        for outcome in coordinator.while_away_outcomes
+    }
+    assert outcomes_by_session["session-one"].reason == "Cannot reach target"
+    assert outcomes_by_session["session-two"].reason == "Unknown error 95"
+    assert outcomes_by_session["session-one"].legacy_visible is True
+    assert outcomes_by_session["session-two"].legacy_visible is True
+    assert {
+        event["id"]: event
+        for event in coordinator.while_away_outcome_contract["events"]
+    } == cached_events
+
+    coordinator._remove_while_away_failure(room.room_id, None)
+
+    assert outcomes_by_session["session-one"].legacy_visible is True
+    assert outcomes_by_session["session-two"].legacy_visible is False
+    assert {
+        event["id"]: event
+        for event in coordinator.while_away_outcome_contract["events"]
+    } == cached_events
+    assert coordinator.while_away_issue_messages == [
+        "Could not clean Office because it could not reach the room"
+    ]
+
+
+def test_session_sensor_exposes_additive_typed_outcome_contract() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
+
+    sensor = sensor_module.ValetudoSessionStateSensor(coordinator)
+    attributes = sensor.extra_state_attributes
+
+    assert attributes[const.ATTR_WHILE_AWAY_OUTCOMES] == (
+        coordinator.while_away_outcome_contract
+    )
+    assert attributes[const.ATTR_WHILE_AWAY_CLEANED] == []
+    assert attributes[const.ATTR_WHILE_AWAY_ISSUES] == []
+
+
+def test_returned_home_cancellation_records_typed_interruption_only() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="hallway",
+        name="Hallway",
+        segment_id="1",
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at="2026-08-19T12:00:00+00:00",
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id=coordinator.session.session_id,
+        started_at="2026-08-19T12:10:00+00:00",
+        vacuum_only=True,
+        command_published=True,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session.terminal_reason == "returned_home"
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["status"] == "interrupted"
+    assert projection["latest_attempt"]["mode"] == "vacuum"
+    assert projection["latest_attempt"]["result"] == "interrupted"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "occupancy.person_arrived"
+    )
+    assert projection["outstanding"]["operation"] == "vacuum"
+    assert coordinator.while_away_issue_messages == []
+
+
+def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    rooms = [
+        logic.RoomConfig(
+            room_id="dining_room",
+            name="Dining Room",
+            segment_id="1",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="kitchen",
+            name="Kitchen",
+            segment_id="2",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="master_bathroom",
+            name="Master Bathroom",
+            segment_id="3",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="guest_bathroom",
+            name="Guest Bathroom",
+            segment_id="4",
+            mop_required=True,
+        ),
+        logic.RoomConfig(
+            room_id="gym",
+            name="Gym",
+            segment_id="5",
+        ),
+        logic.RoomConfig(
+            room_id="office",
+            name="Office",
+            segment_id="6",
+        ),
+        logic.RoomConfig(
+            room_id="guest_room",
+            name="Guest Room",
+            segment_id="7",
+        ),
+        logic.RoomConfig(
+            room_id="master_bedroom_closet",
+            name="Master Bedroom Closet",
+            segment_id="8",
+        ),
+        logic.RoomConfig(
+            room_id="hallway",
+            name="Hallway",
+            segment_id="9",
+        ),
+    ]
+    _set_rooms(coordinator, rooms)
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    ordered_native_dates = {
+        "gym": "2026-07-01T00:00:00+00:00",
+        "office": "2026-07-02T00:00:00+00:00",
+        "guest_room": "2026-07-03T00:00:00+00:00",
+        "master_bedroom_closet": "2026-07-04T00:00:00+00:00",
+        "hallway": "2026-07-05T00:00:00+00:00",
+    }
+    for room_id, timestamp in ordered_native_dates.items():
+        coordinator.ledgers[room_id].last_successful_clean = timestamp
+
+    dt_module = sys.modules["homeassistant.util.dt"]
+    original_now = dt_module.now
+    dt_module.now = lambda: datetime(2026, 8, 19, 14, 0, tzinfo=UTC)
+    try:
+        coordinator.session = logic.SessionState(
+            session_id="session-one",
+            started_at="2026-08-19T16:00:00+00:00",
+        )
+        coordinator.active_run = logic.ActiveRun(
+            room_id="dining_room",
+            segment_id="1",
+            session_id="session-one",
+            started_at="2026-08-19T16:01:00+00:00",
+            command_published=True,
+            observed_cleaning=True,
+            observed_segment_cleaning=True,
+        )
+        coordinator.session.active_room_id = "dining_room"
+        coordinator.set_state(coordinator.vacuum_entity, "error")
+        coordinator.set_state("sensor.robot_dock_status", "pause")
+        _handle_event(
+            coordinator,
+            "sensor.robot_error",
+            "Mop Dock Clean Water Tank empty",
+        )
+
+        assert coordinator.active_run is not None
+        assert coordinator.active_run.room_id == "gym"
+        assert coordinator.active_run.vacuum_only is True
+        assert coordinator.active_run.fallback_vacuum is False
+        asyncio.run(
+            coordinator._async_finish_active_run(success_override=True)
+        )
+
+        assert coordinator.active_run is not None
+        assert coordinator.active_run.room_id == "office"
+        _handle_event(
+            coordinator,
+            "sensor.robot_error",
+            "Auto-Empty Dock dust bag full or dust duct clogged",
+        )
+        assert coordinator.session.terminal_reason == "needs_help"
+        assert coordinator.active_run is None
+
+        coordinator.set_state("person.owner", "not_home")
+        coordinator.set_state(coordinator.vacuum_entity, "docked")
+        coordinator.set_state("sensor.robot_error", "No error")
+        coordinator.set_state("sensor.robot_status_flag", "none")
+        coordinator.set_state("sensor.robot_dock_status", "idle")
+        coordinator.session = logic.SessionState(
+            session_id="session-two",
+            started_at="2026-08-19T19:00:00+00:00",
+        )
+        coordinator.active_run = logic.ActiveRun(
+            room_id="dining_room",
+            segment_id="1",
+            session_id="session-two",
+            started_at="2026-08-19T19:01:00+00:00",
+            command_published=True,
+            observed_cleaning=True,
+            observed_segment_cleaning=True,
+        )
+        coordinator.session.active_room_id = "dining_room"
+        coordinator.set_state(coordinator.vacuum_entity, "error")
+        coordinator.set_state("sensor.robot_dock_status", "pause")
+        _handle_event(
+            coordinator,
+            "sensor.robot_error",
+            "Mop Dock Clean Water Tank empty",
+        )
+
+        for expected_room in (
+            "office",
+            "guest_room",
+            "master_bedroom_closet",
+        ):
+            assert coordinator.active_run is not None
+            assert coordinator.active_run.room_id == expected_room
+            assert coordinator.active_run.vacuum_only is True
+            assert coordinator.active_run.fallback_vacuum is False
+            asyncio.run(
+                coordinator._async_finish_active_run(success_override=True)
+            )
+
+        assert coordinator.active_run is not None
+        assert coordinator.active_run.room_id == "hallway"
+        coordinator.set_state(coordinator.vacuum_entity, "docked")
+        _handle_event(coordinator, "person.owner", "home")
+
+        assert coordinator.session.terminal_reason == "returned_home"
+        assert coordinator.session.fallback_completed_room_ids == []
+        assert coordinator.active_run is None
+        contract = coordinator.while_away_outcome_contract
+        assert contract["version"] == 1
+        assert contract["complete"] is True
+        assert contract["day"] == "2026-08-19"
+        projections = {
+            room["room_id"]: room for room in contract["rooms"]
+        }
+
+        assert projections["gym"]["status"] == "completed"
+        assert projections["office"]["status"] == "completed"
+        assert projections["office"]["occurrence_count"] == 2
+        assert [
+            event["attempt_result"]
+            for event in contract["events"]
+            if event["room_id"] == "office"
+            and event["type"] == "attempt"
+        ] == ["failed", "completed"]
+        assert projections["guest_room"]["status"] == "completed"
+        assert projections["master_bedroom_closet"]["status"] == "completed"
+
+        dining = projections["dining_room"]
+        assert dining["status"] == "failed"
+        assert dining["latest_attempt"]["mode"] == "vacuum_mop"
+        assert dining["latest_attempt"]["reason"]["code"] == (
+            "mop.clean_water_empty"
+        )
+        assert dining["outstanding"]["operation"] == "vacuum_mop"
+        assert dining["outstanding"]["reason"]["code"] == (
+            "mop.clean_water_empty"
+        )
+        assert dining["occurrence_count"] == 2
+        assert dining["reasons_coincide"] is True
+
+        hallway = projections["hallway"]
+        assert hallway["status"] == "interrupted"
+        assert hallway["latest_attempt"]["mode"] == "vacuum"
+        assert hallway["latest_attempt"]["reason"]["code"] == (
+            "occupancy.person_arrived"
+        )
+        assert hallway["outstanding"]["operation"] == "vacuum"
+
+        for room_id in (
+            "kitchen",
+            "master_bathroom",
+            "guest_bathroom",
+        ):
+            projection = projections[room_id]
+            assert projection["status"] == "deferred"
+            assert projection["latest_attempt"] is None
+            assert projection["outstanding"]["operation"] == "vacuum_mop"
+            assert projection["outstanding"]["reason"]["code"] == (
+                "mop.clean_water_empty"
+            )
+
+        assert not any(
+            event.get("attempt_mode") == "fallback_vacuum"
+            and event.get("attempt_result") == "completed"
+            for event in contract["events"]
+        )
+        assert coordinator.while_away_cleaned_messages == [
+            "Cleaned Gym",
+            "Cleaned Office",
+            "Cleaned Guest Room",
+            "Cleaned Master Bedroom Closet",
+        ]
+        assert coordinator.while_away_issue_messages == [
+            "Could not clean Dining Room because the clean water tank is empty"
+        ]
+    finally:
+        dt_module.now = original_now
 
 
 def test_error_95_recovery_clears_warning_and_requeues_room_after_docking() -> None:
@@ -803,6 +1584,10 @@ def test_fallback_partial_credit_stays_due_for_new_same_day_session() -> None:
     ledger.last_mopped = "2026-08-01T00:00:00+00:00"
     ledger.last_failed_reason = "Mop Dock Clean Water Tank empty"
     ledger.successful_count = 3
+    coordinator._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
     coordinator.set_state(coordinator.vacuum_entity, "error")
     coordinator.set_state("sensor.robot_dock_status", "pause")
     coordinator.set_state(
@@ -822,6 +1607,17 @@ def test_fallback_partial_credit_stays_due_for_new_same_day_session() -> None:
     assert coordinator.session is not None
     assert coordinator.session.completed_room_ids == []
     assert coordinator.session.fallback_completed_room_ids == ["room_one"]
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["status"] == "partial"
+    assert projection["latest_attempt"]["mode"] == "fallback_vacuum"
+    assert projection["credit"] == {
+        "status": "partial",
+        "operation": "vacuum",
+    }
+    assert projection["outstanding"]["operation"] == "mop"
+    assert projection["outstanding"]["reason"]["code"] == (
+        "mop.clean_water_empty"
+    )
 
     selection, _skipped = logic.select_next_room(
         [room],
@@ -3039,6 +3835,10 @@ def test_fallback_navigation_failure_is_not_republished() -> None:
         fallback_vacuum=True,
         command_published=True,
     )
+    coordinator._record_deferral_outcome(
+        room,
+        "Mop Dock Clean Water Tank empty",
+    )
     coordinator.set_state(coordinator.vacuum_entity, "error")
     coordinator.set_state("sensor.robot_error", "Unknown error 95")
 
@@ -3048,6 +3848,15 @@ def test_fallback_navigation_failure_is_not_republished() -> None:
     assert coordinator.session.retry_room_ids == []
     assert coordinator.session.fallback_failed_room_ids == ["room_one"]
     assert coordinator.started_rooms == []
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["latest_attempt"]["mode"] == "fallback_vacuum"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "navigation.stuck"
+    )
+    assert projection["outstanding"]["reason"]["code"] == (
+        "mop.clean_water_empty"
+    )
+    assert projection["reasons_coincide"] is False
 
 
 def test_unknown_error_120_does_not_activate_clean_water_fallback() -> None:
@@ -3172,7 +3981,7 @@ def test_blocked_watchdog_uses_long_battery_bound_without_extending_deadline() -
     assert logic.parse_datetime(coordinator.session.blocked_deadline) == short_deadline
 
 
-def test_resource_terminal_cleanup_blocks_resumable_but_accepts_stale_segment() -> None:
+def test_resource_terminal_cleanup_restores_despite_resumable() -> None:
     coordinator = _RecoverableFailureCoordinator()
     room = logic.RoomConfig(
         room_id="room_one",
@@ -3199,13 +4008,6 @@ def test_resource_terminal_cleanup_blocks_resumable_but_accepts_stale_segment() 
     coordinator.set_state("sensor.robot_status_flag", "resumable")
     coordinator.set_state("select.robot_mode", "vacuum")
 
-    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
-
-    assert coordinator.session.notification_sent is False
-    assert coordinator.settings_snapshot is not None
-    assert _service_names(coordinator).count("select_option") == 0
-
-    coordinator.set_state("sensor.robot_status_flag", "segment")
     asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
 
     assert coordinator.session.notification_sent is True
@@ -3244,6 +4046,76 @@ def test_resource_terminal_cleanup_blocks_resumable_but_accepts_stale_segment() 
     assert deferred.session.notification_sent is True
     assert deferred.settings_snapshot is None
     assert _service_names(deferred).count("select_option") == 1
+
+
+def test_mid_session_terminal_resumable_notifies_and_restores_immediately() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.manual_run = None
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    coordinator.config[const.CONF_PASSES_ENTITY] = "input_select.robot_passes"
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="blocked",
+        terminal_message="status flag is resumable",
+        terminal_cause="blocked_timeout",
+        completed_room_ids=["room_one"],
+    )
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        passes="3",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("input_select.robot_passes", "2")
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is None
+    assert _service_names(coordinator).count("household") == 1
+    assert _service_names(coordinator).count("select_option") == 1
+    assert "stop" not in _service_names(coordinator)
+
+
+def test_terminal_notification_does_not_restore_during_external_activity() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.manual_run = None
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="blocked",
+        terminal_message="external task is active",
+    )
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    coordinator.set_state("select.robot_mode", "vacuum")
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is not None
+    assert _service_names(coordinator).count("household") == 1
+    assert _service_names(coordinator).count("select_option") == 0
+    assert coordinator._terminal_cleanup_retry_attempts == 0
+
+    coordinator.set_state(coordinator.vacuum_entity, "idle")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.settings_snapshot is None
+    assert _service_names(coordinator).count("household") == 1
+    assert _service_names(coordinator).count("select_option") == 1
 
 
 def test_blocked_deadline_survives_preparation_and_repeated_tentative_aborts() -> None:
@@ -3422,10 +4294,22 @@ def test_dispatch_and_blocked_watchdogs_finish_degraded_work_finitely() -> None:
     )
 
     asyncio.run(blocked._async_maybe_start_next_room())
-    assert blocked.session.blocked_deadline is not None
-    asyncio.run(blocked._async_expire_blocked_session_serialized())
-    assert blocked.session.active is False
-    assert blocked.session.terminal_cause == "blocked_timeout"
+    assert blocked.retained_task_guard is not None
+    assert blocked.retained_task_guard.observation_deadline is not None
+    blocked.retained_task_guard.observation_deadline = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    asyncio.run(
+        blocked._async_reconcile_retained_task(
+            datetime.now(UTC),
+            allow_clear=True,
+        )
+    )
+    assert blocked.session.active is True
+    assert (
+        blocked.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
 
 
 def test_dispatch_timeout_stops_late_command_before_next_publish() -> None:
@@ -3740,6 +4624,7 @@ def test_presence_change_before_publish_preserves_existing_retry_failure() -> No
         "room_one": "Unknown error 95"
     }
     assert coordinator.session.retried_room_ids == []
+    assert coordinator.while_away_outcome_contract["events"] == []
 
 
 def test_public_cancel_waits_for_mqtt_publish_then_stops_command() -> None:
@@ -4005,3 +4890,744 @@ def test_room_auto_clean_disable_switch_excludes_room_from_active_session() -> N
     assert coordinator.is_room_auto_clean_disabled("room_one") is True
     assert coordinator.started_rooms == ["room_two"]
     assert [room.room_id for room in coordinator.pending_rooms] == []
+
+
+def test_unowned_resumable_waits_until_stale_before_one_stop(monkeypatch) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    fresh = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=False,
+    )
+
+    assert (
+        asyncio.run(
+            fresh._async_reconcile_retained_task(now, allow_clear=True)
+        )
+        is False
+    )
+    assert "stop" not in _service_names(fresh)
+    assert fresh.retained_task_guard is not None
+    assert (
+        fresh.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_STALE_CANDIDATE
+    )
+
+    stale = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+
+    assert (
+        asyncio.run(
+            stale._async_reconcile_retained_task(now, allow_clear=True)
+        )
+        is False
+    )
+    assert _service_names(stale).count("stop") == 1
+    assert stale.retained_task_guard is not None
+    assert stale.retained_task_guard.clear_attempts == 1
+    assert (
+        stale.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_VERIFYING
+    )
+
+
+def test_stale_shadow_preflight_notifies_without_settings_or_stop(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=False,
+        stale=True,
+    )
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    coordinator.config[const.CONF_PASSES_ENTITY] = "input_select.robot_passes"
+    coordinator.set_state("input_select.robot_passes", "3")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert coordinator.session is not None
+    assert coordinator.session.active is True
+    assert coordinator.session.settings_prepared is False
+    assert coordinator.started_rooms == []
+    assert "stop" not in _service_names(coordinator)
+    assert "select_option" not in _service_names(coordinator)
+    assert _service_names(coordinator).count("household") == 1
+
+    sensor = sensor_module.ValetudoSessionStateSensor(coordinator)
+    attributes = sensor.extra_state_attributes
+    assert attributes["retained_task_owner"] == "unknown"
+    assert attributes["retained_task_phase"] == "operator_required"
+    assert attributes["retained_task_stale_age_seconds"] == 3600
+    assert attributes["retained_task_clear_attempts"] == 0
+    assert attributes["retained_task_operator_required_reason"]
+
+
+def test_no_ack_becomes_operator_required_without_second_stop(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert _service_names(coordinator).count("stop") == 1
+
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            now + timedelta(seconds=31),
+            allow_clear=True,
+        )
+    )
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert _service_names(coordinator).count("stop") == 1
+    assert _service_names(coordinator).count("household") == 1
+    assert coordinator.session is not None
+    assert coordinator.session.settings_prepared is False
+
+
+def test_flag_clear_with_latched_dock_pause_requires_operator(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    coordinator.set_state("sensor.robot_status_flag", "none")
+
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            now + timedelta(seconds=31),
+            allow_clear=True,
+        )
+    )
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert "requires a configured Valetudo identifier" in (
+        coordinator.retained_task_guard.operator_required_reason or ""
+    )
+    assert _service_names(coordinator).count("stop") == 1
+    assert "dock_action" not in _service_names(coordinator)
+
+
+def test_task_ack_then_dock_pause_uses_one_persisted_dock_stop(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert _service_names(coordinator).count("stop") == 1
+
+    current[0] += timedelta(seconds=1)
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is False
+    )
+
+    guard = coordinator.retained_task_guard
+    assert guard is not None
+    assert guard.clear_acknowledged_at == current[0].isoformat()
+    assert guard.dock_clear_attempts == 1
+    assert guard.dock_clear_requested_at == current[0].isoformat()
+    assert guard.dock_clear_published_at == current[0].isoformat()
+    assert guard.phase == logic.RETAINED_TASK_PHASE_DOCK_VERIFYING
+    assert _service_names(coordinator).count("dock_action") == 1
+    diagnostics = coordinator.retained_task_attributes
+    assert diagnostics["retained_task_clear_attempts"] == 1
+    assert diagnostics["retained_task_dock_clear_attempts"] == 1
+    assert diagnostics["retained_task_clear_acknowledged_at"]
+    assert diagnostics["retained_task_dock_clear_acknowledged_at"] is None
+    dock_call = next(
+        call
+        for call in coordinator.hass.services.calls
+        if call["service"] == "dock_action"
+    )
+    assert dock_call["domain"] == const.DOMAIN
+    assert dock_call["data"] == {
+        const.CONF_IDENTIFIER: "robot",
+        "capability": "clean",
+        "action": "stop",
+    }
+
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            current[0] + timedelta(seconds=1),
+            allow_clear=True,
+        )
+    )
+    assert _service_names(coordinator).count("dock_action") == 1
+
+    current[0] += timedelta(seconds=2)
+    coordinator.set_state(coordinator.vacuum_entity, "idle")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is True
+    )
+
+    assert guard.phase == logic.RETAINED_TASK_PHASE_CLEARED
+    assert guard.dock_clear_acknowledged_at == current[0].isoformat()
+    assert _service_names(coordinator).count("stop") == 1
+    assert _service_names(coordinator).count("dock_action") == 1
+
+
+def test_dock_stop_waits_for_stable_pause(monkeypatch) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    coordinator.config[const.CONF_STALE_RESUME_SETTLE] = 5
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    current[0] += timedelta(seconds=1)
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            current[0],
+            allow_clear=True,
+        )
+    )
+
+    assert "dock_action" not in _service_names(coordinator)
+    current[0] += timedelta(seconds=6)
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            current[0],
+            allow_clear=True,
+        )
+    )
+    assert _service_names(coordinator).count("dock_action") == 1
+
+
+def test_restart_before_dock_stop_publish_never_replays_uncertain_command(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+        phase=logic.RETAINED_TASK_PHASE_DOCK_CLEAR_PENDING,
+    )
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    assert coordinator.retained_task_guard is not None
+    coordinator.retained_task_guard.clear_attempts = 1
+    coordinator.retained_task_guard.clear_acknowledged_at = now.isoformat()
+    coordinator.retained_task_guard.dock_clear_attempts = 1
+    coordinator.retained_task_guard.dock_clear_requested_at = now.isoformat()
+    coordinator._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            coordinator
+        )
+    )
+
+    restored = _RecoverableFailureCoordinator()
+    restored.active_run = None
+    restored.manual_run = None
+    restored.config[const.CONF_STALE_RESUME_AUTO_CLEAR] = True
+    restored.config[const.CONF_IDENTIFIER] = "robot"
+    restored._store = _MemoryStore(coordinator._store.data)
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_load_store(restored)
+    )
+    restored.set_state(restored.vacuum_entity, "docked")
+    restored.set_state("sensor.robot_status_flag", "none")
+    restored.set_state("sensor.robot_dock_status", "pause")
+    restored.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(
+        restored._async_reconcile_retained_task(
+            now,
+            allow_clear=True,
+            restored=True,
+        )
+    )
+
+    assert restored.retained_task_guard is not None
+    assert (
+        restored.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert "dock_action" not in _service_names(restored)
+
+
+@pytest.mark.parametrize(
+    "clear_order",
+    [
+        ("status", "dock"),
+        ("dock", "status"),
+    ],
+)
+def test_stop_ack_waits_for_coherent_flag_and_dock_then_continues_session(
+    monkeypatch,
+    clear_order,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert coordinator.started_rooms == []
+
+    for index, transition in enumerate(clear_order, start=1):
+        current[0] = now + timedelta(seconds=index)
+        if transition == "status":
+            coordinator.set_state("sensor.robot_status_flag", "none")
+        else:
+            coordinator.set_state("sensor.robot_dock_status", "idle")
+        if index == 2:
+            coordinator.set_state(coordinator.vacuum_entity, "idle")
+        ready = asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        assert ready is (index == 2)
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_CLEARED
+    )
+    original_session = coordinator.session
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.session is original_session
+    assert coordinator.started_rooms == ["room_one"]
+    assert _service_names(coordinator).count("stop") == 1
+
+
+def test_stop_ack_requires_retained_settle_window(monkeypatch) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    coordinator.config[const.CONF_STALE_RESUME_SETTLE] = 60
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    current[0] = now + timedelta(seconds=2)
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is False
+    )
+    assert coordinator.retained_task_guard is not None
+    assert coordinator.retained_task_guard.clear_deadline is None
+    assert coordinator._retained_task_next_deadline() == (
+        current[0] + timedelta(seconds=60)
+    )
+    current[0] += timedelta(seconds=61)
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is True
+    )
+
+
+def test_elapsed_retained_deadline_schedules_immediate_reconciliation(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=False,
+        stale=True,
+    )
+    coordinator.session = None
+    assert coordinator.retained_task_guard is not None
+    coordinator.retained_task_guard.stale_deadline = (
+        now - timedelta(seconds=1)
+    ).isoformat()
+    reconciliations = []
+
+    async def reconcile_retained_task(
+        observed_at,
+        *,
+        allow_clear,
+        restored=False,
+    ) -> bool:
+        reconciliations.append((observed_at, allow_clear, restored))
+        coordinator.retained_task_guard.stale_deadline = (
+            now + timedelta(seconds=60)
+        ).isoformat()
+        return False
+
+    coordinator._async_reconcile_retained_task = reconcile_retained_task
+    coordinator.hass.async_create_task = lambda coroutine: asyncio.run(
+        coroutine
+    )
+
+    coordinator._schedule_retained_task_timer()
+
+    assert reconciliations == [(now, False, False)]
+    assert coordinator._retained_task_reconcile_scheduled is False
+
+    coordinator._schedule_retained_task_timer()
+
+    assert reconciliations == [(now, False, False)]
+    assert coordinator._retained_task_timer_cancel is not None
+
+
+def test_restart_before_stop_publish_never_replays_uncertain_command(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+        phase=logic.RETAINED_TASK_PHASE_CLEAR_PENDING,
+    )
+    assert coordinator.retained_task_guard is not None
+    coordinator.retained_task_guard.clear_attempts = 1
+    coordinator.retained_task_guard.clear_requested_at = now.isoformat()
+    coordinator._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            coordinator
+        )
+    )
+
+    restored = _RecoverableFailureCoordinator()
+    restored.active_run = None
+    restored.manual_run = None
+    restored._store = _MemoryStore(coordinator._store.data)
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_load_store(restored)
+    )
+    restored.set_state(restored.vacuum_entity, "docked")
+    restored.set_state("sensor.robot_status_flag", "resumable")
+    restored.set_state("sensor.robot_dock_status", "pause")
+    restored.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(
+        restored._async_reconcile_retained_task(
+            now,
+            allow_clear=True,
+            restored=True,
+        )
+    )
+
+    assert restored.retained_task_guard is not None
+    assert (
+        restored.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert "stop" not in _service_names(restored)
+
+
+def test_restart_after_stop_publish_waits_without_duplicate(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+        phase=logic.RETAINED_TASK_PHASE_VERIFYING,
+    )
+    assert coordinator.retained_task_guard is not None
+    coordinator.retained_task_guard.clear_attempts = 1
+    coordinator.retained_task_guard.clear_requested_at = now.isoformat()
+    coordinator.retained_task_guard.clear_published_at = now.isoformat()
+    coordinator.retained_task_guard.clear_deadline = (
+        now + timedelta(seconds=30)
+    ).isoformat()
+    coordinator._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            coordinator
+        )
+    )
+
+    restored = _RecoverableFailureCoordinator()
+    restored.active_run = None
+    restored.manual_run = None
+    restored._store = _MemoryStore(coordinator._store.data)
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_load_store(restored)
+    )
+    restored.set_state(restored.vacuum_entity, "docked")
+    restored.set_state("sensor.robot_status_flag", "resumable")
+    restored.set_state("sensor.robot_dock_status", "pause")
+    restored.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(
+        restored._async_reconcile_retained_task(
+            now + timedelta(seconds=1),
+            allow_clear=True,
+            restored=True,
+        )
+    )
+
+    assert restored.retained_task_guard is not None
+    assert (
+        restored.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_VERIFYING
+    )
+    assert "stop" not in _service_names(restored)
+
+
+def test_owned_native_resume_never_enters_stale_clear_path() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_STALE_RESUME_AUTO_CLEAR] = True
+    _trigger_low_battery(coordinator)
+
+    ready = asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            datetime.now(UTC),
+            allow_clear=True,
+        )
+    )
+
+    assert ready is False
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.native_resume_pending is True
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OWNED_NATIVE_RESUME
+    )
+    assert "stop" not in _service_names(coordinator)
+
+
+def test_external_cleaning_is_observed_without_commands_or_settings() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.manual_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.config[const.CONF_STALE_RESUME_AUTO_CLEAR] = True
+    coordinator.config[const.CONF_PASSES_ENTITY] = "input_select.robot_passes"
+    coordinator.set_state("input_select.robot_passes", "3")
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.owner
+        == logic.RETAINED_TASK_OWNER_UNKNOWN
+    )
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+    )
+    assert coordinator.started_rooms == []
+    assert "stop" not in _service_names(coordinator)
+    assert "start" not in _service_names(coordinator)
+    assert "select_option" not in _service_names(coordinator)
+
+
+def test_arrival_cancels_session_without_stopping_unknown_task() -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=False,
+        stale=True,
+    )
+    coordinator.set_state("person.owner", "home")
+
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session is not None
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert "stop" not in _service_names(coordinator)
+    assert "return_to_base" not in _service_names(coordinator)
+
+
+def test_arrival_does_not_repeat_consumed_retained_stop() -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+        owner=logic.RETAINED_TASK_OWNER_COORDINATOR,
+        phase=logic.RETAINED_TASK_PHASE_VERIFYING,
+    )
+    assert coordinator.retained_task_guard is not None
+    coordinator.retained_task_guard.clear_attempts = 1
+    coordinator.retained_task_guard.clear_requested_at = now.isoformat()
+    coordinator.retained_task_guard.clear_published_at = now.isoformat()
+    coordinator.set_state("person.owner", "home")
+
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session is not None
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert "stop" not in _service_names(coordinator)
+    assert "return_to_base" not in _service_names(coordinator)
+
+
+def test_incident_event_order_retains_manual_ownership_and_blocks_preflight(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 24, 17, 48, 9, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = None
+    coordinator.set_state("person.owner", "home")
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    _handle_event(coordinator, coordinator.vacuum_entity, "cleaning")
+
+    assert coordinator.manual_run is not None
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.owner
+        == logic.RETAINED_TASK_OWNER_MANUAL
+    )
+
+    current[0] += timedelta(seconds=43)
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    _handle_event(
+        coordinator,
+        "sensor.robot_error",
+        "Mop Dock Wastewater Tank not installed or full",
+    )
+    _handle_event(coordinator, "sensor.robot_dock_status", "pause")
+
+    current[0] = datetime(2026, 8, 24, 22, 28, 7, tzinfo=UTC)
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+    assert coordinator.manual_run is not None
+    _handle_event(coordinator, "sensor.robot_status_flag", "resumable")
+    _handle_event(coordinator, "sensor.robot_error", "No error")
+
+    assert coordinator.manual_run is not None
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.owner
+        == logic.RETAINED_TASK_OWNER_MANUAL
+    )
+
+    current[0] = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    coordinator.set_state("person.owner", "not_home")
+    coordinator.session = logic.SessionState(
+        session_id="next-away",
+        started_at=current[0].isoformat(),
+    )
+    coordinator.retained_task_guard.last_material_activity_at = (
+        current[0] - timedelta(hours=11)
+    ).isoformat()
+    coordinator.retained_task_guard.coherent_since = (
+        current[0] - timedelta(hours=11)
+    ).isoformat()
+    coordinator.config[const.CONF_STALE_RESUME_AUTO_CLEAR] = False
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.settings_prepared is False
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+    )
+    assert "stop" not in _service_names(coordinator)

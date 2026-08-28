@@ -1,0 +1,40 @@
+valetudo_vacuum_coordinator:
+  status_observers:
+    - id: main_floor
+      name: Main Floor Vacuum
+      vacuum_entity: vacuum.valetudo_exaltedsneakydeer
+      error_entity: sensor.valetudo_exaltedsneakydeer_error
+      status_flag_entity: sensor.valetudo_exaltedsneakydeer_status_flag
+      dock_status_entity: sensor.valetudo_exaltedsneakydeer_dock_status
+      battery_entity: sensor.valetudo_exaltedsneakydeer_battery_level
+      outage_confirmation_seconds: 180
+      conditions:
+        - entity_id: binary_sensor.main_floor_vacuum_coordinator_native_resume_pending
+          code: vacuum.task_resume_pending
+          source: coordinator
+          active_states:
+            - "on"
+
+    - id: music_room
+      name: Music Room Vacuum
+      vacuum_entity: vacuum.valetudo_elatedusedram
+      error_entity: sensor.valetudo_elatedusedram_error
+      status_flag_entity: sensor.valetudo_elatedusedram_status_flag
+      dock_status_entity: sensor.valetudo_elatedusedram_dock_status
+      battery_entity: sensor.valetudo_elatedusedram_battery_level
+      outage_confirmation_seconds: 180
+      conditions:
+        - entity_id: input_boolean.music_room_vacuum_fallback_active
+          code: vacuum.scheduled_vacuum_only_fallback
+          source: automation
+          active_states:
+            - "on"
+
+    - id: theater_room
+      name: Theater Room Vacuum
+      vacuum_entity: vacuum.valetudo_politefatherlykingfisher
+      error_entity: sensor.valetudo_politefatherlykingfisher_error
+      status_flag_entity: sensor.valetudo_politefatherlykingfisher_status_flag
+      dock_status_entity: sensor.valetudo_politefatherlykingfisher_dock_status
+      battery_entity: sensor.valetudo_politefatherlykingfisher_battery_level
+      outage_confirmation_seconds: 180
