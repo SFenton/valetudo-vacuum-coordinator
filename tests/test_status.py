@@ -361,7 +361,7 @@ def test_manifest_and_runtime_versions_match() -> None:
     manifest = json.loads(
         (PACKAGE / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["version"] == const.VERSION == "0.2.0"
+    assert manifest["version"] == const.VERSION == "0.3.0"
 
 
 def test_legacy_and_structured_configs_split_without_changing_legacy_shape() -> None:

@@ -88,6 +88,7 @@ def typed_deferral(
 
 def test_clean_water_fallback_is_enabled_by_default():
     assert const.DEFAULT_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED is True
+    assert const.DEFAULT_STALE_RESUME_AUTO_CLEAR is False
 
 
 def test_pick_next_room_prefers_oldest_success():
@@ -331,9 +332,14 @@ def test_mop_block_can_fall_back_to_vacuum_only():
     assert skipped == []
 
 
-def test_dustbag_error_blocks_all_pending_rooms():
+def test_dustbag_error_defers_mop_but_allows_native_vacuum_room():
     rooms = [
-        logic.RoomConfig(room_id="room_one", name="Room One", segment_id="1"),
+        logic.RoomConfig(
+            room_id="room_one",
+            name="Room One",
+            segment_id="1",
+            mop_required=True,
+        ),
         logic.RoomConfig(room_id="room_two", name="Room Two", segment_id="2"),
     ]
 
@@ -345,10 +351,11 @@ def test_dustbag_error_blocks_all_pending_rooms():
         allow_vacuum_only_when_mop_blocked=False,
     )
 
-    assert selection is None
+    assert selection is not None
+    assert selection.room.room_id == "room_two"
+    assert selection.vacuum_only is True
     assert [(room.room_id, reason) for room, reason in skipped] == [
         ("room_one", "dustbag is full"),
-        ("room_two", "dustbag is full"),
     ]
 
 
@@ -615,7 +622,7 @@ def test_run_success_tolerates_only_exact_allowed_clean_water_error():
         session_id="session",
         started_at=logic.utcnow_iso(),
         vacuum_only=True,
-        allowed_error_fingerprint="mop dock clean water tank empty",
+        allowed_error_fingerprint="mop.clean_water_empty",
         observed_cleaning=True,
         observed_segment_cleaning=True,
     )
@@ -750,7 +757,12 @@ def test_v012_active_run_migrates_with_passive_resume_defaults():
         "docked_at",
         "interruption_count",
         "requested_iterations",
+        "observed_iteration_count",
+        "iteration_evidence_source",
+        "segment_iteration_active",
+        "segment_iteration_counted",
         "recovery_deadline",
+        "dispatch_failure_code",
         "resume_required",
         "post_suspend_cleaning_observed",
         "post_suspend_segment_observed",
@@ -790,7 +802,7 @@ def test_active_run_native_resume_metadata_round_trips():
         command_published=True,
         vacuum_only=True,
         fallback_vacuum=True,
-        allowed_error_fingerprint="mop dock clean water tank empty",
+        allowed_error_fingerprint="mop.clean_water_empty",
         phase=logic.RUN_PHASE_SUSPENDED,
         suspended_at="2026-08-04T12:10:00+00:00",
         suspend_reason="Low battery",
@@ -800,6 +812,7 @@ def test_active_run_native_resume_metadata_round_trips():
         interruption_count=2,
         requested_iterations=3,
         dispatch_deadline="2026-08-04T12:01:00+00:00",
+        dispatch_failure_code="dispatch.start_timeout",
         recovery_deadline="2026-08-04T15:10:00+00:00",
         resume_required=True,
         accumulated_area=12.5,
@@ -808,10 +821,36 @@ def test_active_run_native_resume_metadata_round_trips():
         last_time=610,
         cancel_continue_session=True,
     )
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    run.clear_segment_iteration()
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
 
     restored = logic.ActiveRun.from_dict(run.to_dict())
 
     assert restored == run
+
+
+def test_legacy_clean_water_fingerprint_migrates_to_stable_code():
+    restored = logic.ActiveRun.from_dict(
+        {
+            "room_id": "room_one",
+            "segment_id": "1",
+            "session_id": "session",
+            "started_at": logic.utcnow_iso(),
+            "allowed_error_fingerprint": (
+                "Mop Dock Clean Water Tank empty"
+            ),
+        }
+    )
+
+    assert restored is not None
+    assert restored.allowed_error_fingerprint == "mop.clean_water_empty"
 
 
 def test_mark_success_updates_attempted_and_counts():
@@ -1583,6 +1622,12 @@ def test_session_state_round_trips_terminal_details():
         degraded_at="2026-08-18T20:46:40+00:00",
         terminal_cause="queue_exhausted",
         blocked_reason="dock status is pause",
+        degraded_mode_attempts=4,
+        degraded_mode_next_retry_at="2026-08-18T21:00:00+00:00",
+        dispatch_failure_counts={"room_five": 3},
+        dispatch_failure_reasons={"room_five": "dispatch timed out"},
+        dispatch_failure_fingerprints={"room_five": "fingerprint"},
+        dispatch_escalated_room_ids=["room_five"],
     )
     session.mark_completed("room_one")
     session.mark_skipped("room_two", "clean water empty")
@@ -1609,6 +1654,12 @@ def test_session_state_round_trips_terminal_details():
     assert restored.native_guard_stop_confirmed is True
     assert restored.native_guard_return_confirmed is False
     assert restored.native_guard_cancel_reason == "test cancel"
+    assert restored.degraded_mode_attempts == 4
+    assert restored.degraded_mode_next_retry_at == (
+        "2026-08-18T21:00:00+00:00"
+    )
+    assert restored.dispatch_failure_counts == {"room_five": 3}
+    assert restored.dispatch_escalated_room_ids == ["room_five"]
 
 
 def test_retained_task_guard_round_trips_recovery_state():
@@ -1643,3 +1694,233 @@ def test_retained_task_guard_round_trips_recovery_state():
     restored = logic.RetainedTaskGuard.from_dict(guard.to_dict())
 
     assert restored == guard
+
+
+def test_blocker_classification_defaults_unknown_errors_to_recoverable():
+    blocker = logic.classify_blocker(
+        logic.ResourceState(error="New firmware error 777")
+    )
+
+    assert blocker is not None
+    assert blocker.recoverable is True
+    assert blocker.code == "error.recoverable_unknown"
+
+    fatal = logic.classify_blocker(
+        logic.ResourceState(error="Unrecoverable main board failure")
+    )
+    assert fatal is not None
+    assert fatal.recoverable is False
+    assert fatal.code == "error.unrecoverable"
+
+
+def test_resource_blockers_classify_safe_native_vacuum_continuation():
+    blocker = logic.classify_blocker(
+        logic.ResourceState(fresh_water="empty")
+    )
+
+    assert blocker is not None
+    assert blocker.recoverable is True
+    assert blocker.vacuum_only_safe is True
+    assert blocker.waiting_for_physical_fix is True
+
+    wastewater = logic.classify_blocker(
+        logic.ResourceState(dirty_water="full")
+    )
+    assert wastewater is not None
+    assert wastewater.recoverable is True
+    assert wastewater.vacuum_only_safe is True
+
+    real_error = logic.classify_blocker(
+        logic.ResourceState(
+            error="Main brush jammed",
+            dirty_water="unknown",
+            detergent="unavailable",
+            dustbag="unknown",
+        )
+    )
+    assert real_error is not None
+    assert real_error.code == "error.recoverable_unknown"
+    assert real_error.vacuum_only_safe is False
+
+
+def test_floor_completion_evidence_separates_dock_fault_from_floor_work():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        mop_required=True,
+        min_duration=150,
+        min_area=10,
+    )
+    run = logic.ActiveRun(
+        room_id="dining",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_area=0,
+        start_time=0,
+        requested_iterations=2,
+        observed_cleaning=True,
+        phase=logic.RUN_PHASE_DOCK_INTERRUPT,
+    )
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    run.clear_segment_iteration()
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+
+    evidence = logic.evaluate_floor_completion_evidence(
+        room,
+        run,
+        end_area=15,
+        end_time=2040,
+        vacuum_state="error",
+        status_flag="none",
+        dock_status="cleaning",
+    )
+
+    assert evidence.status == "completed"
+    assert evidence.duration == 2040
+    assert evidence.area == 15
+
+
+def test_salvage_without_status_flag_remains_uncertain():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        min_duration=150,
+    )
+    run = logic.ActiveRun(
+        room_id="dining",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=0,
+        requested_iterations=2,
+        observed_cleaning=True,
+    )
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    run.clear_segment_iteration()
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+
+    evidence = logic.evaluate_floor_completion_evidence(
+        room,
+        run,
+        end_area=None,
+        end_time=500,
+        vacuum_state="docked",
+        status_flag=None,
+        dock_status="idle",
+    )
+
+    assert evidence.status == "uncertain"
+
+
+def test_partial_iteration_evidence_is_uncertain_not_full_credit():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        min_duration=150,
+    )
+    run = logic.ActiveRun(
+        room_id="dining",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=0,
+        observed_cleaning=True,
+        requested_iterations=2,
+        resume_required=True,
+        phase=logic.RUN_PHASE_SUSPENDED,
+    )
+    run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+
+    evidence = logic.evaluate_floor_completion_evidence(
+        room,
+        run,
+        end_area=None,
+        end_time=500,
+        vacuum_state="docked",
+        status_flag="resumable",
+        dock_status="pause",
+    )
+
+    assert evidence.status == "uncertain"
+    assert "iterations" in (evidence.reason or "")
+
+
+def test_statistics_total_alone_never_grants_floor_credit():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        min_duration=150,
+    )
+    run = logic.ActiveRun(
+        room_id="dining",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=0,
+        requested_iterations=2,
+    )
+
+    evidence = logic.evaluate_floor_completion_evidence(
+        room,
+        run,
+        end_area=100,
+        end_time=4000,
+        vacuum_state="docked",
+        status_flag="none",
+        dock_status="idle",
+    )
+
+    assert evidence.status == "incomplete"
+    assert evidence.reason == "Vacuum never entered cleaning state"
+
+
+def test_iteration_evidence_counts_distinct_segment_cycles_and_persists():
+    run = logic.ActiveRun(
+        room_id="dining",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        requested_iterations=2,
+    )
+
+    assert run.observe_segment_iteration(
+        source="status_before_cleaning",
+        count_new_iteration=False,
+    )
+    assert run.observed_iteration_count == 0
+    assert run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    assert run.observed_iteration_count == 1
+    assert run.clear_segment_iteration()
+    assert run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+
+    restored = logic.ActiveRun.from_dict(run.to_dict())
+
+    assert restored is not None
+    assert restored.observed_iteration_count == 2
+    assert restored.iteration_evidence_source == "status_segment_transition"

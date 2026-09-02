@@ -22,6 +22,7 @@ from .const import (
     CONF_AWAY_DELAY,
     CONF_BATTERY_ENTITY,
     CONF_BLOCKED_SESSION_TIMEOUT,
+    CONF_RESOURCE_SETTLE,
     CONF_CANCEL_ANY_AWAY_RUN_ON_ARRIVAL,
     CONF_COORDINATORS,
     CONF_CURRENT_AREA_ENTITY,
@@ -91,6 +92,7 @@ from .const import (
     DEFAULT_NATIVE_RESUME_TIMEOUT,
     DEFAULT_DOCK_SETTLE,
     DEFAULT_BLOCKED_SESSION_TIMEOUT,
+    DEFAULT_RESOURCE_SETTLE,
     DEFAULT_DISPATCH_START_TIMEOUT,
     DEFAULT_RESUME_NUDGE_ENABLED,
     DEFAULT_MODE_MOP_OPTION,
@@ -179,7 +181,11 @@ COORDINATOR_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_BLOCKED_SESSION_TIMEOUT,
             default=DEFAULT_BLOCKED_SESSION_TIMEOUT,
-        ): cv.positive_int,
+        ): vol.All(vol.Coerce(int), vol.Range(min=1)),
+        vol.Optional(
+            CONF_RESOURCE_SETTLE,
+            default=DEFAULT_RESOURCE_SETTLE,
+        ): vol.All(vol.Coerce(int), vol.Range(min=0)),
         vol.Optional(
             CONF_STALE_RESUME_AUTO_CLEAR,
             default=DEFAULT_STALE_RESUME_AUTO_CLEAR,

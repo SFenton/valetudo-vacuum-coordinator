@@ -13,21 +13,23 @@ valetudo_vacuum_coordinator:
   away_delay: 300
   min_battery: 55
   # Retain the firmware's native task through charging and mop-rinse interruptions.
-  # No fresh segment or vacuum.start fallback is issued on timeout.
+  # If firmware clears the retained task after recharge, one acknowledged stop
+  # precedes a safe room retry; vacuum.start is never used as a nudge.
   native_resume_enabled: true
   native_resume_timeout: 10800
   dock_settle: 60
   dispatch_start_timeout: 120
-  # Applies to ordinary resource blocks; battery/charging/resumable waits use
-  # native_resume_timeout only when the task is coordinator-owned.
+  # Bounded retry cadence for recoverable waits; it no longer ends a session.
   blocked_session_timeout: 300
-  # Classify stale unowned resumable work without commands by default. Enable
-  # only after confirming vacuum.stop clears the retained task on this model.
+  # Debounce component-sensor faults during active floor accounting.
+  resource_settle: 3
+  # Shadow-safe by default for unowned stale tasks. Enable only after
+  # validating vacuum.stop on this robot model.
   stale_resume_auto_clear: false
   stale_resume_age: 1800
   stale_resume_settle: 60
   stale_resume_clear_timeout: 30
-  # Reserved for future opt-in behavior; v0.1.3 keeps this inert.
+  # Reserved for compatibility; v0.3.0 keeps this inert.
   resume_nudge_enabled: false
 
   # MQTT topics are case-sensitive; replace `robot` with the exact Valetudo MQTT identifier.
@@ -62,8 +64,8 @@ valetudo_vacuum_coordinator:
   detergent_entity: sensor.valetudo_robot_detergent_dock_component
   dustbag_entity: sensor.valetudo_robot_dustbag_dock_component
 
-  # After an exact clean-water-empty fault, finish configured vacuum-only
-  # rooms first, then vacuum each incomplete mop room once without full credit.
+  # Native vacuum-only rooms always continue during a clean-water blocker.
+  # This option controls only fallback vacuuming of mop-required rooms.
   allow_vacuum_only_when_mop_blocked: true
   cancel_any_away_run_on_arrival: true
   manual_tracking: true

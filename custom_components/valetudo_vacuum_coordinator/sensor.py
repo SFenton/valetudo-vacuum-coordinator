@@ -12,6 +12,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     ATTR_ACTIVE_ROOM,
     ATTR_BLOCKED_REASON,
+    ATTR_BLOCKER_CODE,
+    ATTR_BLOCKER_DISPOSITION,
+    ATTR_BLOCKER_OPERATOR_ACTION,
     ATTR_CANCELLED,
     ATTR_COMPLETED_ROOMS,
     ATTR_DEFERRED_FULL_CLEAN_REASONS,
@@ -48,12 +51,19 @@ from .const import (
     ATTR_SKIPPED_REASONS,
     ATTR_SKIPPED_ROOMS,
     ATTR_NEEDS_HELP,
+    ATTR_NEXT_RETRY_AT,
     ATTR_NOTIFICATION_SENT,
+    ATTR_PRESERVED_ROOMS,
+    ATTR_RECOVERY_PHASE,
+    ATTR_RECOVERY_STARTED_AT,
     ATTR_SUCCESSFUL_COUNT,
     ATTR_TERMINAL_MESSAGE,
     ATTR_TERMINAL_REASON,
     ATTR_TERMINAL_CAUSE,
+    ATTR_UNCERTAIN_REASONS,
+    ATTR_UNCERTAIN_ROOMS,
     ATTR_VACUUM_ONLY,
+    ATTR_WAITING_FOR_PHYSICAL_FIX,
     ATTR_WHILE_AWAY_CLEANED,
     ATTR_WHILE_AWAY_ISSUES,
     ATTR_WHILE_AWAY_OUTCOMES,
@@ -158,6 +168,10 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_FAILED_ROOMS: session.failed_room_ids if session else [],
             ATTR_SKIPPED_REASONS: session.skipped_room_reasons if session else {},
             ATTR_FAILED_REASONS: session.failed_room_reasons if session else {},
+            ATTR_UNCERTAIN_ROOMS: session.uncertain_room_ids if session else [],
+            ATTR_UNCERTAIN_REASONS: (
+                session.uncertain_room_reasons if session else {}
+            ),
             ATTR_FALLBACK_ATTEMPTED_ROOMS: (
                 session.fallback_attempted_room_ids if session else []
             ),
@@ -179,6 +193,31 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_DEGRADED_REASON: session.degraded_reason if session else None,
             ATTR_DEGRADED_AT: session.degraded_at if session else None,
             ATTR_BLOCKED_REASON: session.blocked_reason if session else None,
+            ATTR_BLOCKER_CODE: session.blocker_code if session else None,
+            ATTR_BLOCKER_DISPOSITION: (
+                session.blocker_disposition if session else None
+            ),
+            ATTR_BLOCKER_OPERATOR_ACTION: (
+                session.blocker_operator_action if session else None
+            ),
+            ATTR_RECOVERY_PHASE: session.recovery_phase if session else None,
+            ATTR_RECOVERY_STARTED_AT: (
+                session.recovery_started_at if session else None
+            ),
+            ATTR_NEXT_RETRY_AT: session.next_retry_at if session else None,
+            ATTR_WAITING_FOR_PHYSICAL_FIX: (
+                session.waiting_for_physical_fix if session else False
+            ),
+            "recovery_notification_attempts": (
+                session.recovery_notification_attempts if session else 0
+            ),
+            "recovery_notification_sent": (
+                session.recovery_notification_sent if session else False
+            ),
+            "last_recovery_notification_at": (
+                session.last_recovery_notification_at if session else None
+            ),
+            ATTR_PRESERVED_ROOMS: self.coordinator.preserved_room_ids,
             ATTR_RAW_ERROR: self.coordinator.error_state,
             ATTR_TERMINAL_REASON: session.terminal_reason if session else None,
             ATTR_TERMINAL_MESSAGE: session.terminal_message if session else None,
@@ -190,6 +229,44 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ),
             "settings_prepared": (
                 session.settings_prepared if session else False
+            ),
+            "degraded_dock_stop_attempts": (
+                session.degraded_dock_stop_attempts if session else 0
+            ),
+            "degraded_dock_stop_requested_at": (
+                session.degraded_dock_stop_requested_at if session else None
+            ),
+            "degraded_dock_stop_acknowledged_at": (
+                session.degraded_dock_stop_acknowledged_at
+                if session
+                else None
+            ),
+            "degraded_mode_attempts": (
+                session.degraded_mode_attempts if session else 0
+            ),
+            "degraded_mode_acknowledged_at": (
+                session.degraded_mode_acknowledged_at if session else None
+            ),
+            "degraded_mode_next_retry_at": (
+                session.degraded_mode_next_retry_at if session else None
+            ),
+            "degraded_mode_last_error": (
+                session.degraded_mode_last_error if session else None
+            ),
+            "dispatch_failure_counts": (
+                session.dispatch_failure_counts if session else {}
+            ),
+            "dispatch_failure_reasons": (
+                session.dispatch_failure_reasons if session else {}
+            ),
+            "dispatch_retry_not_before": (
+                session.dispatch_retry_not_before if session else {}
+            ),
+            "dispatch_escalated_rooms": (
+                session.dispatch_escalated_room_ids if session else []
+            ),
+            "last_command_recovery": (
+                session.last_command_recovery if session else {}
             ),
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
             ATTR_WHILE_AWAY_ISSUES: self.coordinator.while_away_issue_messages,
@@ -235,6 +312,45 @@ class ValetudoCurrentRoomSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_REQUESTED_ITERATIONS: (
                 run.requested_iterations if run else None
             ),
+            "observed_iteration_count": (
+                run.observed_iteration_count if run else 0
+            ),
+            "iteration_evidence_source": (
+                run.iteration_evidence_source if run else None
+            ),
+            "command_published": run.command_published if run else False,
+            "command_publish_requested_at": (
+                run.command_publish_requested_at if run else None
+            ),
+            "command_publish_acknowledged_at": (
+                run.command_publish_acknowledged_at if run else None
+            ),
+            "start_confirmed_at": run.start_confirmed_at if run else None,
+            "cancel_stop_attempts": run.cancel_stop_attempts if run else 0,
+            "cancel_stop_requested_at": (
+                run.cancel_stop_requested_at if run else None
+            ),
+            "cancel_stop_published_at": (
+                run.cancel_stop_published_at if run else None
+            ),
+            "cancel_stop_acknowledged_at": (
+                run.cancel_stop_acknowledged_at if run else None
+            ),
+            "cancel_stop_physical_acknowledged_at": (
+                run.cancel_stop_physical_acknowledged_at if run else None
+            ),
+            "cancel_return_attempts": (
+                run.cancel_return_attempts if run else 0
+            ),
+            "cancel_return_acknowledged_at": (
+                run.cancel_return_acknowledged_at if run else None
+            ),
+            "floor_completion_status": (
+                run.floor_completion_status if run else None
+            ),
+            "floor_completion_reason": (
+                run.floor_completion_reason if run else None
+            ),
         }
 
 
@@ -260,6 +376,7 @@ class ValetudoQueueSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_PENDING_ROOMS: [
                 room.room_id for room in self.coordinator.pending_rooms
             ],
+            ATTR_PRESERVED_ROOMS: self.coordinator.preserved_room_ids,
             ATTR_DEFERRED_FULL_CLEAN_ROOMS: (
                 session.deferred_full_clean_room_ids if session else []
             ),

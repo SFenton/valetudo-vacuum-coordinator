@@ -49,6 +49,18 @@ LOW_BATTERY_ERROR_KEYWORDS = (
     "battery low",
 )
 
+# Unknown robot errors are intentionally recoverable. Permanent termination is
+# reserved for explicit fatal/unrecoverable wording so new firmware errors do
+# not silently strand an away queue.
+UNRECOVERABLE_ERROR_KEYWORDS = (
+    "unrecoverable",
+    "fatal error",
+    "fatal hardware failure",
+    "fatal internal error",
+    "permanent failure",
+    "permanent hardware failure",
+)
+
 CLEAN_WATER_EMPTY_ERROR_VALUES = {
     "mop dock clean water tank empty",
     "clean water tank empty",
@@ -56,8 +68,6 @@ CLEAN_WATER_EMPTY_ERROR_VALUES = {
     "fresh water tank empty",
     "freshwater tank empty",
 }
-CLEAN_WATER_EMPTY_DISPOSITION = "__clean_water_empty__"
-
 RUN_PHASE_DISPATCHING = "dispatching"
 RUN_PHASE_CLEANING = "cleaning"
 RUN_PHASE_DOCK_INTERRUPT = "dock_interrupt"
@@ -114,11 +124,20 @@ RETAINED_TASK_PHASES = {
 
 WRONG_ROOM_FAILURE_PREFIX = "Estimated segment dwell was dominated by"
 
-OUTCOME_CONTRACT_VERSION = 1
+OUTCOME_CONTRACT_VERSION = 2
 OUTCOME_EVENT_TYPES = {"attempt", "deferral"}
 OUTCOME_ATTEMPT_MODES = {"vacuum", "vacuum_mop", "fallback_vacuum"}
-OUTCOME_ATTEMPT_RESULTS = {"completed", "failed", "interrupted"}
+OUTCOME_ATTEMPT_RESULTS = {
+    "completed",
+    "failed",
+    "interrupted",
+    "partial",
+    "uncertain",
+}
 OUTCOME_OPERATIONS = {"vacuum", "vacuum_mop", "mop"}
+
+BLOCKER_RECOVERABLE = "recoverable"
+BLOCKER_UNRECOVERABLE = "unrecoverable"
 
 
 def schedule_hass_task(hass: Any, coroutine: Any) -> None:
@@ -205,6 +224,34 @@ class ResourceState:
     mop_attached: bool | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class BlockerClassification:
+    """Typed dispatch blocker and its recovery policy."""
+
+    code: str
+    disposition: str
+    category: str
+    reason: str
+    operator_action: str
+    waiting_for_physical_fix: bool = False
+    vacuum_only_safe: bool = False
+
+    @property
+    def recoverable(self) -> bool:
+        """Return whether the same logical session must keep retrying."""
+        return self.disposition == BLOCKER_RECOVERABLE
+
+
+@dataclass(slots=True, frozen=True)
+class FloorCompletionEvidence:
+    """Floor-work conclusion independent from later dock servicing."""
+
+    status: str
+    reason: str | None = None
+    duration: float | None = None
+    area: float | None = None
+
+
 @dataclass(slots=True)
 class RoomSelection:
     """Result of selecting a room to clean."""
@@ -231,6 +278,9 @@ class ActiveRun:
     allowed_error_fingerprint: str | None = None
     cancelled: bool = False
     command_published: bool = False
+    command_publish_requested_at: str | None = None
+    command_publish_acknowledged_at: str | None = None
+    start_confirmed_at: str | None = None
     phase: str = RUN_PHASE_DISPATCHING
     observed_cleaning: bool = False
     observed_segment_cleaning: bool = False
@@ -242,7 +292,12 @@ class ActiveRun:
     docked_at: str | None = None
     interruption_count: int = 0
     requested_iterations: int = 2
+    observed_iteration_count: int = 0
+    iteration_evidence_source: str | None = None
+    segment_iteration_active: bool = False
+    segment_iteration_counted: bool = False
     dispatch_deadline: str | None = None
+    dispatch_failure_code: str | None = None
     recovery_deadline: str | None = None
     resume_required: bool = False
     post_suspend_cleaning_observed: bool = False
@@ -254,7 +309,21 @@ class ActiveRun:
     cancel_requested_at: str | None = None
     cancel_reason: str | None = None
     cancel_stop_attempted: bool = False
+    cancel_stop_attempts: int = 0
+    cancel_stop_requested_at: str | None = None
+    cancel_stop_published_at: str | None = None
+    cancel_stop_acknowledged_at: str | None = None
+    cancel_stop_physical_acknowledged_at: str | None = None
+    cancel_ack_deadline: str | None = None
+    cancel_return_attempts: int = 0
+    cancel_return_requested_at: str | None = None
+    cancel_return_acknowledged_at: str | None = None
     cancel_continue_session: bool = False
+    cancel_requeue_room: bool = False
+    cancel_outcome_result: str | None = None
+    floor_completion_status: str | None = None
+    floor_completion_reason: str | None = None
+    floor_completion_recorded_at: str | None = None
     last_estimated_room_id: str | None = None
     last_estimated_changed_at: str | None = None
     estimated_dwell_seconds: dict[str, float] = field(default_factory=dict)
@@ -264,6 +333,35 @@ class ActiveRun:
     def native_resume_pending(self) -> bool:
         """Return whether the run is waiting on retained native-task recovery."""
         return self.phase in NATIVE_RESUME_PENDING_PHASES
+
+    def observe_segment_iteration(
+        self,
+        *,
+        source: str,
+        count_new_iteration: bool,
+    ) -> bool:
+        """Persist conservative evidence for a newly observed segment cycle."""
+        changed = False
+        if not self.observed_segment_cleaning:
+            self.observed_segment_cleaning = True
+            changed = True
+        if not self.segment_iteration_active:
+            self.segment_iteration_active = True
+            changed = True
+        if count_new_iteration and not self.segment_iteration_counted:
+            self.observed_iteration_count += 1
+            self.iteration_evidence_source = source
+            self.segment_iteration_counted = True
+            changed = True
+        return changed
+
+    def clear_segment_iteration(self) -> bool:
+        """Allow a later segment transition to prove another iteration."""
+        if not self.segment_iteration_active:
+            return False
+        self.segment_iteration_active = False
+        self.segment_iteration_counted = False
+        return True
 
     def checkpoint_statistics(
         self,
@@ -332,6 +430,32 @@ class ActiveRun:
                 phase = RUN_PHASE_CLEANING
             else:
                 phase = RUN_PHASE_DISPATCHING
+        has_v03_cancel_state = (
+            "cancel_stop_attempts" in data
+            or "cancel_stop_acknowledged_at" in data
+            or "cancel_stop_published_at" in data
+        )
+        legacy_stop_acknowledged = bool(
+            data.get("cancel_stop_attempted", False)
+            and not has_v03_cancel_state
+        )
+        cancel_stop_attempts = max(
+            int(parse_float(data.get("cancel_stop_attempts")) or 0),
+            1 if legacy_stop_acknowledged else 0,
+        )
+        cancel_stop_acknowledged_at = data.get("cancel_stop_acknowledged_at")
+        if legacy_stop_acknowledged and cancel_stop_acknowledged_at is None:
+            cancel_stop_acknowledged_at = (
+                data.get("cancel_requested_at")
+                or data.get("started_at")
+                or utcnow_iso()
+            )
+        allowed_error_fingerprint = data.get("allowed_error_fingerprint")
+        if (
+            allowed_error_fingerprint == "__clean_water_empty__"
+            or is_clean_water_empty_error(allowed_error_fingerprint)
+        ):
+            allowed_error_fingerprint = "mop.clean_water_empty"
         start_area = parse_float(data.get("start_area"))
         start_time = parse_float(data.get("start_time"))
         return cls(
@@ -344,9 +468,23 @@ class ActiveRun:
             manual=bool(data.get("manual", False)),
             vacuum_only=bool(data.get("vacuum_only", False)),
             fallback_vacuum=bool(data.get("fallback_vacuum", False)),
-            allowed_error_fingerprint=data.get("allowed_error_fingerprint"),
+            allowed_error_fingerprint=allowed_error_fingerprint,
             cancelled=bool(data.get("cancelled", False)),
             command_published=command_published,
+            command_publish_requested_at=data.get(
+                "command_publish_requested_at"
+            ),
+            command_publish_acknowledged_at=data.get(
+                "command_publish_acknowledged_at"
+            ),
+            start_confirmed_at=(
+                data.get("start_confirmed_at")
+                or (
+                    data.get("started_at")
+                    if phase in {RUN_PHASE_CLEANING, RUN_PHASE_RESUMED_CLEANING}
+                    else None
+                )
+            ),
             phase=phase,
             observed_cleaning=observed_cleaning,
             observed_segment_cleaning=bool(data.get("observed_segment_cleaning", False)),
@@ -360,7 +498,25 @@ class ActiveRun:
             requested_iterations=max(
                 1, int(parse_float(data.get("requested_iterations")) or 2)
             ),
+            observed_iteration_count=max(
+                0,
+                int(parse_float(data.get("observed_iteration_count")) or 0),
+            ),
+            iteration_evidence_source=data.get("iteration_evidence_source"),
+            segment_iteration_active=bool(
+                data.get("segment_iteration_active", False)
+            ),
+            segment_iteration_counted=bool(
+                data.get(
+                    "segment_iteration_counted",
+                    bool(
+                        data.get("segment_iteration_active", False)
+                        and data.get("observed_iteration_count", 0)
+                    ),
+                )
+            ),
             dispatch_deadline=data.get("dispatch_deadline"),
+            dispatch_failure_code=data.get("dispatch_failure_code"),
             recovery_deadline=data.get("recovery_deadline"),
             resume_required=bool(data.get("resume_required", False)),
             post_suspend_cleaning_observed=bool(
@@ -375,9 +531,35 @@ class ActiveRun:
             last_time=parse_float(data.get("last_time", start_time)),
             cancel_requested_at=data.get("cancel_requested_at"),
             cancel_reason=data.get("cancel_reason"),
-            cancel_stop_attempted=bool(data.get("cancel_stop_attempted", False)),
+            cancel_stop_attempted=bool(
+                data.get("cancel_stop_attempted", False)
+                or cancel_stop_attempts
+            ),
+            cancel_stop_attempts=cancel_stop_attempts,
+            cancel_stop_requested_at=data.get("cancel_stop_requested_at"),
+            cancel_stop_published_at=data.get("cancel_stop_published_at"),
+            cancel_stop_acknowledged_at=cancel_stop_acknowledged_at,
+            cancel_stop_physical_acknowledged_at=data.get(
+                "cancel_stop_physical_acknowledged_at"
+            ),
+            cancel_ack_deadline=data.get("cancel_ack_deadline"),
+            cancel_return_attempts=max(
+                0,
+                int(parse_float(data.get("cancel_return_attempts")) or 0),
+            ),
+            cancel_return_requested_at=data.get("cancel_return_requested_at"),
+            cancel_return_acknowledged_at=data.get(
+                "cancel_return_acknowledged_at"
+            ),
             cancel_continue_session=bool(
                 data.get("cancel_continue_session", False)
+            ),
+            cancel_requeue_room=bool(data.get("cancel_requeue_room", False)),
+            cancel_outcome_result=data.get("cancel_outcome_result"),
+            floor_completion_status=data.get("floor_completion_status"),
+            floor_completion_reason=data.get("floor_completion_reason"),
+            floor_completion_recorded_at=data.get(
+                "floor_completion_recorded_at"
             ),
             last_estimated_room_id=data.get("last_estimated_room_id"),
             last_estimated_changed_at=data.get("last_estimated_changed_at"),
@@ -407,6 +589,11 @@ class ActiveRun:
             "allowed_error_fingerprint": self.allowed_error_fingerprint,
             "cancelled": self.cancelled,
             "command_published": self.command_published,
+            "command_publish_requested_at": self.command_publish_requested_at,
+            "command_publish_acknowledged_at": (
+                self.command_publish_acknowledged_at
+            ),
+            "start_confirmed_at": self.start_confirmed_at,
             "phase": self.phase,
             "observed_cleaning": self.observed_cleaning,
             "observed_segment_cleaning": self.observed_segment_cleaning,
@@ -418,7 +605,12 @@ class ActiveRun:
             "docked_at": self.docked_at,
             "interruption_count": self.interruption_count,
             "requested_iterations": self.requested_iterations,
+            "observed_iteration_count": self.observed_iteration_count,
+            "iteration_evidence_source": self.iteration_evidence_source,
+            "segment_iteration_active": self.segment_iteration_active,
+            "segment_iteration_counted": self.segment_iteration_counted,
             "dispatch_deadline": self.dispatch_deadline,
+            "dispatch_failure_code": self.dispatch_failure_code,
             "recovery_deadline": self.recovery_deadline,
             "resume_required": self.resume_required,
             "post_suspend_cleaning_observed": self.post_suspend_cleaning_observed,
@@ -430,7 +622,25 @@ class ActiveRun:
             "cancel_requested_at": self.cancel_requested_at,
             "cancel_reason": self.cancel_reason,
             "cancel_stop_attempted": self.cancel_stop_attempted,
+            "cancel_stop_attempts": self.cancel_stop_attempts,
+            "cancel_stop_requested_at": self.cancel_stop_requested_at,
+            "cancel_stop_published_at": self.cancel_stop_published_at,
+            "cancel_stop_acknowledged_at": self.cancel_stop_acknowledged_at,
+            "cancel_stop_physical_acknowledged_at": (
+                self.cancel_stop_physical_acknowledged_at
+            ),
+            "cancel_ack_deadline": self.cancel_ack_deadline,
+            "cancel_return_attempts": self.cancel_return_attempts,
+            "cancel_return_requested_at": self.cancel_return_requested_at,
+            "cancel_return_acknowledged_at": (
+                self.cancel_return_acknowledged_at
+            ),
             "cancel_continue_session": self.cancel_continue_session,
+            "cancel_requeue_room": self.cancel_requeue_room,
+            "cancel_outcome_result": self.cancel_outcome_result,
+            "floor_completion_status": self.floor_completion_status,
+            "floor_completion_reason": self.floor_completion_reason,
+            "floor_completion_recorded_at": self.floor_completion_recorded_at,
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
             "estimated_dwell_seconds": self.estimated_dwell_seconds,
@@ -950,9 +1160,22 @@ def build_while_away_outcome_contract(
                     "operation": outcome.attempt_mode,
                 }
                 projection["outstanding"] = None
-        elif outcome.attempt_result in {"failed", "interrupted"}:
+        elif outcome.attempt_result in {
+            "failed",
+            "interrupted",
+            "partial",
+            "uncertain",
+        }:
             projection["status"] = outcome.attempt_result
-            if projection["credit"]["status"] != "partial":
+            if (
+                outcome.attempt_result == "partial"
+                and outcome.attempt_mode in {"vacuum", "fallback_vacuum"}
+            ):
+                projection["credit"] = {
+                    "status": "partial",
+                    "operation": "vacuum",
+                }
+            elif projection["credit"]["status"] != "partial":
                 projection["credit"] = {
                     "status": "none",
                     "operation": None,
@@ -1007,8 +1230,10 @@ class SessionState:
     completed_room_ids: list[str] = field(default_factory=list)
     skipped_room_ids: list[str] = field(default_factory=list)
     failed_room_ids: list[str] = field(default_factory=list)
+    uncertain_room_ids: list[str] = field(default_factory=list)
     skipped_room_reasons: dict[str, str] = field(default_factory=dict)
     failed_room_reasons: dict[str, str] = field(default_factory=dict)
+    uncertain_room_reasons: dict[str, str] = field(default_factory=dict)
     fallback_attempted_room_ids: list[str] = field(default_factory=list)
     fallback_completed_room_ids: list[str] = field(default_factory=list)
     fallback_failed_room_ids: list[str] = field(default_factory=list)
@@ -1031,8 +1256,36 @@ class SessionState:
     degraded_at: str | None = None
     degraded_preparation_attempted: bool = False
     degraded_preparation_completed: bool = False
+    degraded_dock_stop_attempts: int = 0
+    degraded_dock_stop_requested_at: str | None = None
+    degraded_dock_stop_acknowledged_at: str | None = None
+    degraded_mode_attempts: int = 0
+    degraded_mode_acknowledged_at: str | None = None
+    degraded_mode_next_retry_at: str | None = None
+    degraded_mode_last_error: str | None = None
+    degraded_mode_state_fingerprint: str | None = None
+    dispatch_failure_counts: dict[str, int] = field(default_factory=dict)
+    dispatch_failure_reasons: dict[str, str] = field(default_factory=dict)
+    dispatch_failure_fingerprints: dict[str, str] = field(default_factory=dict)
+    dispatch_retry_not_before: dict[str, str] = field(default_factory=dict)
+    dispatch_escalated_room_ids: list[str] = field(default_factory=list)
     blocked_deadline: str | None = None
     blocked_reason: str | None = None
+    blocker_code: str | None = None
+    blocker_disposition: str | None = None
+    blocker_operator_action: str | None = None
+    recovery_phase: str | None = None
+    recovery_started_at: str | None = None
+    next_retry_at: str | None = None
+    waiting_for_physical_fix: bool = False
+    recovery_notification_fingerprint: str | None = None
+    recovery_notification_attempts: int = 0
+    recovery_notification_sent: bool = False
+    last_recovery_notification_fingerprint: str | None = None
+    last_recovery_notification_at: str | None = None
+    recovery_announcement_sent: bool = False
+    last_recovered_at: str | None = None
+    last_command_recovery: dict[str, Any] = field(default_factory=dict)
     native_resume_guard_latched: bool = False
     native_guard_cancel_pending: bool = False
     native_guard_stop_confirmed: bool = False
@@ -1046,11 +1299,24 @@ class SessionState:
         if room_id not in self.attempted_room_ids:
             self.attempted_room_ids.append(room_id)
 
+    def unmark_attempted(self, room_id: str) -> None:
+        """Return an unstarted room token after acknowledged command cancellation."""
+        if room_id in self.attempted_room_ids:
+            self.attempted_room_ids.remove(room_id)
+        self.discard_retry(room_id)
+        if room_id in self.retried_room_ids:
+            self.retried_room_ids.remove(room_id)
+        self._remove_room_issue(room_id)
+        self.active_room_id = None
+
     def mark_completed(self, room_id: str) -> None:
         """Record a completed room for this session."""
         self.mark_attempted(room_id)
         if room_id not in self.completed_room_ids:
             self.completed_room_ids.append(room_id)
+        if room_id in self.uncertain_room_ids:
+            self.uncertain_room_ids.remove(room_id)
+        self.uncertain_room_reasons.pop(room_id, None)
         self.clear_deferred_full_clean(room_id)
         self._remove_room_issue(room_id)
         self.active_room_id = None
@@ -1106,6 +1372,69 @@ class SessionState:
             self.failed_room_ids.append(room_id)
         if reason:
             self.failed_room_reasons[room_id] = reason
+
+    def mark_uncertain(self, room_id: str, reason: str) -> None:
+        """Record proven floor work whose full completion is not coherent."""
+        self.mark_attempted(room_id)
+        if room_id not in self.uncertain_room_ids:
+            self.uncertain_room_ids.append(room_id)
+        self.uncertain_room_reasons[room_id] = reason
+        self._remove_room_issue(room_id)
+        self.active_room_id = None
+
+    def clear_dispatch_failure(self, room_id: str) -> None:
+        """Clear persisted dispatch backoff after material progress."""
+        self.dispatch_failure_counts.pop(room_id, None)
+        self.dispatch_failure_reasons.pop(room_id, None)
+        self.dispatch_failure_fingerprints.pop(room_id, None)
+        self.dispatch_retry_not_before.pop(room_id, None)
+        if room_id in self.dispatch_escalated_room_ids:
+            self.dispatch_escalated_room_ids.remove(room_id)
+
+    def enter_recovery(
+        self,
+        *,
+        code: str,
+        disposition: str,
+        reason: str,
+        phase: str,
+        next_retry_at: str | None,
+        waiting_for_physical_fix: bool,
+        operator_action: str | None = None,
+    ) -> None:
+        """Persist an explicit waiting state without discarding the queue."""
+        now = utcnow_iso()
+        if self.recovery_started_at is None or self.blocker_code != code:
+            self.recovery_started_at = now
+            self.recovery_notification_sent = False
+            self.recovery_notification_attempts = 0
+            self.recovery_announcement_sent = False
+        self.blocker_code = code
+        self.blocker_disposition = disposition
+        self.blocker_operator_action = operator_action
+        self.blocked_reason = reason
+        self.recovery_phase = phase
+        self.next_retry_at = next_retry_at
+        self.blocked_deadline = next_retry_at
+        self.waiting_for_physical_fix = waiting_for_physical_fix
+
+    def clear_recovery(self) -> None:
+        """Clear the active blocker while retaining recovery history."""
+        if self.blocker_code is not None:
+            self.last_recovered_at = utcnow_iso()
+        self.blocker_code = None
+        self.blocker_disposition = None
+        self.blocker_operator_action = None
+        self.blocked_reason = None
+        self.blocked_deadline = None
+        self.recovery_phase = None
+        self.recovery_started_at = None
+        self.next_retry_at = None
+        self.waiting_for_physical_fix = False
+        self.recovery_notification_fingerprint = None
+        self.recovery_notification_attempts = 0
+        self.recovery_notification_sent = False
+        self.last_recovery_notification_fingerprint = None
 
     def begin_recovering(
         self,
@@ -1198,8 +1527,12 @@ class SessionState:
             completed_room_ids=list(data.get("completed_room_ids") or []),
             skipped_room_ids=list(data.get("skipped_room_ids") or []),
             failed_room_ids=list(data.get("failed_room_ids") or []),
+            uncertain_room_ids=list(data.get("uncertain_room_ids") or []),
             skipped_room_reasons=dict(data.get("skipped_room_reasons") or {}),
             failed_room_reasons=dict(data.get("failed_room_reasons") or {}),
+            uncertain_room_reasons=dict(
+                data.get("uncertain_room_reasons") or {}
+            ),
             fallback_attempted_room_ids=list(
                 data.get("fallback_attempted_room_ids") or []
             ),
@@ -1238,8 +1571,91 @@ class SessionState:
             degraded_preparation_completed=bool(
                 data.get("degraded_preparation_completed", False)
             ),
+            degraded_dock_stop_attempts=max(
+                0,
+                int(
+                    parse_float(data.get("degraded_dock_stop_attempts"))
+                    or 0
+                ),
+            ),
+            degraded_dock_stop_requested_at=data.get(
+                "degraded_dock_stop_requested_at"
+            ),
+            degraded_dock_stop_acknowledged_at=data.get(
+                "degraded_dock_stop_acknowledged_at"
+            ),
+            degraded_mode_attempts=max(
+                0,
+                int(parse_float(data.get("degraded_mode_attempts")) or 0),
+            ),
+            degraded_mode_acknowledged_at=data.get(
+                "degraded_mode_acknowledged_at"
+            ),
+            degraded_mode_next_retry_at=data.get(
+                "degraded_mode_next_retry_at"
+            ),
+            degraded_mode_last_error=data.get("degraded_mode_last_error"),
+            degraded_mode_state_fingerprint=data.get(
+                "degraded_mode_state_fingerprint"
+            ),
+            dispatch_failure_counts={
+                str(room_id): max(0, int(parse_float(count) or 0))
+                for room_id, count in (
+                    data.get("dispatch_failure_counts") or {}
+                ).items()
+            },
+            dispatch_failure_reasons=dict(
+                data.get("dispatch_failure_reasons") or {}
+            ),
+            dispatch_failure_fingerprints=dict(
+                data.get("dispatch_failure_fingerprints") or {}
+            ),
+            dispatch_retry_not_before=dict(
+                data.get("dispatch_retry_not_before") or {}
+            ),
+            dispatch_escalated_room_ids=list(
+                data.get("dispatch_escalated_room_ids") or []
+            ),
             blocked_deadline=data.get("blocked_deadline"),
             blocked_reason=data.get("blocked_reason"),
+            blocker_code=data.get("blocker_code"),
+            blocker_disposition=data.get("blocker_disposition"),
+            blocker_operator_action=data.get("blocker_operator_action"),
+            recovery_phase=data.get("recovery_phase"),
+            recovery_started_at=data.get("recovery_started_at"),
+            next_retry_at=(
+                data.get("next_retry_at")
+                or data.get("blocked_deadline")
+            ),
+            waiting_for_physical_fix=bool(
+                data.get("waiting_for_physical_fix", False)
+            ),
+            recovery_notification_fingerprint=data.get(
+                "recovery_notification_fingerprint"
+            ),
+            recovery_notification_attempts=max(
+                0,
+                int(
+                    parse_float(data.get("recovery_notification_attempts"))
+                    or 0
+                ),
+            ),
+            recovery_notification_sent=bool(
+                data.get("recovery_notification_sent", False)
+            ),
+            last_recovery_notification_fingerprint=data.get(
+                "last_recovery_notification_fingerprint"
+            ),
+            last_recovery_notification_at=data.get(
+                "last_recovery_notification_at"
+            ),
+            recovery_announcement_sent=bool(
+                data.get("recovery_announcement_sent", False)
+            ),
+            last_recovered_at=data.get("last_recovered_at"),
+            last_command_recovery=dict(
+                data.get("last_command_recovery") or {}
+            ),
             native_resume_guard_latched=bool(
                 data.get("native_resume_guard_latched", False)
             ),
@@ -1268,8 +1684,10 @@ class SessionState:
             "completed_room_ids": self.completed_room_ids,
             "skipped_room_ids": self.skipped_room_ids,
             "failed_room_ids": self.failed_room_ids,
+            "uncertain_room_ids": self.uncertain_room_ids,
             "skipped_room_reasons": self.skipped_room_reasons,
             "failed_room_reasons": self.failed_room_reasons,
+            "uncertain_room_reasons": self.uncertain_room_reasons,
             "fallback_attempted_room_ids": self.fallback_attempted_room_ids,
             "fallback_completed_room_ids": self.fallback_completed_room_ids,
             "fallback_failed_room_ids": self.fallback_failed_room_ids,
@@ -1292,8 +1710,54 @@ class SessionState:
             "degraded_at": self.degraded_at,
             "degraded_preparation_attempted": self.degraded_preparation_attempted,
             "degraded_preparation_completed": self.degraded_preparation_completed,
+            "degraded_dock_stop_attempts": self.degraded_dock_stop_attempts,
+            "degraded_dock_stop_requested_at": (
+                self.degraded_dock_stop_requested_at
+            ),
+            "degraded_dock_stop_acknowledged_at": (
+                self.degraded_dock_stop_acknowledged_at
+            ),
+            "degraded_mode_attempts": self.degraded_mode_attempts,
+            "degraded_mode_acknowledged_at": (
+                self.degraded_mode_acknowledged_at
+            ),
+            "degraded_mode_next_retry_at": self.degraded_mode_next_retry_at,
+            "degraded_mode_last_error": self.degraded_mode_last_error,
+            "degraded_mode_state_fingerprint": (
+                self.degraded_mode_state_fingerprint
+            ),
+            "dispatch_failure_counts": self.dispatch_failure_counts,
+            "dispatch_failure_reasons": self.dispatch_failure_reasons,
+            "dispatch_failure_fingerprints": (
+                self.dispatch_failure_fingerprints
+            ),
+            "dispatch_retry_not_before": self.dispatch_retry_not_before,
+            "dispatch_escalated_room_ids": self.dispatch_escalated_room_ids,
             "blocked_deadline": self.blocked_deadline,
             "blocked_reason": self.blocked_reason,
+            "blocker_code": self.blocker_code,
+            "blocker_disposition": self.blocker_disposition,
+            "blocker_operator_action": self.blocker_operator_action,
+            "recovery_phase": self.recovery_phase,
+            "recovery_started_at": self.recovery_started_at,
+            "next_retry_at": self.next_retry_at,
+            "waiting_for_physical_fix": self.waiting_for_physical_fix,
+            "recovery_notification_fingerprint": (
+                self.recovery_notification_fingerprint
+            ),
+            "recovery_notification_attempts": (
+                self.recovery_notification_attempts
+            ),
+            "recovery_notification_sent": self.recovery_notification_sent,
+            "last_recovery_notification_fingerprint": (
+                self.last_recovery_notification_fingerprint
+            ),
+            "last_recovery_notification_at": (
+                self.last_recovery_notification_at
+            ),
+            "recovery_announcement_sent": self.recovery_announcement_sent,
+            "last_recovered_at": self.last_recovered_at,
+            "last_command_recovery": self.last_command_recovery,
             "native_resume_guard_latched": self.native_resume_guard_latched,
             "native_guard_cancel_pending": self.native_guard_cancel_pending,
             "native_guard_stop_confirmed": self.native_guard_stop_confirmed,
@@ -1435,13 +1899,30 @@ def build_auto_clean_summary(
     total_room_count: int | None = None,
     fallback_room_names: list[str] | None = None,
     deferred_room_names: list[str] | None = None,
+    uncertain_room_names: list[str] | None = None,
 ) -> AutoCleanSummary | None:
     """Build the one notification for an auto-clean session."""
     completed_count = len(completed_room_names)
     fallback_room_names = fallback_room_names or []
     deferred_room_names = deferred_room_names or []
+    uncertain_room_names = uncertain_room_names or []
     fallback_count = len(fallback_room_names)
     friendly_terminal = friendly_failure_reason(terminal_message)
+
+    if terminal_reason == "complete_with_uncertainty":
+        completed_text = (
+            cleaned_summary_sentence(vacuum_name, completed_room_names)
+            if completed_room_names
+            else f"{vacuum_name} finished its away session."
+        )
+        uncertain_text = format_room_list(uncertain_room_names)
+        return AutoCleanSummary(
+            title=f"{vacuum_name} · Check Results",
+            message=(
+                f"{completed_text} Completion could not be confirmed for "
+                f"{uncertain_text or 'one room'}; it was not blindly repeated."
+            ),
+        )
 
     if terminal_reason == "mop_resource_deferred":
         parts: list[str] = []
@@ -1533,8 +2014,11 @@ def no_selection_terminal_reason(
     skipped_room_ids: list[str],
     failed_room_ids: list[str],
     current_skipped_count: int,
+    uncertain_room_ids: list[str] | None = None,
 ) -> str:
     """Return the terminal reason when room selection has no next candidate."""
+    if uncertain_room_ids:
+        return "complete_with_uncertainty"
     if completed_room_ids:
         return "complete"
     if skipped_room_ids or failed_room_ids or current_skipped_count:
@@ -1615,6 +2099,240 @@ def is_clean_water_empty_error(error: str | None) -> bool:
     return bool(normalized and normalized.lower() in CLEAN_WATER_EMPTY_ERROR_VALUES)
 
 
+def is_unrecoverable_error(error: str | None) -> bool:
+    """Return whether an error explicitly declares permanent failure."""
+    return error_contains_any(error, UNRECOVERABLE_ERROR_KEYWORDS)
+
+
+def classify_blocker(
+    resources: ResourceState,
+    *,
+    vacuum_state: str | None = None,
+    dock_status: str | None = None,
+    status_flag: str | None = None,
+    battery: float | None = None,
+    minimum_battery: float | None = None,
+) -> BlockerClassification | None:
+    """Classify the current blocker, defaulting unknown failures to recovery."""
+    error = normalize_state(resources.error)
+    error_lower = error.lower() if error else None
+    if error_lower in {"unknown", "unavailable"}:
+        return BlockerClassification(
+            "sensor.error_unavailable",
+            BLOCKER_RECOVERABLE,
+            "availability",
+            f"error sensor is {error_lower}",
+            "Wait for the Valetudo error sensor to recover.",
+        )
+    if error and not is_error_clear(error):
+        if is_unrecoverable_error(error):
+            return BlockerClassification(
+                "error.unrecoverable",
+                BLOCKER_UNRECOVERABLE,
+                "error",
+                error,
+                "Service the vacuum before starting another automatic session.",
+                waiting_for_physical_fix=True,
+            )
+        if is_low_battery_error(error):
+            return BlockerClassification(
+                "power.low_battery",
+                BLOCKER_RECOVERABLE,
+                "power",
+                error,
+                "Leave the vacuum docked so it can recharge and resume.",
+            )
+        if is_clean_water_empty_error(error):
+            return BlockerClassification(
+                "mop.clean_water_empty",
+                BLOCKER_RECOVERABLE,
+                "mop_resource",
+                error,
+                "Refill the clean-water tank; vacuum-only rooms can continue.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if "dustbag" in error_lower or "dust bag" in error_lower:
+            return BlockerClassification(
+                "dock.dustbag_full_or_duct_blocked",
+                BLOCKER_RECOVERABLE,
+                "dock",
+                error,
+                "Replace the dustbag or clear the dust duct.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if any(
+            value in error_lower
+            for value in ("dirty water", "dirty tank", "wastewater")
+        ):
+            return BlockerClassification(
+                "mop.dirty_water_unavailable",
+                BLOCKER_RECOVERABLE,
+                "mop_resource",
+                error,
+                "Empty and reseat the wastewater tank.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if any(
+            value in error_lower
+            for value in ("detergent", "cleaning liquid", "fortified liquid")
+        ):
+            return BlockerClassification(
+                "mop.detergent_unavailable",
+                BLOCKER_RECOVERABLE,
+                "mop_resource",
+                error,
+                "Refill or reseat the detergent container.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if "unknown error 120" in error_lower:
+            return BlockerClassification(
+                "mop.hardware_unavailable",
+                BLOCKER_RECOVERABLE,
+                "mop_resource",
+                error,
+                "Check the mop pads and dock, then clear the warning.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if is_recoverable_navigation_error(error):
+            return BlockerClassification(
+                "navigation.recoverable",
+                BLOCKER_RECOVERABLE,
+                "navigation",
+                error,
+                "Clear the route or obstruction; cleaning will retry when ready.",
+                waiting_for_physical_fix=True,
+            )
+        return BlockerClassification(
+            "error.recoverable_unknown",
+            BLOCKER_RECOVERABLE,
+            "error",
+            error,
+            "Clear the vacuum error; the preserved session will retry.",
+            waiting_for_physical_fix=True,
+        )
+
+    component_checks = (
+        (
+            "fresh water",
+            resources.fresh_water,
+            {"empty", "missing", "unknown", "unavailable"},
+            "mop.clean_water_unavailable",
+            "Refill or reseat the clean-water tank; vacuum-only rooms can continue.",
+            True,
+        ),
+        (
+            "dirty water",
+            resources.dirty_water,
+            {"full", "missing", "unknown", "unavailable"},
+            "mop.dirty_water_unavailable",
+            "Empty and reseat the wastewater tank.",
+            True,
+        ),
+        (
+            "detergent",
+            resources.detergent,
+            {"empty", "missing", "unknown", "unavailable"},
+            "mop.detergent_unavailable",
+            "Refill or reseat the detergent container.",
+            True,
+        ),
+        (
+            "dustbag",
+            resources.dustbag,
+            {"full", "missing", "unknown", "unavailable"},
+            "dock.dustbag_full_or_duct_blocked",
+            "Replace the dustbag or clear the dust duct.",
+            True,
+        ),
+    )
+    for label, value, bad_values, code, action, vacuum_only_safe in component_checks:
+        normalized = normalize_state(value)
+        if normalized and normalized.lower() in bad_values:
+            return BlockerClassification(
+                code,
+                BLOCKER_RECOVERABLE,
+                "mop_resource" if label != "dustbag" else "dock",
+                f"{label} is {normalized}",
+                action,
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=vacuum_only_safe,
+            )
+
+    normalized_vacuum = (normalize_state(vacuum_state) or "").lower()
+    if normalized_vacuum in {"unknown", "unavailable"}:
+        return BlockerClassification(
+            "vacuum.unavailable",
+            BLOCKER_RECOVERABLE,
+            "availability",
+            f"vacuum state is {normalized_vacuum}",
+            "Wait for the vacuum entity to reconnect.",
+        )
+    normalized_status = (normalize_state(status_flag) or "").lower()
+    if normalized_status in {"unknown", "unavailable"}:
+        return BlockerClassification(
+            "status.unavailable",
+            BLOCKER_RECOVERABLE,
+            "availability",
+            f"status flag is {normalized_status}",
+            "Wait for the Valetudo status flag to recover.",
+        )
+    if normalized_status == "resumable":
+        return BlockerClassification(
+            "task.resume_pending",
+            BLOCKER_RECOVERABLE,
+            "recovery",
+            "Valetudo retained a resumable task",
+            "Leave the vacuum docked; the coordinator will reconcile the task.",
+        )
+    if normalized_status and normalized_status != "none":
+        return BlockerClassification(
+            "task.active",
+            BLOCKER_RECOVERABLE,
+            "recovery",
+            f"status flag is {normalized_status}",
+            "Wait for the retained Valetudo task to clear.",
+        )
+    normalized_dock = (normalize_state(dock_status) or "").lower()
+    if normalized_dock in {"unknown", "unavailable"}:
+        return BlockerClassification(
+            "dock.unavailable",
+            BLOCKER_RECOVERABLE,
+            "availability",
+            f"dock status is {normalized_dock}",
+            "Wait for the dock status entity to recover.",
+        )
+    if normalized_dock in {"cleaning", "emptying", "pause"}:
+        return BlockerClassification(
+            "dock.busy",
+            BLOCKER_RECOVERABLE,
+            "dock",
+            f"dock status is {normalized_dock}",
+            "Wait for dock servicing to finish.",
+        )
+    if (
+        minimum_battery is not None
+        and (battery is None or battery < minimum_battery)
+    ):
+        reason = (
+            "battery state is unavailable"
+            if battery is None
+            else f"battery is {battery:.0f}%, below {minimum_battery:.0f}%"
+        )
+        return BlockerClassification(
+            "power.charging",
+            BLOCKER_RECOVERABLE,
+            "power",
+            reason,
+            "Leave the vacuum docked until it has enough charge.",
+        )
+    return None
+
+
 def _reason_number(value: str) -> int | float:
     """Return an integer where possible, otherwise a float."""
     number = float(value)
@@ -1626,6 +2344,18 @@ def classify_outcome_reason(reason: str | None) -> OutcomeReason:
     normalized = normalize_state(reason) or "Unknown failure"
     lowered = normalized.lower()
 
+    if (
+        is_clean_water_empty_error(normalized)
+        or (
+            (
+                "clean water" in lowered
+                or "fresh water" in lowered
+                or "freshwater" in lowered
+            )
+            and "empty" in lowered
+        )
+    ):
+        return OutcomeReason("mop.clean_water_empty", "mop_resource", normalized)
     fresh_water_unavailable_state = next(
         (
             state
@@ -1648,18 +2378,6 @@ def classify_outcome_reason(reason: str | None) -> OutcomeReason:
             normalized,
             {"state": fresh_water_unavailable_state},
         )
-    if (
-        is_clean_water_empty_error(normalized)
-        or (
-            (
-                "clean water" in lowered
-                or "fresh water" in lowered
-                or "freshwater" in lowered
-            )
-            and "empty" in lowered
-        )
-    ):
-        return OutcomeReason("mop.clean_water_empty", "mop_resource", normalized)
     if "dustbag" in lowered or "dust bag" in lowered or "dust duct" in lowered:
         return OutcomeReason(
             "dock.dustbag_full_or_duct_blocked",
@@ -1806,6 +2524,27 @@ def classify_outcome_reason(reason: str | None) -> OutcomeReason:
             "execution",
             normalized,
         )
+    if "requested iterations did not reach a coherent completed task state" in lowered:
+        return OutcomeReason(
+            "verification.iterations_uncertain",
+            "verification",
+            normalized,
+        )
+    iteration_count = re.fullmatch(
+        r"Observed ([0-9]+) of ([0-9]+) requested iterations",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if iteration_count:
+        return OutcomeReason(
+            "verification.iterations_incomplete",
+            "verification",
+            normalized,
+            {
+                "observed_iterations": int(iteration_count.group(1)),
+                "requested_iterations": int(iteration_count.group(2)),
+            },
+        )
     if "run was cancelled" in lowered or lowered == "cancelled":
         return OutcomeReason("operation.cancelled", "operation", normalized)
     if "mop attachment is missing" in lowered:
@@ -1853,27 +2592,46 @@ def clean_water_empty_reason(resources: ResourceState) -> str | None:
     return None
 
 
+def clean_water_vacuum_only_reason(resources: ResourceState) -> str | None:
+    """Return a clean-water blocker that still permits safe vacuuming."""
+    exact_empty = clean_water_empty_reason(resources)
+    if exact_empty:
+        return exact_empty
+    fresh_water = normalize_state(resources.fresh_water)
+    if fresh_water and fresh_water.lower() in {
+        "missing",
+        "unknown",
+        "unavailable",
+    }:
+        return f"fresh water is {fresh_water}"
+    error = normalize_state(resources.error)
+    lowered = error.lower() if error else ""
+    if (
+        ("clean water" in lowered or "fresh water" in lowered or "freshwater" in lowered)
+        and any(
+            state in lowered
+            for state in ("empty", "missing", "unknown", "unavailable")
+        )
+    ):
+        return error
+    return None
+
+
 def allowed_error_fingerprint(resources: ResourceState) -> str | None:
-    """Return the persisted fingerprint for an allowed degraded vacuum run."""
-    if not clean_water_empty_reason(resources):
-        return None
-    normalized_error = normalize_state(resources.error)
-    if is_clean_water_empty_error(normalized_error):
-        return normalized_error.lower()
-    return CLEAN_WATER_EMPTY_DISPOSITION
+    """Return the stable blocker code allowed during degraded vacuuming."""
+    blocker = classify_blocker(resources)
+    return blocker.code if blocker and blocker.vacuum_only_safe else None
 
 
 def run_allows_error(run: ActiveRun, error: str | None) -> bool:
-    """Return whether a run may ignore this exact pre-existing water warning."""
+    """Return whether a run may ignore this pre-existing safe blocker."""
     if not run.vacuum_only or not run.allowed_error_fingerprint:
         return False
-    normalized = normalize_state(error)
-    if not is_clean_water_empty_error(normalized):
-        return False
-    fingerprint = run.allowed_error_fingerprint
-    return (
-        fingerprint == CLEAN_WATER_EMPTY_DISPOSITION
-        or fingerprint == normalized.lower()
+    blocker = classify_blocker(ResourceState(error=error))
+    return bool(
+        blocker
+        and blocker.vacuum_only_safe
+        and blocker.code == run.allowed_error_fingerprint
     )
 
 
@@ -1954,18 +2712,36 @@ def select_next_room(
             pending_rooms.append(room)
             pending_room_ids.add(room.room_id)
 
+    blocker = classify_blocker(resources)
     general_block_reason = cleaning_block_reason(resources)
-    if general_block_reason:
+    if general_block_reason and not (
+        blocker and blocker.vacuum_only_safe
+    ):
         return None, [(room, general_block_reason) for room in pending_rooms]
 
     for room in pending_rooms:
+        if blocker and blocker.vacuum_only_safe:
+            if not room.mop_required:
+                return RoomSelection(room=room, vacuum_only=True), skipped
+            if (
+                allow_vacuum_only_when_mop_blocked
+                and clean_water_vacuum_only_reason(resources)
+            ):
+                return RoomSelection(
+                    room=room,
+                    vacuum_only=True,
+                    mop_block_reason=blocker.reason,
+                    fallback_vacuum=True,
+                ), skipped
+            skipped.append((room, blocker.reason))
+            continue
         reason = mop_block_reason(room, resources)
         if reason is None:
             return RoomSelection(room=room, vacuum_only=not room.mop_required), skipped
 
         if (
             allow_vacuum_only_when_mop_blocked
-            and clean_water_empty_reason(resources)
+            and clean_water_vacuum_only_reason(resources)
         ):
             return RoomSelection(
                 room=room,
@@ -2039,6 +2815,88 @@ def evaluate_run_success(
             return False, f"Estimated in-room dwell {dwell:.0f}s, below {room.min_estimated_dwell}s threshold"
 
     return True, None
+
+
+def evaluate_floor_completion_evidence(
+    room: RoomConfig,
+    run: ActiveRun,
+    *,
+    end_area: float | None,
+    end_time: float | None,
+    vacuum_state: str | None,
+    status_flag: str | None,
+    dock_status: str | None,
+) -> FloorCompletionEvidence:
+    """Evaluate floor work without letting later dock faults erase it."""
+    success, reason = evaluate_run_success(
+        room,
+        run,
+        end_area,
+        end_time,
+        None,
+    )
+    duration = run.total_time(end_time)
+    area = run.total_area(end_area)
+    if not success:
+        return FloorCompletionEvidence(
+            "incomplete",
+            reason,
+            duration,
+            area,
+        )
+    if room.min_duration > 0 and duration is None:
+        return FloorCompletionEvidence(
+            "uncertain",
+            "Floor completion time was unavailable during dock servicing",
+            duration,
+            area,
+        )
+    if room.min_area > 0 and area is None:
+        return FloorCompletionEvidence(
+            "uncertain",
+            "Floor completion area was unavailable during dock servicing",
+            duration,
+            area,
+        )
+    if run.observed_iteration_count < run.requested_iterations:
+        return FloorCompletionEvidence(
+            "uncertain",
+            (
+                f"Observed {run.observed_iteration_count} of "
+                f"{run.requested_iterations} requested iterations"
+            ),
+            duration,
+            area,
+        )
+
+    normalized_vacuum = (normalize_state(vacuum_state) or "").lower()
+    normalized_status = (normalize_state(status_flag) or "").lower()
+    normalized_dock = (normalize_state(dock_status) or "").lower()
+    at_post_clean_surface = bool(
+        normalized_vacuum in {"docked", "idle", "charging", "returning"}
+        or (
+            normalized_vacuum == "error"
+            and normalized_dock
+            in {"idle", "cleaning", "emptying", "pause", "drying"}
+        )
+    )
+    task_coherently_clear = normalized_status == "none"
+    if (
+        at_post_clean_surface
+        and task_coherently_clear
+        and not run.resume_required
+    ):
+        return FloorCompletionEvidence("completed", None, duration, area)
+
+    return FloorCompletionEvidence(
+        "uncertain",
+        (
+            "Floor thresholds were met, but the requested iterations did not "
+            "reach a coherent completed task state"
+        ),
+        duration,
+        area,
+    )
 
 
 def counter_delta(start_value: float, end_value: float) -> float:

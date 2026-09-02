@@ -2,7 +2,7 @@
 
 DOMAIN = "valetudo_vacuum_coordinator"
 NAME = "Valetudo Vacuum Coordinator"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 PLATFORM_BINARY_SENSOR = "binary_sensor"
 PLATFORM_SENSOR = "sensor"
@@ -25,6 +25,7 @@ CONF_NATIVE_RESUME_TIMEOUT = "native_resume_timeout"
 CONF_DOCK_SETTLE = "dock_settle"
 CONF_DISPATCH_START_TIMEOUT = "dispatch_start_timeout"
 CONF_BLOCKED_SESSION_TIMEOUT = "blocked_session_timeout"
+CONF_RESOURCE_SETTLE = "resource_settle"
 CONF_STALE_RESUME_AUTO_CLEAR = "stale_resume_auto_clear"
 CONF_STALE_RESUME_AGE = "stale_resume_age"
 CONF_STALE_RESUME_SETTLE = "stale_resume_settle"
@@ -81,6 +82,7 @@ DEFAULT_NATIVE_RESUME_TIMEOUT = 10800
 DEFAULT_DOCK_SETTLE = 60
 DEFAULT_DISPATCH_START_TIMEOUT = 120
 DEFAULT_BLOCKED_SESSION_TIMEOUT = 300
+DEFAULT_RESOURCE_SETTLE = 3
 DEFAULT_STALE_RESUME_AUTO_CLEAR = False
 DEFAULT_STALE_RESUME_AGE = 1800
 DEFAULT_STALE_RESUME_SETTLE = 60
@@ -161,9 +163,20 @@ ATTR_TERMINAL_CAUSE = "terminal_cause"
 ATTR_MOP_DEFERRED = "mop_deferred"
 ATTR_MOP_DEFERRED_REASON = "mop_deferred_reason"
 ATTR_BLOCKED_REASON = "blocked_reason"
+ATTR_BLOCKER_CODE = "blocker_code"
+ATTR_BLOCKER_DISPOSITION = "blocker_disposition"
+ATTR_BLOCKER_OPERATOR_ACTION = "blocker_operator_action"
+ATTR_RECOVERY_PHASE = "recovery_phase"
+ATTR_RECOVERY_STARTED_AT = "recovery_started_at"
+ATTR_NEXT_RETRY_AT = "next_retry_at"
+ATTR_WAITING_FOR_PHYSICAL_FIX = "waiting_for_physical_fix"
+ATTR_PRESERVED_ROOMS = "preserved_rooms"
+ATTR_UNCERTAIN_ROOMS = "uncertain_rooms"
+ATTR_UNCERTAIN_REASONS = "uncertain_reasons"
 
 STORE_VERSION = 1
 STORE_KEY = "valetudo_vacuum_coordinator"
+COORDINATOR_DATA_VERSION = 3
 
 STATE_IDLE = "idle"
 STATE_PAUSED = "paused"
@@ -172,3 +185,4 @@ STATE_WAITING = "waiting"
 STATE_ERROR = "error"
 STATE_DEGRADED = "degraded"
 STATE_DEFERRED = "deferred"
+STATE_SUSPENDED = "suspended"

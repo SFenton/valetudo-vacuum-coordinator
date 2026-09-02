@@ -31,8 +31,10 @@ valetudo_vacuum_coordinator:
   native_resume_timeout: 10800
   dock_settle: 60
   dispatch_start_timeout: 120
+  # Recoverable blockers recheck on this cadence; they do not end the session.
   blocked_session_timeout: 300
-  # Shadow-safe by default until vacuum.stop is validated on the robot model.
+  # Debounce dock-component faults during an active run.
+  resource_settle: 3
   stale_resume_auto_clear: false
   stale_resume_age: 1800
   stale_resume_settle: 60
@@ -189,11 +191,11 @@ field or status-observer service.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
 - Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
 - Native-resume-pending binary sensor: read-only guard that stays on while a retained Valetudo task is interrupted or suspended. Use it to block manual/startup command loops.
-- Session sensors: state, current room, actionable queue, fallback-vacuumed rooms, and deferred full-clean rooms.
+- Session sensors: state, current room, actionable queue, fallback-vacuumed rooms, deferred full-clean rooms, typed blocker disposition, recovery phase/deadline, preserved rooms, command acknowledgements, and uncertain floor outcomes.
 - Per-room sensors: last successful clean, last vacuumed, last fallback-vacuumed, last mopped, and successful clean count.
 
 The session-state sensor also exposes a versioned `while_away_outcomes`
-attribute. Version 1 contains an ordered typed event history and one
+attribute. Version 2 contains an ordered typed event history and one
 authoritative current-day projection per room. The projection identifies the
 required operation from each room's `mop_required` configuration, the latest
 attempt and result, granted credit, and any outstanding operation. Existing
@@ -202,8 +204,63 @@ compatibility. A room projection's `status` is the authoritative primary
 outcome; `credit` and `outstanding` are orthogonal details. Once full credit is
 earned for the current day, the primary status remains completed with no
 outstanding operation, while any later anomalous attempt remains in event
-history only. Outcome retention is bounded to the current Home Assistant local
-day and is also cleared when manual cleaning starts.
+history only. Version 2 adds `partial` and `uncertain` attempt results so
+threshold-backed floor work is not mislabeled as a generic failure when dock
+servicing faults race completion. Requested iterations are tracked from
+distinct segment cycles; if Valetudo does not expose enough evidence to prove
+all requested passes, the result remains `uncertain` rather than receiving full
+credit. Uncertain work is not blindly repeated.
+Outcome retention is bounded to the current Home Assistant local day and is
+also cleared when manual cleaning starts.
+
+## Automatic Recovery Policy
+
+Version 0.3.0 keeps the same logical away session and queue for every
+recoverable blocker. This includes low battery and native recharge, dock
+rinse/service, clean-water faults, wastewater, detergent, dustbag conditions,
+temporary unavailable/unknown entities, recoverable navigation failures,
+dock busy states, and pending-command races. `blocked_session_timeout` is now a
+bounded recheck cadence, not a terminal deadline.
+
+Only errors whose text explicitly identifies an unrecoverable/fatal permanent
+failure terminalize the session. Unknown firmware errors default to
+recoverable waiting so a newly introduced error cannot silently discard the
+queue.
+
+When a blocker appears after a segment publish but before cleaning is
+confirmed, the coordinator persists cancellation intent before issuing exactly
+one blocking `vacuum.stop`. It records service or physical acknowledgement,
+does not repeat an uncertain stop after restart, and cannot dispatch another
+segment until cancellation is acknowledged. `return_to_base` is used only when
+the robot is still moving.
+
+Ignored segment commands use persisted per-room exponential backoff. After
+three consecutive publish/start cancellations under the same robot-state
+fingerprint, the room remains preserved but no further segment is published
+until the vacuum, dock, resource, battery-readiness bucket, or mode state
+changes materially.
+
+Clean-water blockers enter degraded mode. All native vacuum-only rooms remain
+eligible even when `allow_vacuum_only_when_mop_blocked: false`; that option
+controls only fallback vacuuming of rooms whose configured operation requires
+mopping. Deferred mop work resumes automatically in the same away session when
+clean water recovers. Wastewater, detergent, dustbag, and error-120 conditions
+also permit configured native vacuum-only rooms when the robot can safely
+depart, while affected mop or dock-service work remains deferred. Mode-service
+failures use bounded exponential retry indefinitely rather than becoming a
+permanent dead end.
+
+The session sensor exposes:
+
+- `blocker_code`, `blocker_disposition`, `blocker_operator_action`, `recovery_phase`,
+  `recovery_started_at`, and `next_retry_at`;
+- `waiting_for_physical_fix` and `preserved_rooms`;
+- current and last command publish/stop/return attempts and acknowledgements;
+- degraded dock-stop/mode attempts and acknowledgements;
+- `uncertain_rooms` and `uncertain_reasons`.
+
+Waiting and recovery notifications are deduplicated per blocker. A recovery
+notification is sent once when an alerted blocker clears.
 
 ## Dock Actions
 
@@ -225,7 +282,22 @@ rooms from rooms that were only vacuumed and still need mopping.
 
 Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration can also use the Status Flag, Dock Status, Error, Battery, Current Statistics, Estimated Segment, and optional Dock Component sensors.
 
-Version 0.2.0 adds independent status observers and the version 1 read-only
+Version 0.3.0 makes auto-resume the default invariant for coordinator-owned
+recoverable
+conditions. Stored 0.2.0 `blocked`, `mop_resource_deferred`, and non-fatal
+`needs_help` sessions migrate back into explicit waiting state with their room
+history, deferred work, settings snapshot, retained-task guard, and away
+timestamp preserved. The Store version remains compatible and all new fields
+have safe defaults. A separate persisted coordinator data schema version (`3`)
+gates this legacy revival so a v0.3 terminal session remains terminal on later
+restarts. General HACS installations keep
+`stale_resume_auto_clear: false`; users who have validated `vacuum.stop` for
+their robot can continue to opt in explicitly. A migrated terminal session
+clears its old final-notification flag. If no settings snapshot was stored, it
+also clears `settings_prepared` so the next command captures fresh settings and
+can restore them safely.
+
+Version 0.2.0 added independent status observers and the version 1 read-only
 status contract. Existing coordinator-only YAML remains valid. The structured
 configuration form can run any number of coordinators and status observers
 together, while status observers remain independent from people, room ledgers,
@@ -239,10 +311,9 @@ passive native-resume behavior. Active manual or external cleaning is observed
 without issuing commands, and unknown work is never actively resumed.
 
 An unowned `resumable` task must remain coherently docked and inactive for
-`stale_resume_age` before it is classified as stale. Automatic clearing is
-disabled by default with `stale_resume_auto_clear: false`; classification,
-diagnostics, and immediate operator notification still run in this shadow-safe
-mode. After model-specific validation, enabling the option permits exactly one
+`stale_resume_age` before it is classified as stale. Automatic clearing remains
+shadow-safe by default with `stale_resume_auto_clear: false`. Explicitly
+enabling it after robot-specific validation permits exactly one
 persisted `vacuum.stop` publication. The coordinator then waits up to
 `stale_resume_clear_timeout` for the status flag to acknowledge the clear task.
 If that succeeds while the dock remains stably `pause`, and `identifier` is
@@ -254,13 +325,14 @@ becomes `operator_required` without changing cleaning settings. If the robot
 later reaches a coherent clear state, the same preflight session continues
 instead of scheduling a new same-away session.
 
-`operator_required` intentionally keeps that away session active. It prevents
-another away-timer session from racing the unresolved task while allowing the
-same queue to continue immediately after an operator or later robot update
-clears the blocker. Manual or external cleaning that is still active is only
-observed. A dormant manually observed task that remains docked and `resumable`
-beyond `stale_resume_age` is eligible for the same bounded, configuration-gated
-clear sequence as an unknown stale task.
+`operator_required` preserves the logical away session in an explicit
+suspended state. It prevents another away-timer session from racing the
+unresolved task, schedules bounded reconciliations, and allows the same queue
+to continue immediately after an operator or robot update clears the blocker.
+Manual or external cleaning that is still active is only observed. A dormant
+manually observed task that remains docked and `resumable` beyond
+`stale_resume_age` is eligible for the same bounded, configuration-gated clear
+sequence as an unknown stale task.
 
 Final terminal summaries are sent independently of robot state. Restoring the
 captured cleaning settings is a separate step that waits only while a
@@ -296,42 +368,41 @@ dual-mode room at most once. Those fallback rooms update `last_vacuumed` and
 auto-clean slot, mop timestamp, successful count, or full completed-room list.
 They therefore remain due for a later normal vacuum-and-mop session.
 
-The degraded queue terminalizes as `mop_resource_deferred` when its actionable
-work is exhausted or cannot begin within the configured bounds. The queue state
-then reaches zero while `deferred_full_clean_rooms` preserves the outstanding
-mop obligations. `dispatch_start_timeout` bounds a segment publish that the
-firmware never starts; `blocked_session_timeout` bounds any active session with
-no active run and no safe dispatch. If clean water is refilled before
-terminalization, remaining native vacuum-only rooms still finish first, then
-untouched dual-mode rooms return to normal full cleaning. A terminal session is
-not revived or automatically restarted during the same persisted away period.
-After refilling, use `start_session` explicitly or wait for a later home-to-away
-transition.
+In version 0.1.6 the degraded queue terminalized as
+`mop_resource_deferred`, and `blocked_session_timeout` ended persistent waits.
+Version 0.3.0 supersedes that behavior: both fields migrate into a live,
+bounded waiting state, deferred work resumes on clear, and no new departure or
+manual `start_session` call is required.
 
-The vacuum-only fallback is intentionally limited to positively identified
-clean-water-empty faults. Unknown error 120, wastewater, detergent, tray, and
-other mop-resource errors do not receive an automatic vacuum fallback.
-`blocked_session_timeout` still applies to those ordinary sessions: after one
-final re-evaluation, a stationary session that remains blocked terminates with
-`terminal_reason: blocked` instead of remaining silently active.
-Both `blocked` and `mop_resource_deferred` terminals suppress automatic restart
-during the same persisted away period. Battery-below-minimum, charging, and
-owned native-resume waits use the longer `native_resume_timeout`; raw unowned
-`resumable` state uses the retained-task preflight policy instead. A later
-shorter resource fault may shorten an ordinary blocked deadline, but no state
-change extends it.
+Fallback vacuuming of mop-required rooms remains limited to positively
+identified clean-water faults. Unknown error 120, wastewater, detergent,
+dustbag, tray, and other resource conditions may allow native vacuum-only rooms
+but do not downgrade mop-required rooms to fallback vacuuming.
+`blocked_session_timeout` now schedules the next diagnostic recheck. Battery,
+charging, and owned native-resume waits use `native_resume_timeout` before
+entering the slower stalled-recovery phase, but remain recoverable. Raw unowned
+`resumable` state still uses the retained-task preflight policy.
 
 If `identifier` is configured, degraded preparation sends one bounded
 mop-dock-clean stop through the existing restricted dock-action bridge before
 selecting vacuum mode. Firmware support for starting a segment while the
 clean-water warning remains latched is model-specific; an ignored command is
-handled by the finite dispatch timeout rather than retried forever.
+cancelled with one acknowledged stop and only reconsidered on the bounded
+recovery cadence.
 
 Version 0.1.3 uses passive native resume for low-battery and dock/mop-rinse interruptions. The same active room run and session remain retained while the robot returns, docks, charges, or rinses. The coordinator does not call `vacuum.stop`, `vacuum.return_to_base`, `vacuum.start`, or publish a fresh segment as part of recovery. It waits for native `cleaning` plus `status_flag=segment`, accumulates statistics across counter resets, and only then continues accounting for the original run.
 
 Configure `status_flag_entity` for passive native-resume confirmation. A suspended low-battery run remains guarded until the firmware resumes it, the timeout expires, or it is explicitly cancelled. Other retained tasks can finalize when the robot is stably docked, the flag has cleared to `none` after the suspension, the dock and error sensors are clear, and the configured dock-settle window has elapsed. This distinguishes a completed final pass from a real mop-rinse interruption without issuing recovery commands.
 
-`native_resume_timeout` defaults to three hours. Expiry ends the uncredited room as `needs_help` without restarting or otherwise commanding the robot. Setting `native_resume_enabled: false` also makes a low-battery interruption terminate as `needs_help`; it does not restore the old restart behavior. `dock_settle` defaults to 60 seconds so a docked/idle event cannot complete a run before late status or dock-state updates arrive. `min_battery` now applies only between room dispatches and never releases or restarts a suspended native task. `resume_nudge_enabled` is reserved and defaults to `false`; v0.1.3 intentionally implements no `vacuum.start` nudge or automatic fresh-segment fallback.
+`native_resume_timeout` defaults to three hours. In 0.3.0 expiry moves the
+preserved run into `recovery_stalled` and schedules another bounded
+reconciliation; it no longer terminalizes the room. The legacy
+`native_resume_enabled: false` value is retained for configuration
+compatibility but no longer permits recoverable low-battery work to be
+discarded. `dock_settle` defaults to 60 seconds so a docked/idle event cannot
+complete a run before late status or dock-state updates arrive. `min_battery`
+applies only between room dispatches. `resume_nudge_enabled` remains reserved
+and no `vacuum.start` nudge is issued.
 
 Person arrival and explicit cancellation remain intentionally destructive: when an active run exists, the coordinator persists cancellation intent, sends one blocking `vacuum.stop`, returns to base only when needed, then clears the run and restores settings.
 
@@ -343,6 +414,13 @@ Binary sensors are read-only in Home Assistant, so the pause control is exposed 
 
 ```powershell
 scripts/test.ps1
+```
+
+On Linux:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q custom_components tests
 ```
 
 The script disables globally installed pytest plugins because this package's tests are pure logic tests and the workstation's `pytest-socket` plugin blocks asyncio's Windows socketpair during plugin setup.
