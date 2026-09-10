@@ -3600,6 +3600,48 @@ class ValetudoVacuumCoordinator:
             material=False,
             reset_coherent=not restored,
         )
+        blocker = self._current_blocker()
+        if (
+            self.session
+            and self.session.active
+            and not self.active_run
+            and not self.manual_run
+            and blocker
+            and blocker.recoverable
+            and blocker.vacuum_only_safe
+            and guard.owner == RETAINED_TASK_OWNER_UNKNOWN
+            and guard.phase == RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+            and guard.clear_attempts == 0
+            and guard.clear_requested_at is None
+            and guard.clear_published_at is None
+            and guard.clear_acknowledged_at is None
+            and guard.dock_clear_attempts == 0
+            and guard.dock_clear_requested_at is None
+            and guard.dock_clear_published_at is None
+            and guard.dock_clear_acknowledged_at is None
+            and status_flag == "none"
+            and vacuum_state in {"docked", "idle", "error", "charging"}
+            and dock_status in _STALE_CLEAR_DOCK_STATES
+        ):
+            guard.phase = RETAINED_TASK_PHASE_CLEARED
+            guard.reason = (
+                "Retained task yielded to safe vacuum-only resource recovery"
+            )
+            guard.operator_required_reason = None
+            guard.stale_deadline = None
+            guard.observation_deadline = None
+            guard.clear_deadline = None
+            guard.dock_clear_deadline = None
+            self.session.preflight_complete = True
+            if (
+                self.session.blocker_code
+                and self.session.blocker_code.startswith("task.")
+            ):
+                await self._async_clear_recoverable_wait()
+            self._cancel_retained_task_timer()
+            await self._async_save_store()
+            self._notify_listeners()
+            return True
         if guard.phase == RETAINED_TASK_PHASE_CLEARED:
             if (
                 status_flag != "resumable"

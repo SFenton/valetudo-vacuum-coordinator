@@ -282,6 +282,15 @@ rooms from rooms that were only vacuumed and still need mopping.
 
 Valetudo's generic Home Assistant vacuum entity is not enough for reliable accounting. This integration can also use the Status Flag, Dock Status, Error, Battery, Current Statistics, Estimated Segment, and optional Dock Component sensors.
 
+Version 0.3.1 lets a persisted stale or `operator_required` retained-task guard
+yield to an active session's safe vacuum-only resource recovery. When the
+status flag is clear and the vacuum is at the dock with a recoverable
+vacuum-only-safe blocker such as a missing clean-water tank, the coordinator
+stops treating the old guard as the primary blocker. It proceeds through the
+bounded degraded dock-stop and mode preparation, continues native vacuum-only
+rooms, and preserves mop-required rooms for automatic resume after the
+resource is restored.
+
 Version 0.3.0 makes auto-resume the default invariant for coordinator-owned
 recoverable
 conditions. Stored 0.2.0 `blocked`, `mop_resource_deferred`, and non-fatal

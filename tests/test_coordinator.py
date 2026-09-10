@@ -5744,6 +5744,131 @@ def test_external_cleaning_is_observed_without_commands_or_settings() -> None:
     assert "select_option" not in _service_names(coordinator)
 
 
+def test_operator_required_guard_yields_to_missing_clean_water_degraded_recovery() -> None:
+    now = datetime(2026, 9, 10, 15, 58, 18, tzinfo=UTC)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+        phase=logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+    )
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(
+                room_id="office",
+                name="Office",
+                segment_id="1",
+            ),
+            logic.RoomConfig(
+                room_id="bathroom",
+                name="Bathroom",
+                segment_id="2",
+                mop_required=True,
+            ),
+        ],
+    )
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = (
+        "sensor.robot_fresh_water"
+    )
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
+    coordinator._async_start_room = types.MethodType(
+        coordinator_module.ValetudoVacuumCoordinator._async_start_room,
+        coordinator,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state(
+        "sensor.robot_error",
+        "Mop Dock Clean Water Tank empty",
+    )
+    coordinator.set_state("sensor.robot_fresh_water", "missing")
+    assert coordinator.session is not None
+    coordinator.session.enter_recovery(
+        code="task.operator_required",
+        disposition=logic.BLOCKER_RECOVERABLE,
+        reason="the retained task did not reach a clear idle dock state",
+        phase="operator_required",
+        next_retry_at=(now + timedelta(minutes=5)).isoformat(),
+        waiting_for_physical_fix=True,
+        operator_action="Clear the retained task or dock condition.",
+    )
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.retained_task_guard is not None
+    assert (
+        coordinator.retained_task_guard.owner
+        == logic.RETAINED_TASK_OWNER_COORDINATOR
+    )
+    assert (
+        coordinator.retained_task_guard.phase
+        == logic.RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+    )
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.room_id == "office"
+    assert coordinator.active_run.vacuum_only is True
+    assert coordinator.active_run.fallback_vacuum is False
+    assert coordinator.session.active is True
+    assert coordinator.session.deferred_full_clean_room_ids == ["bathroom"]
+    assert _service_names(coordinator).count("dock_action") == 1
+    assert _service_names(coordinator).count("publish") == 1
+    assert _service_names(coordinator).count("stop") == 0
+
+
+def test_active_or_uncertain_retained_task_never_yields_to_degraded_recovery() -> None:
+    now = datetime(2026, 9, 10, 15, 58, 18, tzinfo=UTC)
+    for phase, clear_requested_at in (
+        (logic.RETAINED_TASK_PHASE_OBSERVED_ACTIVE, None),
+        (
+            logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED,
+            now.isoformat(),
+        ),
+    ):
+        coordinator = _prepare_preflight_coordinator(
+            now=now,
+            auto_clear=True,
+            stale=True,
+            phase=phase,
+        )
+        coordinator.config[const.CONF_FRESH_WATER_ENTITY] = (
+            "sensor.robot_fresh_water"
+        )
+        coordinator.set_state(coordinator.vacuum_entity, "error")
+        coordinator.set_state("sensor.robot_status_flag", "none")
+        coordinator.set_state("sensor.robot_dock_status", "pause")
+        coordinator.set_state(
+            "sensor.robot_error",
+            "Mop Dock Clean Water Tank empty",
+        )
+        coordinator.set_state("sensor.robot_fresh_water", "missing")
+        coordinator._schedule_retained_task_timer = lambda: None
+        assert coordinator.retained_task_guard is not None
+        if clear_requested_at is not None:
+            coordinator.retained_task_guard.clear_attempts = 1
+            coordinator.retained_task_guard.clear_requested_at = (
+                clear_requested_at
+            )
+
+        ready = asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                now,
+                allow_clear=True,
+            )
+        )
+
+        assert ready is False
+        assert coordinator.active_run is None
+        assert (
+            coordinator.retained_task_guard.phase
+            != logic.RETAINED_TASK_PHASE_CLEARED
+        )
+        assert "publish" not in _service_names(coordinator)
+        assert "dock_action" not in _service_names(coordinator)
+
+
 def test_arrival_cancels_session_without_stopping_unknown_task() -> None:
     now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
     coordinator = _prepare_preflight_coordinator(
