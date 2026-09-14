@@ -29,6 +29,7 @@ valetudo_vacuum_coordinator:
   min_battery: 55
   native_resume_enabled: true
   native_resume_timeout: 10800
+  navigation_error_return_enabled: false
   dock_settle: 60
   dispatch_start_timeout: 120
   # Recoverable blockers recheck on this cadence; they do not end the session.
@@ -227,12 +228,32 @@ failure terminalize the session. Unknown firmware errors default to
 recoverable waiting so a newly introduced error cannot silently discard the
 queue.
 
+Version 0.3.2 makes recoverable room-navigation failures retain the failed room as attempted,
+wait for a coherent docked and error-clear state, run every unattempted room
+first, and then retry the failed room at most once. This preserves the queue
+without allowing one unreachable room to monopolize the session.
+
+`navigation_error_return_enabled` is disabled by default. When enabled after
+robot-specific validation, a target-unreachable room failure may issue one
+restart-safe `return_to_base` request only while both the original and current
+raw errors are exactly `Cannot reach target` and the status flag is clear, even
+when the vacuum already reports `error`. Request, service acknowledgement,
+state acknowledgement, and later docked/error-clear recovery evidence remain
+separate.
+
+Active v0.3.1 runs with persisted positive start evidence migrate to the new
+bounded room-recovery policy. Already-finalized v0.3.1 cancellation records do
+not contain enough evidence to infer that cleaning started, so they retain
+legacy queue semantics. For immediate adoption, update while no automatic
+session is active.
+
 When a blocker appears after a segment publish but before cleaning is
 confirmed, the coordinator persists cancellation intent before issuing exactly
 one blocking `vacuum.stop`. It records service or physical acknowledgement,
 does not repeat an uncertain stop after restart, and cannot dispatch another
 segment until cancellation is acknowledged. `return_to_base` is used only when
-the robot is still moving.
+the robot is still moving unless the explicitly enabled, robot-validated
+navigation-error recovery path permits one return from `error`.
 
 Ignored segment commands use persisted per-room exponential backoff. After
 three consecutive publish/start cancellations under the same robot-state
@@ -253,8 +274,11 @@ permanent dead end.
 The session sensor exposes:
 
 - `blocker_code`, `blocker_disposition`, `blocker_operator_action`, `recovery_phase`,
-  `recovery_started_at`, and `next_retry_at`;
+  `recovery_started_at`, `next_retry_at`, and `retry_cadence_reason`;
 - `waiting_for_physical_fix` and `preserved_rooms`;
+- `pending_recovery_room`, `pending_recovery_reason`,
+  `pending_recovery_policy`, `retry_rooms`, `retried_rooms`, and
+  `next_candidate_room`;
 - current and last command publish/stop/return attempts and acknowledgements;
 - degraded dock-stop/mode attempts and acknowledgements;
 - `uncertain_rooms` and `uncertain_reasons`.

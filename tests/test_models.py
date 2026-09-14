@@ -443,7 +443,11 @@ def test_priority_retry_rooms_are_selected_before_unattempted_rooms():
 def test_session_recovery_queues_retry_without_clearing_failure():
     session = logic.SessionState(session_id="session", started_at=logic.utcnow_iso())
     session.mark_failed("room_one", "Unknown error 95")
-    session.begin_recovering("room_one", "Unknown error 95")
+    session.begin_recovering(
+        "room_one",
+        "Unknown error 95",
+        policy="navigation_retry_later",
+    )
 
     session.resolve_recoverable_failure("room_one")
 
@@ -451,6 +455,7 @@ def test_session_recovery_queues_retry_without_clearing_failure():
     assert session.failed_room_reasons == {"room_one": "Unknown error 95"}
     assert session.pending_recovery_room_id is None
     assert session.pending_recovery_reason is None
+    assert session.pending_recovery_policy is None
     assert session.retry_room_ids == ["room_one"]
 
     session.mark_retry_started("room_one")
@@ -820,6 +825,10 @@ def test_active_run_native_resume_metadata_round_trips():
         last_area=12.5,
         last_time=610,
         cancel_continue_session=True,
+        cancel_recover_room=True,
+        cancel_return_attempts=1,
+        cancel_return_requested_at="2026-08-04T12:11:00+00:00",
+        cancel_return_service_acknowledged_at="2026-08-04T12:11:01+00:00",
     )
     run.observe_segment_iteration(
         source="status_segment_transition",
@@ -834,6 +843,72 @@ def test_active_run_native_resume_metadata_round_trips():
     restored = logic.ActiveRun.from_dict(run.to_dict())
 
     assert restored == run
+
+
+def test_active_run_migrates_navigation_requeue_to_bounded_recovery():
+    restored = logic.ActiveRun.from_dict(
+        {
+            "room_id": "room_one",
+            "segment_id": "1",
+            "session_id": "session",
+            "started_at": logic.utcnow_iso(),
+            "cancelled": True,
+            "phase": logic.RUN_PHASE_CANCEL_PENDING,
+            "cancel_reason": "Cannot reach target",
+            "cancel_continue_session": True,
+            "cancel_requeue_room": True,
+            "observed_cleaning": True,
+        }
+    )
+
+    assert restored is not None
+    assert restored.cancel_recover_room is True
+    assert restored.cancel_requeue_room is False
+
+
+def test_active_run_migrates_prestart_navigation_to_dispatch_recovery():
+    restored = logic.ActiveRun.from_dict(
+        {
+            "room_id": "room_one",
+            "segment_id": "1",
+            "session_id": "session",
+            "started_at": logic.utcnow_iso(),
+            "cancelled": True,
+            "phase": logic.RUN_PHASE_CANCEL_PENDING,
+            "cancel_reason": "Cannot reach target",
+            "cancel_continue_session": True,
+            "cancel_requeue_room": True,
+        }
+    )
+
+    assert restored is not None
+    assert restored.cancel_recover_room is False
+    assert restored.cancel_requeue_room is True
+    assert restored.dispatch_failure_code == (
+        "dispatch.navigation_before_start"
+    )
+
+
+def test_active_run_preserves_existing_dispatch_failure_migration():
+    restored = logic.ActiveRun.from_dict(
+        {
+            "room_id": "room_one",
+            "segment_id": "1",
+            "session_id": "session",
+            "started_at": logic.utcnow_iso(),
+            "cancelled": True,
+            "phase": logic.RUN_PHASE_CANCEL_PENDING,
+            "cancel_reason": "Could not dispatch Gym: cannot reach broker",
+            "cancel_continue_session": True,
+            "cancel_requeue_room": True,
+            "dispatch_failure_code": "dispatch.publish_ack_pending",
+        }
+    )
+
+    assert restored is not None
+    assert restored.cancel_recover_room is False
+    assert restored.cancel_requeue_room is True
+    assert restored.dispatch_failure_code == "dispatch.publish_ack_pending"
 
 
 def test_legacy_clean_water_fingerprint_migrates_to_stable_code():
@@ -1622,6 +1697,10 @@ def test_session_state_round_trips_terminal_details():
         degraded_at="2026-08-18T20:46:40+00:00",
         terminal_cause="queue_exhausted",
         blocked_reason="dock status is pause",
+        retry_cadence_reason="blocked_session_recheck",
+        pending_recovery_room_id="room_three",
+        pending_recovery_reason="Cannot reach target",
+        pending_recovery_policy="navigation_retry_later",
         degraded_mode_attempts=4,
         degraded_mode_next_retry_at="2026-08-18T21:00:00+00:00",
         dispatch_failure_counts={"room_five": 3},
@@ -1651,6 +1730,9 @@ def test_session_state_round_trips_terminal_details():
     assert restored.degraded_reason == "Mop Dock Clean Water Tank empty"
     assert restored.terminal_cause == "queue_exhausted"
     assert restored.blocked_reason == "dock status is pause"
+    assert restored.retry_cadence_reason == "blocked_session_recheck"
+    assert restored.pending_recovery_room_id == "room_three"
+    assert restored.pending_recovery_policy == "navigation_retry_later"
     assert restored.native_guard_stop_confirmed is True
     assert restored.native_guard_return_confirmed is False
     assert restored.native_guard_cancel_reason == "test cancel"
@@ -1660,6 +1742,31 @@ def test_session_state_round_trips_terminal_details():
     )
     assert restored.dispatch_failure_counts == {"room_five": 3}
     assert restored.dispatch_escalated_room_ids == ["room_five"]
+
+
+def test_finalized_v03_navigation_recovery_is_not_inferred_without_start_evidence():
+    restored = logic.SessionState.from_dict(
+        {
+            "session_id": "legacy-active",
+            "started_at": "2026-09-14T15:11:09+00:00",
+            "active": True,
+            "attempted_room_ids": [],
+            "failed_room_ids": [],
+            "retry_room_ids": [],
+            "last_command_recovery": {
+                "room_id": "gym",
+                "reason": "Cannot reach target",
+                "outcome": "interrupted",
+                "dispatch_failure_code": None,
+            },
+        }
+    )
+
+    assert restored is not None
+    assert restored.pending_recovery_room_id is None
+    assert restored.pending_recovery_policy is None
+    assert restored.retry_room_ids == []
+    assert restored.retried_room_ids == []
 
 
 def test_retained_task_guard_round_trips_recovery_state():

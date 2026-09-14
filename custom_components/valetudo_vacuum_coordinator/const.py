@@ -2,7 +2,7 @@
 
 DOMAIN = "valetudo_vacuum_coordinator"
 NAME = "Valetudo Vacuum Coordinator"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 PLATFORM_BINARY_SENSOR = "binary_sensor"
 PLATFORM_SENSOR = "sensor"
@@ -22,6 +22,7 @@ CONF_MANUAL_TRACKING = "manual_tracking"
 CONF_MIN_BATTERY = "min_battery"
 CONF_NATIVE_RESUME_ENABLED = "native_resume_enabled"
 CONF_NATIVE_RESUME_TIMEOUT = "native_resume_timeout"
+CONF_NAVIGATION_ERROR_RETURN_ENABLED = "navigation_error_return_enabled"
 CONF_DOCK_SETTLE = "dock_settle"
 CONF_DISPATCH_START_TIMEOUT = "dispatch_start_timeout"
 CONF_BLOCKED_SESSION_TIMEOUT = "blocked_session_timeout"
@@ -79,6 +80,7 @@ DEFAULT_AWAY_DELAY = 300
 DEFAULT_MIN_BATTERY = 55
 DEFAULT_NATIVE_RESUME_ENABLED = True
 DEFAULT_NATIVE_RESUME_TIMEOUT = 10800
+DEFAULT_NAVIGATION_ERROR_RETURN_ENABLED = False
 DEFAULT_DOCK_SETTLE = 60
 DEFAULT_DISPATCH_START_TIMEOUT = 120
 DEFAULT_BLOCKED_SESSION_TIMEOUT = 300
@@ -169,8 +171,16 @@ ATTR_BLOCKER_OPERATOR_ACTION = "blocker_operator_action"
 ATTR_RECOVERY_PHASE = "recovery_phase"
 ATTR_RECOVERY_STARTED_AT = "recovery_started_at"
 ATTR_NEXT_RETRY_AT = "next_retry_at"
+ATTR_RETRY_CADENCE_REASON = "retry_cadence_reason"
 ATTR_WAITING_FOR_PHYSICAL_FIX = "waiting_for_physical_fix"
 ATTR_PRESERVED_ROOMS = "preserved_rooms"
+ATTR_PENDING_RECOVERY_ROOM = "pending_recovery_room"
+ATTR_PENDING_RECOVERY_REASON = "pending_recovery_reason"
+ATTR_PENDING_RECOVERY_POLICY = "pending_recovery_policy"
+ATTR_RETRY_ROOMS = "retry_rooms"
+ATTR_RETRIED_ROOMS = "retried_rooms"
+ATTR_NEXT_CANDIDATE_ROOM = "next_candidate_room"
+ATTR_NAVIGATION_ERROR_RETURN_ENABLED = "navigation_error_return_enabled"
 ATTR_UNCERTAIN_ROOMS = "uncertain_rooms"
 ATTR_UNCERTAIN_REASONS = "uncertain_reasons"
 

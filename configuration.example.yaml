@@ -31,6 +31,9 @@ valetudo_vacuum_coordinator:
   stale_resume_clear_timeout: 30
   # Reserved for compatibility; v0.3.0 keeps this inert.
   resume_nudge_enabled: false
+  # Shadow-safe until this robot model has been observed accepting one dock
+  # return while the exact Cannot reach target error is latched.
+  navigation_error_return_enabled: false
 
   # MQTT topics are case-sensitive; replace `robot` with the exact Valetudo MQTT identifier.
   segment_command_topic: valetudo/robot/MapSegmentationCapability/clean/set

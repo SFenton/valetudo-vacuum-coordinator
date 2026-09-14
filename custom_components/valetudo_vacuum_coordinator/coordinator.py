@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 import logging
@@ -40,6 +41,7 @@ from .const import (
     CONF_MIN_BATTERY,
     CONF_NATIVE_RESUME_ENABLED,
     CONF_NATIVE_RESUME_TIMEOUT,
+    CONF_NAVIGATION_ERROR_RETURN_ENABLED,
     CONF_DOCK_SETTLE,
     CONF_RESUME_NUDGE_ENABLED,
     CONF_MODE_ENTITY,
@@ -65,6 +67,7 @@ from .const import (
     DEFAULT_MIN_BATTERY,
     DEFAULT_NATIVE_RESUME_ENABLED,
     DEFAULT_NATIVE_RESUME_TIMEOUT,
+    DEFAULT_NAVIGATION_ERROR_RETURN_ENABLED,
     DEFAULT_STALE_RESUME_AGE,
     DEFAULT_STALE_RESUME_AUTO_CLEAR,
     DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
@@ -112,6 +115,7 @@ from .logic import (
     RETAINED_TASK_PHASE_VERIFYING,
     RoomConfig,
     RoomLedger,
+    RoomSelection,
     SessionState,
     WhileAwayOutcome,
     attempt_mode_for_run,
@@ -176,6 +180,8 @@ _RESTORE_RECONCILE_DELAY_SECONDS = 15
 _TERMINAL_CLEANUP_RETRY_SECONDS = 30
 _MAX_TERMINAL_CLEANUP_RETRIES = 3
 _MAX_AUTOMATIC_DISPATCH_FAILURES = 3
+_VALIDATED_NAVIGATION_RETURN_ERRORS = {"cannot reach target"}
+_NAVIGATION_RETRY_LATER_POLICY = "navigation_retry_later"
 
 
 class ValetudoVacuumCoordinator:
@@ -464,8 +470,23 @@ class ValetudoVacuumCoordinator:
             "cancel_return_attempts": (
                 run.cancel_return_attempts if run else 0
             ),
+            "cancel_return_requested_at": (
+                run.cancel_return_requested_at if run else None
+            ),
             "cancel_return_acknowledged_at": (
-                run.cancel_return_acknowledged_at if run else None
+                (
+                    run.cancel_return_service_acknowledged_at
+                    or run.cancel_return_state_acknowledged_at
+                    or run.cancel_return_acknowledged_at
+                )
+                if run
+                else None
+            ),
+            "cancel_return_service_acknowledged_at": (
+                run.cancel_return_service_acknowledged_at if run else None
+            ),
+            "cancel_return_state_acknowledged_at": (
+                run.cancel_return_state_acknowledged_at if run else None
             ),
             "floor_completion_status": (
                 run.floor_completion_status if run else None
@@ -583,16 +604,6 @@ class ValetudoVacuumCoordinator:
         pending: list[RoomConfig] = []
         pending_ids: set[str] = set()
 
-        if self.session and self.session.pending_recovery_room_id:
-            room = self.room_by_id.get(self.session.pending_recovery_room_id)
-            if (
-                room
-                and room.room_id not in held_room_ids
-                and self._room_auto_clean_enabled(room)
-            ):
-                pending.append(room)
-                pending_ids.add(room.room_id)
-
         priority_retry_room_ids = (
             self.session.priority_retry_room_ids if self.session else []
         )
@@ -609,7 +620,7 @@ class ValetudoVacuumCoordinator:
 
         pending.extend(
             room
-            for room in self.rooms
+            for room in self._sorted_auto_clean_rooms()
             if self._room_auto_clean_enabled(room)
             and room.room_id not in attempted
             and room.room_id not in pending_ids
@@ -630,6 +641,198 @@ class ValetudoVacuumCoordinator:
                 pending.append(room)
                 pending_ids.add(room.room_id)
         return pending
+
+    @property
+    def next_candidate_room_id(self) -> str | None:
+        """Return the first room planned after the current blocker clears."""
+        selection = self._planned_next_room(
+            assume_pending_recovery_resolved=True
+        )
+        return selection.room.room_id if selection else None
+
+    @property
+    def navigation_error_return_enabled(self) -> bool:
+        """Return whether target-unreachable errors may request one dock return."""
+        return bool(
+            self.config.get(
+                CONF_NAVIGATION_ERROR_RETURN_ENABLED,
+                DEFAULT_NAVIGATION_ERROR_RETURN_ENABLED,
+            )
+        )
+
+    def _projected_room_queues(
+        self,
+        *,
+        assume_pending_recovery_resolved: bool,
+        include_refill_priority: bool = False,
+    ) -> tuple[set[str], list[str], list[str]]:
+        """Return local attempted and retry queues for side-effect-free planning."""
+        session = self.session
+        if not session:
+            return set(), [], []
+        attempted = set(session.attempted_room_ids)
+        attempted.update(self._dispatch_held_room_ids_snapshot())
+        retry_room_ids = list(session.retry_room_ids)
+        priority_retry_room_ids = list(session.priority_retry_room_ids)
+        if include_refill_priority:
+            for room_id in self._refilled_normal_retry_room_ids():
+                if room_id in retry_room_ids:
+                    retry_room_ids.remove(room_id)
+                if room_id not in priority_retry_room_ids:
+                    priority_retry_room_ids.append(room_id)
+        recovery_room_id = session.pending_recovery_room_id
+        if (
+            assume_pending_recovery_resolved
+            and recovery_room_id
+            and session.can_retry_room(recovery_room_id)
+            and (room := self.room_by_id.get(recovery_room_id))
+            and self._room_auto_clean_enabled(room)
+        ):
+            if session.pending_recovery_priority:
+                priority_retry_room_ids.append(recovery_room_id)
+            else:
+                retry_room_ids.append(recovery_room_id)
+        return attempted, retry_room_ids, priority_retry_room_ids
+
+    def _planned_normal_room(
+        self,
+        resources: ResourceState,
+        *,
+        assume_pending_recovery_resolved: bool,
+        include_refill_priority: bool = False,
+    ) -> tuple[RoomSelection | None, list[tuple[RoomConfig, str]]]:
+        """Return the normal-lane selection using the dispatch scheduler."""
+        attempted, retry_room_ids, priority_retry_room_ids = (
+            self._projected_room_queues(
+                assume_pending_recovery_resolved=(
+                    assume_pending_recovery_resolved
+                ),
+                include_refill_priority=include_refill_priority,
+            )
+        )
+        return select_next_room(
+            self._auto_clean_rooms(),
+            self.ledgers,
+            attempted,
+            resources,
+            False,
+            self._current_auto_clean_day(),
+            retry_room_ids,
+            priority_retry_room_ids,
+        )
+
+    def _planned_degraded_room(
+        self,
+        resources: ResourceState,
+        *,
+        assume_pending_recovery_resolved: bool,
+    ) -> RoomSelection | None:
+        """Return the degraded-lane selection in actual dispatch order."""
+        session = self.session
+        if not session:
+            return None
+        attempted, retry_room_ids, _priority_retry_room_ids = (
+            self._projected_room_queues(
+                assume_pending_recovery_resolved=(
+                    assume_pending_recovery_resolved
+                ),
+            )
+        )
+        held_room_ids = self._dispatch_held_room_ids_snapshot()
+        fallback_attempted = set(session.fallback_attempted_room_ids)
+        fallback_attempted.update(held_room_ids)
+        completed = set(session.completed_room_ids)
+        auto_clean_day = self._current_auto_clean_day()
+        ordered = self._sorted_auto_clean_rooms()
+        for room in ordered:
+            if (
+                not room.mop_required
+                and room.room_id not in attempted
+                and not room_auto_cleaned_on(
+                    self.ledgers.get(room.room_id, RoomLedger()),
+                    auto_clean_day,
+                )
+            ):
+                return RoomSelection(room=room, vacuum_only=True)
+
+        current_water_reason = clean_water_vacuum_only_reason(resources)
+        if (
+            current_water_reason
+            and self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)
+        ):
+            for room in ordered:
+                if (
+                    room.mop_required
+                    and room.room_id not in completed
+                    and room.room_id not in fallback_attempted
+                    and not room_auto_cleaned_on(
+                        self.ledgers.get(room.room_id, RoomLedger()),
+                        auto_clean_day,
+                    )
+                ):
+                    return RoomSelection(
+                        room=room,
+                        vacuum_only=True,
+                        mop_block_reason=current_water_reason,
+                        fallback_vacuum=True,
+                    )
+
+        for room_id in retry_room_ids:
+            room = self.room_by_id.get(room_id)
+            if (
+                room
+                and not room.mop_required
+                and room_id not in held_room_ids
+                and self._room_auto_clean_enabled(room)
+                and not room_auto_cleaned_on(
+                    self.ledgers.get(room_id, RoomLedger()),
+                    auto_clean_day,
+                )
+            ):
+                return RoomSelection(room=room, vacuum_only=True)
+        return None
+
+    def _planned_next_room(
+        self,
+        *,
+        assume_pending_recovery_resolved: bool,
+    ) -> RoomSelection | None:
+        """Return the same room projection consumed by dispatch."""
+        if not self.session or not self.session.active:
+            return None
+        resources = self._resource_state()
+        if (
+            assume_pending_recovery_resolved
+            and self.session.pending_recovery_room_id
+        ):
+            resources = replace(resources, error="No error")
+        resource_blocker = classify_blocker(resources)
+        if (
+            self.session.degraded_reason
+            and resource_blocker
+            and resource_blocker.vacuum_only_safe
+        ):
+            return self._planned_degraded_room(
+                resources,
+                assume_pending_recovery_resolved=(
+                    assume_pending_recovery_resolved
+                ),
+            )
+        if self.session.degraded_reason and resource_blocker is None:
+            native_room = self._next_degraded_native_room()
+            if native_room:
+                return RoomSelection(room=native_room, vacuum_only=True)
+        selection, _skipped = self._planned_normal_room(
+            resources,
+            assume_pending_recovery_resolved=(
+                assume_pending_recovery_resolved
+            ),
+            include_refill_priority=bool(
+                self.session.degraded_reason
+                and resource_blocker is None
+            ),
+        )
+        return selection
 
     @property
     def while_away_cleaned_messages(self) -> list[str]:
@@ -741,6 +944,7 @@ class ValetudoVacuumCoordinator:
             self.session.pending_recovery_room_id = None
             self.session.pending_recovery_reason = None
             self.session.pending_recovery_priority = False
+            self.session.pending_recovery_policy = None
             self.session.retry_room_ids = []
             self.session.priority_retry_room_ids = []
             self.session.terminal_reason = (
@@ -928,9 +1132,16 @@ class ValetudoVacuumCoordinator:
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
         if (
             run.cancel_return_attempts >= 1
-            and not run.cancel_return_acknowledged_at
+            and not run.return_acknowledged
         ):
-            if vacuum_state in _MOVING_VACUUM_STATES:
+            if (
+                vacuum_state in _MOVING_VACUUM_STATES
+                or (
+                    run.cancel_recover_room
+                    and vacuum_state == "error"
+                )
+                or vacuum_state not in _AT_DOCK_VACUUM_STATES
+            ):
                 if self.session:
                     self.session.enter_recovery(
                         code="command.return_ack_pending",
@@ -940,24 +1151,28 @@ class ValetudoVacuumCoordinator:
                             "return-to-base attempt"
                         ),
                         phase="operator_required",
-                        next_retry_at=None,
+                        next_retry_at=run.cancel_ack_deadline,
                         waiting_for_physical_fix=False,
                         operator_action=(
                             "Leave the robot reachable so its return state can "
                             "be confirmed."
                         ),
+                        retry_cadence_reason="command_ack_recheck",
                     )
                 await self._async_save_store()
                 self._notify_listeners()
                 self._schedule_cancel_ack_timeout()
                 return False
-            run.cancel_return_acknowledged_at = utcnow_iso()
+            run.cancel_return_state_acknowledged_at = utcnow_iso()
             run.cancel_ack_deadline = None
             self._cancel_cancel_ack_timeout()
             await self._async_save_store()
         if (
-            vacuum_state in _MOVING_VACUUM_STATES
-            and run.cancel_return_attempts == 0
+            (
+                vacuum_state in _MOVING_VACUUM_STATES
+                and run.cancel_return_attempts == 0
+            )
+            or self._navigation_error_return_allowed(run, vacuum_state)
         ):
             run.cancel_return_attempts = 1
             run.cancel_return_requested_at = utcnow_iso()
@@ -995,18 +1210,19 @@ class ValetudoVacuumCoordinator:
                             f"is uncertain: {err}"
                         ),
                         phase="operator_required",
-                        next_retry_at=None,
+                        next_retry_at=run.cancel_ack_deadline,
                         waiting_for_physical_fix=False,
                         operator_action=(
                             "Leave the robot reachable so its return state can "
                             "be confirmed."
                         ),
+                        retry_cadence_reason="command_ack_recheck",
                     )
                 await self._async_save_store()
                 self._notify_listeners()
                 self._schedule_cancel_ack_timeout()
                 return False
-            run.cancel_return_acknowledged_at = utcnow_iso()
+            run.cancel_return_service_acknowledged_at = utcnow_iso()
             run.cancel_ack_deadline = None
             self._cancel_cancel_ack_timeout()
             await self._async_save_store()
@@ -1036,6 +1252,24 @@ class ValetudoVacuumCoordinator:
                         kind="failed",
                         run=run,
                         result="interrupted",
+                        reason=reason,
+                        occurred_at=when,
+                    )
+                elif run.cancel_continue_session and run.cancel_recover_room:
+                    retry_eligible = self.session.can_retry_room(run.room_id)
+                    run.cancel_outcome_result = (
+                        "interrupted" if retry_eligible else "failed"
+                    )
+                    self.session.mark_failed(run.room_id, reason)
+                    self.session.begin_recovering(
+                        run.room_id,
+                        reason,
+                        policy=_NAVIGATION_RETRY_LATER_POLICY,
+                    )
+                    self._record_attempt_outcome(
+                        kind="failed",
+                        run=run,
+                        result=run.cancel_outcome_result,
                         reason=reason,
                         occurred_at=when,
                     )
@@ -1076,10 +1310,31 @@ class ValetudoVacuumCoordinator:
                 ),
                 "return_attempts": run.cancel_return_attempts,
                 "return_requested_at": run.cancel_return_requested_at,
-                "return_acknowledged_at": (
+                "return_service_acknowledged_at": (
+                    run.cancel_return_service_acknowledged_at
+                ),
+                "return_state_acknowledged_at": (
+                    run.cancel_return_state_acknowledged_at
+                ),
+                "return_legacy_acknowledged_at": (
                     run.cancel_return_acknowledged_at
                 ),
+                "return_recovery_confirmed_at": None,
                 "outcome": run.cancel_outcome_result,
+                "recovery_policy": (
+                    "recover_then_retry_later"
+                    if run.cancel_recover_room
+                    else (
+                        "requeue_same"
+                        if run.cancel_requeue_room
+                        else None
+                    )
+                ),
+                "retry_eligible": bool(
+                    run.cancel_recover_room
+                    and run.room_id
+                    and self.session.can_retry_room(run.room_id)
+                ),
                 "dispatch_failure_code": run.dispatch_failure_code,
                 "dispatch_failure_count": (
                     self.session.dispatch_failure_counts.get(
@@ -1089,6 +1344,10 @@ class ValetudoVacuumCoordinator:
                 ),
             }
         self._clear_active_run()
+        if self.session and self.session.last_command_recovery:
+            self.session.last_command_recovery["next_candidate_room"] = (
+                self.next_candidate_room_id
+            )
         return True
 
     def _cancel_stop_physically_acknowledged(self) -> bool:
@@ -2694,7 +2953,7 @@ class ValetudoVacuumCoordinator:
                 run.cancel_stop_acknowledged_at
                 and not (
                     run.cancel_return_attempts >= 1
-                    and not run.cancel_return_acknowledged_at
+                    and not run.return_acknowledged
                 )
             )
             or getattr(self, "_cancel_ack_timeout_cancel", None) is not None
@@ -2779,7 +3038,7 @@ class ValetudoVacuumCoordinator:
                 pending_stop_ack = not run.cancel_stop_acknowledged_at
                 pending_return_ack = bool(
                     run.cancel_return_attempts >= 1
-                    and not run.cancel_return_acknowledged_at
+                    and not run.return_acknowledged
                 )
                 if (
                     (pending_stop_ack or pending_return_ack)
@@ -2817,6 +3076,7 @@ class ValetudoVacuumCoordinator:
                                 "Wait for physical confirmation; no duplicate "
                                 "command will be sent."
                             ),
+                            retry_cadence_reason="command_ack_recheck",
                         )
                     await self._async_save_store()
                     self._notify_listeners()
@@ -4120,6 +4380,14 @@ class ValetudoVacuumCoordinator:
         for room_id in self.session.dispatch_failure_counts:
             if room_id in self.room_by_id and room_id not in room_ids:
                 room_ids.append(room_id)
+        recovery_room_id = self.session.pending_recovery_room_id
+        if (
+            recovery_room_id
+            and self.session.can_retry_room(recovery_room_id)
+            and recovery_room_id in self.room_by_id
+            and recovery_room_id not in room_ids
+        ):
+            room_ids.append(recovery_room_id)
         for room_id in self.session.deferred_full_clean_room_ids:
             if room_id not in room_ids:
                 room_ids.append(room_id)
@@ -4343,6 +4611,7 @@ class ValetudoVacuumCoordinator:
         *,
         phase: str,
         next_retry_at: datetime | None,
+        retry_cadence_reason: str | None = None,
     ) -> None:
         """Persist one deduplicated recoverable wait and operator alert."""
         session = self.session
@@ -4358,6 +4627,7 @@ class ValetudoVacuumCoordinator:
             ),
             waiting_for_physical_fix=blocker.waiting_for_physical_fix,
             operator_action=blocker.operator_action,
+            retry_cadence_reason=retry_cadence_reason,
         )
         if (
             blocker.code == "recovery.degraded_preparation"
@@ -4497,25 +4767,34 @@ class ValetudoVacuumCoordinator:
             await self._async_terminalize_unrecoverable(blocker)
             return
         now = dt_util.utcnow()
+        timeout_seconds, retry_cadence_reason = (
+            self._blocked_session_timeout_details(
+                reason or blocker.reason,
+                blocker=blocker,
+            )
+        )
         candidate_deadline = (
             retry_at
             if retry_at is not None
             else now
-            + timedelta(
-                seconds=self._blocked_session_timeout_seconds(
-                    reason or blocker.reason
-                )
-            )
+            + timedelta(seconds=timeout_seconds)
         )
         deadline = parse_datetime(session.next_retry_at)
+        selected_cadence_reason = session.retry_cadence_reason
         if retry_at is not None:
             deadline = candidate_deadline
+            selected_cadence_reason = "explicit_deadline"
         elif (
             deadline is None
             or deadline <= now
             or candidate_deadline < deadline
         ):
             deadline = candidate_deadline
+            selected_cadence_reason = retry_cadence_reason
+        elif selected_cadence_reason is None:
+            selected_cadence_reason = "restored_deadline"
+        previous_deadline = session.next_retry_at
+        previous_cadence_reason = session.retry_cadence_reason
         await self._async_enter_recoverable_wait(
             blocker,
             phase=(
@@ -4524,7 +4803,22 @@ class ValetudoVacuumCoordinator:
                 else "waiting_for_retry"
             ),
             next_retry_at=deadline,
+            retry_cadence_reason=selected_cadence_reason,
         )
+        if (
+            previous_deadline != session.next_retry_at
+            or previous_cadence_reason != session.retry_cadence_reason
+        ):
+            _LOGGER.info(
+                "%s recovery wait: blocker=%s cadence=%s next_retry_at=%s "
+                "next_candidate_room=%s pending_recovery_room=%s",
+                self.name,
+                blocker.code,
+                session.retry_cadence_reason,
+                session.next_retry_at,
+                self.next_candidate_room_id,
+                session.pending_recovery_room_id,
+            )
         if getattr(self, "_blocked_session_watchdog_cancel", None) is not None:
             self._blocked_session_watchdog_cancel()
             self._blocked_session_watchdog_cancel = None
@@ -4548,41 +4842,83 @@ class ValetudoVacuumCoordinator:
 
     def _blocked_session_timeout_seconds(self, reason: str | None) -> int:
         """Return the bounded wait for the current blocked condition."""
+        timeout, _cadence_reason = self._blocked_session_timeout_details(
+            reason,
+            blocker=self._current_blocker(),
+        )
+        return timeout
+
+    def _blocked_session_timeout_details(
+        self,
+        reason: str | None,
+        *,
+        blocker: BlockerClassification | None,
+    ) -> tuple[int, str]:
+        """Return the recovery delay and the policy that selected it."""
         normalized_reason = (normalize_state(reason) or "").lower()
         battery_entity = self.config.get(CONF_BATTERY_ENTITY)
         battery = parse_float(self._state(battery_entity)) if battery_entity else None
         minimum_battery = float(
             self.config.get(CONF_MIN_BATTERY, DEFAULT_MIN_BATTERY)
         )
-        long_recovery_wait = bool(
-            is_low_battery_error(reason)
-            or "battery" in normalized_reason
-            or "charging" in normalized_reason
-            or normalize_state(self._state(self.vacuum_entity)) == "charging"
-            or self.native_resume_pending
-            or (
-                battery is not None
-                and battery < minimum_battery
+        if (
+            blocker
+            and blocker.category == "navigation"
+        ) or (
+            self.session
+            and self.session.pending_recovery_policy
+            == _NAVIGATION_RETRY_LATER_POLICY
+        ):
+            return (
+                max(
+                    1,
+                    int(
+                        self.config.get(
+                            CONF_BLOCKED_SESSION_TIMEOUT,
+                            DEFAULT_BLOCKED_SESSION_TIMEOUT,
+                        )
+                    ),
+                ),
+                "navigation_recheck",
             )
-        )
-        if long_recovery_wait:
-            return max(
+        if is_low_battery_error(reason):
+            long_recovery_reason = "low_battery_error"
+        elif "battery" in normalized_reason:
+            long_recovery_reason = "battery_reason"
+        elif "charging" in normalized_reason:
+            long_recovery_reason = "charging_reason"
+        elif normalize_state(self._state(self.vacuum_entity)) == "charging":
+            long_recovery_reason = "vacuum_charging"
+        elif self.native_resume_pending:
+            long_recovery_reason = "native_resume_pending"
+        elif battery is not None and battery < minimum_battery:
+            long_recovery_reason = "battery_below_minimum"
+        else:
+            long_recovery_reason = None
+        if long_recovery_reason:
+            return (
+                max(
+                    1,
+                    int(
+                        self.config.get(
+                            CONF_NATIVE_RESUME_TIMEOUT,
+                            DEFAULT_NATIVE_RESUME_TIMEOUT,
+                        )
+                    ),
+                ),
+                long_recovery_reason,
+            )
+        return (
+            max(
                 1,
                 int(
                     self.config.get(
-                        CONF_NATIVE_RESUME_TIMEOUT,
-                        DEFAULT_NATIVE_RESUME_TIMEOUT,
+                        CONF_BLOCKED_SESSION_TIMEOUT,
+                        DEFAULT_BLOCKED_SESSION_TIMEOUT,
                     )
                 ),
-            )
-        return max(
-            1,
-            int(
-                self.config.get(
-                    CONF_BLOCKED_SESSION_TIMEOUT,
-                    DEFAULT_BLOCKED_SESSION_TIMEOUT,
-                )
             ),
+            "blocked_session_recheck",
         )
 
     async def _async_expire_blocked_session_serialized(self) -> None:
@@ -4615,6 +4951,32 @@ class ValetudoVacuumCoordinator:
                 )
             )
 
+    def _navigation_error_return_allowed(
+        self,
+        run: ActiveRun,
+        vacuum_state: str | None,
+    ) -> bool:
+        """Return whether the exact validated live error permits one return."""
+        status_flag = (
+            normalize_state(self._status_flag())
+            if self.config.get(CONF_STATUS_FLAG_ENTITY)
+            else None
+        )
+        return bool(
+            self.navigation_error_return_enabled
+            and run.cancel_recover_room
+            and run.room_id in self.room_by_id
+            and run.cancel_return_attempts == 0
+            and run.cancel_stop_acknowledged_at
+            and vacuum_state == "error"
+            and (normalize_state(run.cancel_reason) or "").lower()
+            in _VALIDATED_NAVIGATION_RETURN_ERRORS
+            and (normalize_state(self.error_state) or "").lower()
+            in _VALIDATED_NAVIGATION_RETURN_ERRORS
+            and status_flag
+            not in {"segment", "resumable", "unknown", "unavailable"}
+        )
+
     def _clear_blocked_session_watchdog(self) -> None:
         """Clear the no-progress deadline, reason, and timer."""
         if getattr(self, "_blocked_session_watchdog_cancel", None) is not None:
@@ -4628,6 +4990,7 @@ class ValetudoVacuumCoordinator:
             ):
                 self.session.blocked_deadline = None
                 self.session.next_retry_at = None
+                self.session.retry_cadence_reason = None
                 self.session.recovery_phase = "degraded_vacuum"
                 return
             self.session.clear_recovery()
@@ -4794,17 +5157,9 @@ class ValetudoVacuumCoordinator:
                 self._notify_listeners()
                 return
 
-        selection, skipped = select_next_room(
-            self._auto_clean_rooms(),
-            self.ledgers,
-            set(self.session.attempted_room_ids).union(
-                dispatch_held_room_ids
-            ),
-            self._resource_state(),
-            False,
-            self._current_auto_clean_day(),
-            self.session.retry_room_ids,
-            self.session.priority_retry_room_ids,
+        selection, skipped = self._planned_normal_room(
+            resources,
+            assume_pending_recovery_resolved=False,
         )
 
         for room, reason in skipped:
@@ -4832,6 +5187,7 @@ class ValetudoVacuumCoordinator:
             self.session.pending_recovery_room_id = None
             self.session.pending_recovery_reason = None
             self.session.pending_recovery_priority = False
+            self.session.pending_recovery_policy = None
             self.session.retry_room_ids = []
             self.session.priority_retry_room_ids = []
             self.session.terminal_reason = no_selection_terminal_reason(
@@ -4872,8 +5228,6 @@ class ValetudoVacuumCoordinator:
         if not blocker.vacuum_only_safe:
             await self._async_arm_blocked_session_watchdog(blocker.reason)
             return
-        current_water_reason = clean_water_vacuum_only_reason(resources)
-
         if not await self._async_prepare_degraded_vacuuming():
             retry_at = (
                 parse_datetime(session.degraded_mode_next_retry_at)
@@ -4914,9 +5268,11 @@ class ValetudoVacuumCoordinator:
         if not blocker.vacuum_only_safe:
             await self._async_arm_blocked_session_watchdog(blocker.reason)
             return
-        current_water_reason = clean_water_vacuum_only_reason(resources)
-        native_room = self._next_degraded_native_room()
-        if native_room:
+        selection = self._planned_degraded_room(
+            resources,
+            assume_pending_recovery_resolved=False,
+        )
+        if selection:
             if not self._vacuum_ready_for_selection(vacuum_only=True):
                 await self._async_arm_blocked_session_watchdog(
                     self._current_blocked_reason(resources)
@@ -4930,36 +5286,11 @@ class ValetudoVacuumCoordinator:
                 next_retry_at=None,
             )
             await self._async_start_room(
-                native_room,
-                vacuum_only=True,
-                fallback_vacuum=False,
+                selection.room,
+                vacuum_only=selection.vacuum_only,
+                fallback_vacuum=selection.fallback_vacuum,
             )
             return
-
-        if (
-            current_water_reason
-            and self.config.get(CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED)
-        ):
-            fallback_room = self._next_degraded_fallback_room()
-            if fallback_room:
-                if not self._vacuum_ready_for_selection(vacuum_only=True):
-                    await self._async_arm_blocked_session_watchdog(
-                        self._current_blocked_reason(resources)
-                        or current_water_reason
-                    )
-                    self._notify_listeners()
-                    return
-                await self._async_enter_recoverable_wait(
-                    blocker,
-                    phase="degraded_vacuum",
-                    next_retry_at=None,
-                )
-                await self._async_start_room(
-                    fallback_room,
-                    vacuum_only=True,
-                    fallback_vacuum=True,
-                )
-                return
 
         actionable_deferred = [
             room_id
@@ -4999,15 +5330,9 @@ class ValetudoVacuumCoordinator:
             )
             return
         self._queue_refilled_normal_retries()
-        selection, skipped = select_next_room(
-            self._auto_clean_rooms(),
-            self.ledgers,
-            set(session.attempted_room_ids).union(held_room_ids),
+        selection, skipped = self._planned_normal_room(
             resources,
-            False,
-            self._current_auto_clean_day(),
-            session.retry_room_ids,
-            session.priority_retry_room_ids,
+            assume_pending_recovery_resolved=False,
         )
         if selection:
             if not self._vacuum_ready_for_selection(
@@ -5118,6 +5443,26 @@ class ValetudoVacuumCoordinator:
             None,
         )
 
+    def _next_degraded_retry_room(self) -> RoomConfig | None:
+        """Return the next safe native retry after unattempted degraded work."""
+        if not self.session:
+            return None
+        auto_clean_day = self._current_auto_clean_day()
+        return next(
+            (
+                room
+                for room_id in self.session.retry_room_ids
+                if (room := self.room_by_id.get(room_id))
+                and not room.mop_required
+                and self._room_auto_clean_enabled(room)
+                and not room_auto_cleaned_on(
+                    self.ledgers.get(room.room_id, RoomLedger()),
+                    auto_clean_day,
+                )
+            ),
+            None,
+        )
+
     def _next_degraded_fallback_room(self) -> RoomConfig | None:
         """Return the next incomplete dual-mode room with an unused fallback token."""
         if not self.session:
@@ -5212,29 +5557,54 @@ class ValetudoVacuumCoordinator:
                     auto_clean_day,
                 )
             )
+        pending_ids = {room.room_id for room in rooms}
+        for room_id in self.session.retry_room_ids:
+            room = self.room_by_id.get(room_id)
+            if (
+                room
+                and not room.mop_required
+                and self._room_auto_clean_enabled(room)
+                and room_id not in pending_ids
+                and not room_auto_cleaned_on(
+                    self.ledgers.get(room_id, RoomLedger()),
+                    auto_clean_day,
+                )
+            ):
+                rooms.append(room)
+                pending_ids.add(room_id)
         return rooms
+
+    def _refilled_normal_retry_room_ids(self) -> list[str]:
+        """Return deferred mop rooms in their post-refill priority order."""
+        session = self.session
+        if not session:
+            return []
+        fallback_completed = set(session.fallback_completed_room_ids)
+        return [
+            room_id
+            for room_id in sorted(
+                (
+                    room_id
+                    for room_id in session.deferred_full_clean_room_ids
+                    if room_id not in session.uncertain_room_ids
+                ),
+                key=lambda room_id: (
+                    room_id in fallback_completed,
+                    session.deferred_full_clean_room_ids.index(room_id),
+                ),
+            )
+            if (
+                (room := self.room_by_id.get(room_id))
+                and room.mop_required
+            )
+        ]
 
     def _queue_refilled_normal_retries(self) -> None:
         """Queue every deferred mop obligation after clean water recovers."""
         session = self.session
         if not session:
             return
-        fallback_completed = set(session.fallback_completed_room_ids)
-        deferred_room_ids = sorted(
-            (
-                room_id
-                for room_id in session.deferred_full_clean_room_ids
-                if room_id not in session.uncertain_room_ids
-            ),
-            key=lambda room_id: (
-                room_id in fallback_completed,
-                session.deferred_full_clean_room_ids.index(room_id),
-            ),
-        )
-        for room_id in deferred_room_ids:
-            room = self.room_by_id.get(room_id)
-            if not room or not room.mop_required:
-                continue
+        for room_id in self._refilled_normal_retry_room_ids():
             if room_id in session.retried_room_ids:
                 session.retried_room_ids.remove(room_id)
             session.queue_retry(room_id, priority=True)
@@ -5406,6 +5776,7 @@ class ValetudoVacuumCoordinator:
         self.session.pending_recovery_room_id = None
         self.session.pending_recovery_reason = None
         self.session.pending_recovery_priority = False
+        self.session.pending_recovery_policy = None
         self.session.retry_room_ids = []
         self.session.priority_retry_room_ids = []
         self.session.terminal_reason = no_selection_terminal_reason(
@@ -5614,11 +5985,10 @@ class ValetudoVacuumCoordinator:
     ) -> None:
         """Record a segment command only after MQTT accepts the publish."""
         if run.fallback_vacuum:
-            session.discard_retry(room.room_id)
             if session.pending_recovery_room_id == room.room_id:
                 session.resolve_recoverable_failure(
                     room.room_id,
-                    queue_retry=False,
+                    queue_retry=session.can_retry_room(room.room_id),
                 )
             session.mark_fallback_attempted(room.room_id)
             self._clear_blocked_session_watchdog()
@@ -5627,6 +5997,11 @@ class ValetudoVacuumCoordinator:
             previous_reason = session.failed_room_reasons.get(room.room_id)
             session.mark_retry_started(room.room_id)
             session.clear_room_issue(room.room_id)
+            recovery = session.last_command_recovery
+            if recovery.get("room_id") == room.room_id:
+                recovery["retry_started_at"] = utcnow_iso()
+                recovery["retry_eligible"] = False
+                recovery["retry_queued"] = False
             ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
             if previous_reason and ledger.last_failed_reason == previous_reason:
                 ledger.last_failed_reason = None
@@ -5929,8 +6304,29 @@ class ValetudoVacuumCoordinator:
             else blocker.reason
         )
         run.cancel_continue_session = blocker.recoverable
+        navigation_room_failure = bool(
+            blocker.code == "navigation.recoverable"
+            and run.room_id
+            and run.room_id in self.room_by_id
+            and not run.manual
+            and not run.fallback_vacuum
+            and not run.dispatch_failure_code
+            and run.confirmed_room_start
+            and (evidence is None or evidence.status == "incomplete")
+        )
+        if (
+            blocker.code == "navigation.recoverable"
+            and not run.confirmed_room_start
+            and not run.dispatch_failure_code
+            and (evidence is None or evidence.status == "incomplete")
+        ):
+            run.dispatch_failure_code = "dispatch.navigation_before_start"
+        run.cancel_recover_room = bool(
+            navigation_room_failure
+        )
         run.cancel_requeue_room = bool(
             blocker.recoverable
+            and not run.cancel_recover_room
             and (evidence is None or evidence.status == "incomplete")
         )
         run.cancel_outcome_result = (
@@ -5944,6 +6340,12 @@ class ValetudoVacuumCoordinator:
             parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
         )
         if blocker.recoverable and self.session:
+            if run.cancel_recover_room and run.room_id:
+                self.session.begin_recovering(
+                    run.room_id,
+                    run.cancel_reason,
+                    policy=_NAVIGATION_RETRY_LATER_POLICY,
+                )
             await self._async_enter_recoverable_wait(
                 blocker,
                 phase="cancelling_pending_command",
@@ -6012,12 +6414,24 @@ class ValetudoVacuumCoordinator:
             self.session.pending_recovery_room_id = None
             self.session.pending_recovery_reason = None
             self.session.pending_recovery_priority = False
+            self.session.pending_recovery_policy = None
             await self._async_save_store()
             self._notify_listeners()
             return True
 
         should_retry = self.session.can_retry_room(room_id)
         self.session.resolve_recoverable_failure(room_id, queue_retry=should_retry)
+        recovery = self.session.last_command_recovery
+        if recovery.get("room_id") == room_id:
+            recovered_at = utcnow_iso()
+            recovery["recovered_at"] = recovered_at
+            recovery["retry_queued"] = should_retry
+            if (
+                recovery.get("return_attempts", 0)
+                and not recovery.get("return_recovery_confirmed_at")
+            ):
+                recovery["return_recovery_confirmed_at"] = recovered_at
+            recovery["next_candidate_room"] = self.next_candidate_room_id
         if should_retry:
             _LOGGER.info(
                 "Recovered %s room %s after %s; queued it for one%s retry",
@@ -6028,8 +6442,8 @@ class ValetudoVacuumCoordinator:
             )
         else:
             _LOGGER.info(
-                "Recovered %s after the final low-battery failure for room %s; "
-                "continuing the queue",
+                "Recovered %s after room %s exhausted its retry; continuing "
+                "the queue",
                 self.name,
                 room_id,
             )
@@ -6081,11 +6495,24 @@ class ValetudoVacuumCoordinator:
             await self._async_terminalize_unrecoverable(blocker)
             return
 
+        navigation_retry_later = (
+            self.session.pending_recovery_policy
+            == _NAVIGATION_RETRY_LATER_POLICY
+        )
         self.session.discard_retry(room_id)
         self.session.begin_recovering(
             room_id,
             error,
-            priority=is_low_battery_error(error),
+            priority=(
+                False
+                if navigation_retry_later
+                else is_low_battery_error(error)
+            ),
+            policy=(
+                _NAVIGATION_RETRY_LATER_POLICY
+                if navigation_retry_later
+                else None
+            ),
         )
         await self._async_save_store()
         self._notify_listeners()

@@ -317,9 +317,12 @@ class ActiveRun:
     cancel_ack_deadline: str | None = None
     cancel_return_attempts: int = 0
     cancel_return_requested_at: str | None = None
+    cancel_return_service_acknowledged_at: str | None = None
+    cancel_return_state_acknowledged_at: str | None = None
     cancel_return_acknowledged_at: str | None = None
     cancel_continue_session: bool = False
     cancel_requeue_room: bool = False
+    cancel_recover_room: bool = False
     cancel_outcome_result: str | None = None
     floor_completion_status: str | None = None
     floor_completion_reason: str | None = None
@@ -333,6 +336,24 @@ class ActiveRun:
     def native_resume_pending(self) -> bool:
         """Return whether the run is waiting on retained native-task recovery."""
         return self.phase in NATIVE_RESUME_PENDING_PHASES
+
+    @property
+    def confirmed_room_start(self) -> bool:
+        """Return whether the robot positively acknowledged room cleaning."""
+        return bool(
+            self.start_confirmed_at
+            or self.observed_cleaning
+            or self.observed_segment_cleaning
+        )
+
+    @property
+    def return_acknowledged(self) -> bool:
+        """Return whether service, state, or legacy evidence acknowledged return."""
+        return bool(
+            self.cancel_return_service_acknowledged_at
+            or self.cancel_return_state_acknowledged_at
+            or self.cancel_return_acknowledged_at
+        )
 
     def observe_segment_iteration(
         self,
@@ -458,6 +479,46 @@ class ActiveRun:
             allowed_error_fingerprint = "mop.clean_water_empty"
         start_area = parse_float(data.get("start_area"))
         start_time = parse_float(data.get("start_time"))
+        cancel_reason = data.get("cancel_reason")
+        dispatch_failure_code = data.get("dispatch_failure_code")
+        confirmed_room_start = bool(
+            data.get("start_confirmed_at")
+            or data.get("observed_cleaning")
+            or data.get("observed_segment_cleaning")
+        )
+        cancel_recover_room = bool(data.get("cancel_recover_room", False))
+        if (
+            "cancel_recover_room" not in data
+            and bool(data.get("cancelled", False))
+            and phase == RUN_PHASE_CANCEL_PENDING
+            and bool(data.get("cancel_continue_session", False))
+            and bool(data.get("cancel_requeue_room", False))
+            and data.get("room_id")
+            and not bool(data.get("manual", False))
+            and not bool(data.get("fallback_vacuum", False))
+            and not dispatch_failure_code
+            and confirmed_room_start
+            and is_recoverable_navigation_error(cancel_reason)
+        ):
+            cancel_recover_room = True
+        if (
+            not cancel_recover_room
+            and bool(data.get("cancelled", False))
+            and phase == RUN_PHASE_CANCEL_PENDING
+            and bool(data.get("cancel_continue_session", False))
+            and bool(data.get("cancel_requeue_room", False))
+            and data.get("room_id")
+            and not bool(data.get("manual", False))
+            and not bool(data.get("fallback_vacuum", False))
+            and not dispatch_failure_code
+            and not confirmed_room_start
+            and is_recoverable_navigation_error(cancel_reason)
+        ):
+            dispatch_failure_code = "dispatch.navigation_before_start"
+        cancel_requeue_room = bool(
+            data.get("cancel_requeue_room", False)
+            and not cancel_recover_room
+        )
         return cls(
             room_id=data.get("room_id"),
             segment_id=data.get("segment_id"),
@@ -516,7 +577,7 @@ class ActiveRun:
                 )
             ),
             dispatch_deadline=data.get("dispatch_deadline"),
-            dispatch_failure_code=data.get("dispatch_failure_code"),
+            dispatch_failure_code=dispatch_failure_code,
             recovery_deadline=data.get("recovery_deadline"),
             resume_required=bool(data.get("resume_required", False)),
             post_suspend_cleaning_observed=bool(
@@ -530,7 +591,7 @@ class ActiveRun:
             last_area=parse_float(data.get("last_area", start_area)),
             last_time=parse_float(data.get("last_time", start_time)),
             cancel_requested_at=data.get("cancel_requested_at"),
-            cancel_reason=data.get("cancel_reason"),
+            cancel_reason=cancel_reason,
             cancel_stop_attempted=bool(
                 data.get("cancel_stop_attempted", False)
                 or cancel_stop_attempts
@@ -548,13 +609,20 @@ class ActiveRun:
                 int(parse_float(data.get("cancel_return_attempts")) or 0),
             ),
             cancel_return_requested_at=data.get("cancel_return_requested_at"),
+            cancel_return_service_acknowledged_at=data.get(
+                "cancel_return_service_acknowledged_at"
+            ),
+            cancel_return_state_acknowledged_at=data.get(
+                "cancel_return_state_acknowledged_at"
+            ),
             cancel_return_acknowledged_at=data.get(
                 "cancel_return_acknowledged_at"
             ),
             cancel_continue_session=bool(
                 data.get("cancel_continue_session", False)
             ),
-            cancel_requeue_room=bool(data.get("cancel_requeue_room", False)),
+            cancel_requeue_room=cancel_requeue_room,
+            cancel_recover_room=cancel_recover_room,
             cancel_outcome_result=data.get("cancel_outcome_result"),
             floor_completion_status=data.get("floor_completion_status"),
             floor_completion_reason=data.get("floor_completion_reason"),
@@ -632,11 +700,18 @@ class ActiveRun:
             "cancel_ack_deadline": self.cancel_ack_deadline,
             "cancel_return_attempts": self.cancel_return_attempts,
             "cancel_return_requested_at": self.cancel_return_requested_at,
+            "cancel_return_service_acknowledged_at": (
+                self.cancel_return_service_acknowledged_at
+            ),
+            "cancel_return_state_acknowledged_at": (
+                self.cancel_return_state_acknowledged_at
+            ),
             "cancel_return_acknowledged_at": (
                 self.cancel_return_acknowledged_at
             ),
             "cancel_continue_session": self.cancel_continue_session,
             "cancel_requeue_room": self.cancel_requeue_room,
+            "cancel_recover_room": self.cancel_recover_room,
             "cancel_outcome_result": self.cancel_outcome_result,
             "floor_completion_status": self.floor_completion_status,
             "floor_completion_reason": self.floor_completion_reason,
@@ -1246,6 +1321,7 @@ class SessionState:
     pending_recovery_room_id: str | None = None
     pending_recovery_reason: str | None = None
     pending_recovery_priority: bool = False
+    pending_recovery_policy: str | None = None
     active_room_id: str | None = None
     terminal_reason: str | None = None
     terminal_message: str | None = None
@@ -1277,6 +1353,7 @@ class SessionState:
     recovery_phase: str | None = None
     recovery_started_at: str | None = None
     next_retry_at: str | None = None
+    retry_cadence_reason: str | None = None
     waiting_for_physical_fix: bool = False
     recovery_notification_fingerprint: str | None = None
     recovery_notification_attempts: int = 0
@@ -1401,6 +1478,7 @@ class SessionState:
         next_retry_at: str | None,
         waiting_for_physical_fix: bool,
         operator_action: str | None = None,
+        retry_cadence_reason: str | None = None,
     ) -> None:
         """Persist an explicit waiting state without discarding the queue."""
         now = utcnow_iso()
@@ -1416,6 +1494,7 @@ class SessionState:
         self.recovery_phase = phase
         self.next_retry_at = next_retry_at
         self.blocked_deadline = next_retry_at
+        self.retry_cadence_reason = retry_cadence_reason
         self.waiting_for_physical_fix = waiting_for_physical_fix
 
     def clear_recovery(self) -> None:
@@ -1430,6 +1509,7 @@ class SessionState:
         self.recovery_phase = None
         self.recovery_started_at = None
         self.next_retry_at = None
+        self.retry_cadence_reason = None
         self.waiting_for_physical_fix = False
         self.recovery_notification_fingerprint = None
         self.recovery_notification_attempts = 0
@@ -1442,11 +1522,13 @@ class SessionState:
         reason: str | None,
         *,
         priority: bool = False,
+        policy: str | None = None,
     ) -> None:
         """Track a failed room that can be retried after the robot docks cleanly."""
         self.pending_recovery_room_id = room_id
         self.pending_recovery_reason = reason
         self.pending_recovery_priority = priority
+        self.pending_recovery_policy = policy
 
     def can_retry_room(self, room_id: str) -> bool:
         """Return whether the session can retry a recoverable room failure."""
@@ -1495,6 +1577,7 @@ class SessionState:
             self.pending_recovery_room_id = None
             self.pending_recovery_reason = None
             self.pending_recovery_priority = False
+            self.pending_recovery_policy = None
 
     def clear_room_issue(self, room_id: str) -> None:
         """Clear failure and skip bookkeeping after a retry is published."""
@@ -1557,6 +1640,7 @@ class SessionState:
             pending_recovery_room_id=data.get("pending_recovery_room_id"),
             pending_recovery_reason=data.get("pending_recovery_reason"),
             pending_recovery_priority=bool(data.get("pending_recovery_priority", False)),
+            pending_recovery_policy=data.get("pending_recovery_policy"),
             active_room_id=data.get("active_room_id"),
             terminal_reason=data.get("terminal_reason"),
             terminal_message=data.get("terminal_message"),
@@ -1627,6 +1711,7 @@ class SessionState:
                 data.get("next_retry_at")
                 or data.get("blocked_deadline")
             ),
+            retry_cadence_reason=data.get("retry_cadence_reason"),
             waiting_for_physical_fix=bool(
                 data.get("waiting_for_physical_fix", False)
             ),
@@ -1700,6 +1785,7 @@ class SessionState:
             "pending_recovery_room_id": self.pending_recovery_room_id,
             "pending_recovery_reason": self.pending_recovery_reason,
             "pending_recovery_priority": self.pending_recovery_priority,
+            "pending_recovery_policy": self.pending_recovery_policy,
             "active_room_id": self.active_room_id,
             "terminal_reason": self.terminal_reason,
             "terminal_message": self.terminal_message,
@@ -1741,6 +1827,7 @@ class SessionState:
             "recovery_phase": self.recovery_phase,
             "recovery_started_at": self.recovery_started_at,
             "next_retry_at": self.next_retry_at,
+            "retry_cadence_reason": self.retry_cadence_reason,
             "waiting_for_physical_fix": self.waiting_for_physical_fix,
             "recovery_notification_fingerprint": (
                 self.recovery_notification_fingerprint

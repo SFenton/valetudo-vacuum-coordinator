@@ -289,6 +289,7 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
             const.CONF_MIN_BATTERY: 40,
             const.CONF_NATIVE_RESUME_ENABLED: True,
             const.CONF_NATIVE_RESUME_TIMEOUT: 10800,
+            const.CONF_NAVIGATION_ERROR_RETURN_ENABLED: False,
             const.CONF_DOCK_SETTLE: 0,
             const.CONF_STALE_RESUME_AUTO_CLEAR: False,
             const.CONF_STALE_RESUME_AGE: 1800,
@@ -403,6 +404,14 @@ def _handle_event(
     coordinator.set_state(entity_id, state)
     event_cls = sys.modules["homeassistant.core"].Event
     asyncio.run(coordinator._async_handle_state_change_event(event_cls(entity_id, state)))
+
+
+def _confirm_active_room_started(
+    coordinator: _RecoverableFailureCoordinator,
+) -> None:
+    assert coordinator.active_run is not None
+    coordinator.active_run.observed_cleaning = True
+    coordinator.active_run.start_confirmed_at = logic.utcnow_iso()
 
 
 def _service_names(coordinator: _RecoverableFailureCoordinator) -> list[str]:
@@ -961,6 +970,230 @@ def test_session_sensor_exposes_additive_typed_outcome_contract() -> None:
     assert attributes[const.ATTR_PRESERVED_ROOMS] == ["dining"]
 
 
+def test_recovery_sensors_expose_queue_and_cadence_instrumentation() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session.mark_failed("room_one", "Cannot reach target")
+    coordinator.session.begin_recovering(
+        "room_one",
+        "Cannot reach target",
+        policy="navigation_retry_later",
+    )
+    coordinator.session.retry_cadence_reason = "navigation_recheck"
+    session_sensor = sensor_module.ValetudoSessionStateSensor(coordinator)
+    queue_sensor = sensor_module.ValetudoQueueSensor(coordinator)
+
+    session_attributes = session_sensor.extra_state_attributes
+    queue_attributes = queue_sensor.extra_state_attributes
+
+    assert session_attributes[const.ATTR_PENDING_RECOVERY_ROOM] == "room_one"
+    assert session_attributes[const.ATTR_PENDING_RECOVERY_REASON] == (
+        "Cannot reach target"
+    )
+    assert session_attributes[const.ATTR_PENDING_RECOVERY_POLICY] == (
+        "navigation_retry_later"
+    )
+    assert session_attributes[const.ATTR_RETRY_ROOMS] == []
+    assert session_attributes[const.ATTR_RETRIED_ROOMS] == []
+    assert session_attributes[const.ATTR_NEXT_CANDIDATE_ROOM] == "room_two"
+    assert session_attributes[const.ATTR_RETRY_CADENCE_REASON] == (
+        "navigation_recheck"
+    )
+    assert (
+        session_attributes[const.ATTR_NAVIGATION_ERROR_RETURN_ENABLED]
+        is False
+    )
+    assert queue_attributes[const.ATTR_PENDING_ROOMS] == ["room_two"]
+    assert queue_attributes[const.ATTR_PENDING_RECOVERY_ROOM] == "room_one"
+    assert queue_attributes[const.ATTR_NEXT_CANDIDATE_ROOM] == "room_two"
+    assert queue_attributes[const.ATTR_PRESERVED_ROOMS] == [
+        "room_two",
+        "room_one",
+    ]
+
+
+def test_next_candidate_matches_normal_fairness_dispatch() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    newer = logic.RoomConfig(
+        room_id="newer",
+        name="Configured First",
+        segment_id="1",
+    )
+    older = logic.RoomConfig(
+        room_id="older",
+        name="Configured Second",
+        segment_id="2",
+    )
+    _set_rooms(coordinator, [newer, older])
+    coordinator.ledgers["newer"].last_successful_clean = (
+        "2026-09-10T12:00:00+00:00"
+    )
+    coordinator.ledgers["older"].last_successful_clean = (
+        "2026-09-01T12:00:00+00:00"
+    )
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    assert coordinator.next_candidate_room_id == "older"
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["older"]
+
+
+def test_candidate_and_dispatch_share_disabled_daily_and_held_exclusions() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    disabled = logic.RoomConfig(
+        room_id="disabled",
+        name="Disabled",
+        segment_id="1",
+    )
+    daily = logic.RoomConfig(
+        room_id="daily",
+        name="Already Cleaned",
+        segment_id="2",
+    )
+    eligible = logic.RoomConfig(
+        room_id="eligible",
+        name="Eligible",
+        segment_id="3",
+    )
+    _set_rooms(coordinator, [disabled, daily, eligible])
+    coordinator.disabled_room_ids.add("disabled")
+    coordinator.ledgers["daily"].last_auto_cleaned_day = (
+        coordinator._current_auto_clean_day()
+    )
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    assert coordinator.next_candidate_room_id == "eligible"
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert coordinator.started_rooms == ["eligible"]
+
+    held = _RecoverableFailureCoordinator()
+    held.active_run = None
+    held.set_state(held.vacuum_entity, "docked")
+    held.session = logic.SessionState(
+        session_id="held",
+        started_at=logic.utcnow_iso(),
+        dispatch_failure_counts={"room_one": 1},
+        dispatch_failure_fingerprints={
+            "room_one": held._dispatch_state_fingerprint()
+        },
+        dispatch_retry_not_before={
+            "room_one": (
+                datetime.now(UTC) + timedelta(minutes=5)
+            ).isoformat()
+        },
+    )
+
+    assert held.next_candidate_room_id is None
+    asyncio.run(held._async_maybe_start_next_room())
+    assert held.started_rooms == []
+
+
+def test_next_candidate_projects_pending_normal_and_priority_recovery() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one", "room_two"],
+        completed_room_ids=["room_two"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={"room_one": "Cannot reach target"},
+        pending_recovery_room_id="room_one",
+        pending_recovery_reason="Cannot reach target",
+        pending_recovery_policy="navigation_retry_later",
+    )
+
+    assert coordinator.next_candidate_room_id == "room_one"
+
+    coordinator.session = logic.SessionState(
+        session_id="priority",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_two"],
+        failed_room_ids=["room_two"],
+        failed_room_reasons={"room_two": "Low battery"},
+        pending_recovery_room_id="room_two",
+        pending_recovery_reason="Low battery",
+        pending_recovery_priority=True,
+    )
+
+    assert coordinator.next_candidate_room_id == "room_two"
+
+
+def test_refill_candidate_matches_deferred_priority_dispatch() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    deferred_first = logic.RoomConfig(
+        room_id="deferred_first",
+        name="Deferred First",
+        segment_id="1",
+        mop_required=True,
+    )
+    fairness_first = logic.RoomConfig(
+        room_id="fairness_first",
+        name="Fairness First",
+        segment_id="2",
+        mop_required=True,
+    )
+    fallback_done = logic.RoomConfig(
+        room_id="fallback_done",
+        name="Fallback Done",
+        segment_id="3",
+        mop_required=True,
+    )
+    _set_rooms(
+        coordinator,
+        [fairness_first, deferred_first, fallback_done],
+    )
+    coordinator.ledgers["deferred_first"].last_successful_clean = (
+        "2026-09-10T12:00:00+00:00"
+    )
+    coordinator.ledgers["fairness_first"].last_successful_clean = (
+        "2026-09-01T12:00:00+00:00"
+    )
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="fresh water is unavailable",
+        degraded_preparation_completed=True,
+        deferred_full_clean_room_ids=[
+            "deferred_first",
+            "fairness_first",
+            "fallback_done",
+        ],
+        deferred_full_clean_reasons={
+            "deferred_first": "fresh water is unavailable",
+            "fairness_first": "fresh water is unavailable",
+            "fallback_done": "fresh water is unavailable",
+        },
+        fallback_completed_room_ids=["fallback_done"],
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+
+    assert coordinator._refilled_normal_retry_room_ids() == [
+        "deferred_first",
+        "fairness_first",
+        "fallback_done",
+    ]
+    assert coordinator.next_candidate_room_id == "deferred_first"
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["deferred_first"]
+
+
 def test_returned_home_cancellation_records_typed_interruption_only() -> None:
     coordinator = _RecoverableFailureCoordinator()
     room = logic.RoomConfig(
@@ -997,6 +1230,73 @@ def test_returned_home_cancellation_records_typed_interruption_only() -> None:
     )
     assert projection["outstanding"]["operation"] == "vacuum"
     assert coordinator.while_away_issue_messages == []
+
+
+def test_arrival_during_pending_navigation_recovery_preserves_one_failure() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _confirm_active_room_started(coordinator)
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+    event_count = len(coordinator.while_away_outcome_contract["events"])
+    vacuum_call_count = len(
+        [
+            call
+            for call in coordinator.hass.services.calls
+            if call["domain"] == "vacuum"
+        ]
+    )
+
+    coordinator.set_state("person.owner", "home")
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session is not None
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert coordinator.session.pending_recovery_room_id is None
+    assert coordinator.session.pending_recovery_policy is None
+    assert len(coordinator.while_away_outcome_contract["events"]) == event_count
+    assert len(
+        [
+            call
+            for call in coordinator.hass.services.calls
+            if call["domain"] == "vacuum"
+        ]
+    ) == vacuum_call_count
+
+
+def test_arrival_during_navigation_retry_records_one_interruption() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        retried_room_ids=["room_one"],
+        active_room_id="room_one",
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        command_published=True,
+        observed_cleaning=True,
+        start_confirmed_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state("person.owner", "home")
+
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert coordinator.session.retried_room_ids == ["room_one"]
+    assert coordinator.active_run is None
+    assert _service_names(coordinator).count("stop") == 1
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["latest_attempt"]["result"] == "interrupted"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "occupancy.person_arrived"
+    )
 
 
 def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
@@ -1251,14 +1551,16 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
         dt_module.now = original_now
 
 
-def test_error_95_recovery_preserves_and_retries_room_after_clear() -> None:
+def test_target_unreachable_recovery_preserves_and_retries_room_after_clear() -> None:
     coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
     event_cls = sys.modules["homeassistant.core"].Event
+    _confirm_active_room_started(coordinator)
 
-    coordinator.set_state("sensor.robot_error", "Unknown error 95")
+    coordinator.set_state("sensor.robot_error", "Cannot reach target")
     asyncio.run(
         coordinator._async_handle_state_change_event(
-            event_cls("sensor.robot_error", "Unknown error 95")
+            event_cls("sensor.robot_error", "Cannot reach target")
         )
     )
 
@@ -1266,9 +1568,29 @@ def test_error_95_recovery_preserves_and_retries_room_after_clear() -> None:
     assert coordinator.session.active is True
     assert coordinator.session.needs_help is False
     assert coordinator.session.recovery_phase == "operator_required"
-    assert coordinator.session.failed_room_ids == []
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.pending_recovery_room_id == "room_one"
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.next_candidate_room_id == "room_two"
     assert _service_names(coordinator).count("stop") == 1
+    assert _service_names(coordinator).count("return_to_base") == 1
     assert coordinator.started_rooms == []
+    assert coordinator.session.last_command_recovery["recovery_policy"] == (
+        "recover_then_retry_later"
+    )
+    assert coordinator.session.last_command_recovery["retry_eligible"] is True
+    assert (
+        coordinator.session.last_command_recovery[
+            "return_service_acknowledged_at"
+        ]
+        is not None
+    )
+    assert (
+        coordinator.session.last_command_recovery[
+            "return_recovery_confirmed_at"
+        ]
+        is None
+    )
 
     coordinator.set_state(coordinator.vacuum_entity, "docked")
     coordinator.set_state("sensor.robot_error", "No error")
@@ -1276,11 +1598,630 @@ def test_error_95_recovery_preserves_and_retries_room_after_clear() -> None:
         coordinator._async_handle_state_change_event(event_cls(coordinator.vacuum_entity, "docked"))
     )
 
-    assert coordinator.session.failed_room_ids == []
-    assert coordinator.session.failed_room_reasons == {}
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.failed_room_reasons == {
+        "room_one": "Cannot reach target"
+    }
     assert coordinator.session.pending_recovery_room_id is None
+    assert coordinator.session.retry_room_ids == ["room_one"]
+    assert coordinator.started_rooms == ["room_two"]
+    assert (
+        coordinator.session.last_command_recovery[
+            "return_recovery_confirmed_at"
+        ]
+        is not None
+    )
+    assert coordinator.session.last_command_recovery["retry_queued"] is True
+    assert coordinator.session.last_command_recovery["next_candidate_room"] == (
+        "room_two"
+    )
+
+
+def test_navigation_recovery_return_is_shadow_safe_by_default() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    assert coordinator.session is not None
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.pending_recovery_room_id == "room_one"
+    assert coordinator.session.retry_cadence_reason == "navigation_recheck"
+    assert coordinator.next_candidate_room_id == "room_two"
+    assert _service_names(coordinator).count("stop") == 1
+    assert "return_to_base" not in _service_names(coordinator)
+
+
+def test_navigation_recovery_notification_includes_retained_room() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    notification = next(
+        call
+        for call in coordinator.hass.services.calls
+        if call["service"] == "household"
+    )
+    message = notification["data"]["message"]
+    assert "Preserved rooms:" in message
+    assert "room_one" in message
+    assert "room_two" in message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Unknown error 95",
+        "Easy-to-fall area detected",
+        "robot_stuck_on_ramp",
+        "Cannot navigate to the dock",
+        "Fatal hardware failure",
+    ],
+)
+def test_navigation_return_rejects_unvalidated_errors(error: str) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", error)
+
+    assert "return_to_base" not in _service_names(coordinator)
+
+
+@pytest.mark.parametrize(
+    ("current_error", "status_flag"),
+    [
+        ("Main brush jammed", "none"),
+        ("unavailable", "none"),
+        ("Cannot reach target", "segment"),
+        ("Cannot reach target", "resumable"),
+        ("Cannot reach target", "unavailable"),
+    ],
+)
+def test_navigation_return_revalidates_live_error_and_status(
+    current_error: str,
+    status_flag: str,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        command_published=True,
+        observed_cleaning=True,
+        cancelled=True,
+        phase=logic.RUN_PHASE_CANCEL_PENDING,
+        cancel_reason="Cannot reach target",
+        cancel_stop_attempts=1,
+        cancel_stop_acknowledged_at=logic.utcnow_iso(),
+        cancel_continue_session=True,
+        cancel_recover_room=True,
+        cancel_outcome_result="interrupted",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_error", current_error)
+    coordinator.set_state("sensor.robot_status_flag", status_flag)
+
+    assert asyncio.run(coordinator._async_execute_cancel_pending()) is True
+
+    assert "return_to_base" not in _service_names(coordinator)
+
+
+def test_navigation_recovery_return_failure_is_not_replayed() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    _confirm_active_room_started(coordinator)
+    original_async_call = coordinator.hass.services.async_call
+    return_attempts = 0
+
+    async def reject_return(domain, service, data, blocking=False) -> None:
+        nonlocal return_attempts
+        if domain == "vacuum" and service == "return_to_base":
+            return_attempts += 1
+            raise RuntimeError("return rejected")
+        await original_async_call(domain, service, data, blocking)
+
+    coordinator.hass.services.async_call = reject_return
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    assert return_attempts == 1
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.phase == logic.RUN_PHASE_CANCEL_PENDING
+    assert coordinator.active_run.cancel_return_attempts == 1
+    assert coordinator.active_run.return_acknowledged is False
+    assert coordinator.session is not None
+    assert coordinator.session.blocker_code == "command.return_ack_pending"
+    assert coordinator.session.next_retry_at == (
+        coordinator.active_run.cancel_ack_deadline
+    )
+    assert coordinator.session.retry_cadence_reason == "command_ack_recheck"
+
+    restored = _RecoverableFailureCoordinator()
+    restored.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = False
+    restored.active_run = logic.ActiveRun.from_dict(
+        coordinator.active_run.to_dict()
+    )
+    restored.session = logic.SessionState.from_dict(
+        coordinator.session.to_dict()
+    )
+    restored.set_state(restored.vacuum_entity, "unavailable")
+    restored.set_state("sensor.robot_error", "unavailable")
+
+    assert asyncio.run(restored._async_execute_cancel_pending()) is False
+    assert restored.active_run is not None
+    assert (
+        restored.active_run.cancel_return_state_acknowledged_at is None
+    )
+    assert "return_to_base" not in _service_names(restored)
+
+    restored.set_state(restored.vacuum_entity, "docked")
+    restored.set_state("sensor.robot_error", "No error")
+
+    assert asyncio.run(restored._async_execute_cancel_pending()) is True
+    assert "return_to_base" not in _service_names(restored)
+    assert restored.session is not None
+    recovery = restored.session.last_command_recovery
+    assert "return_published_at" not in recovery
+    assert recovery["return_service_acknowledged_at"] is None
+    assert recovery["return_state_acknowledged_at"] is not None
+    assert recovery["return_recovery_confirmed_at"] is None
+
+    asyncio.run(restored._async_maybe_start_next_room())
+
+    assert restored.started_rooms == ["room_two"]
+    assert recovery["return_recovery_confirmed_at"] is not None
+
+
+def test_navigation_return_success_survives_restart_before_recovery() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    recovery = coordinator.session.last_command_recovery
+    assert recovery["return_service_acknowledged_at"] is not None
+    assert recovery["return_state_acknowledged_at"] is None
+    assert recovery["return_recovery_confirmed_at"] is None
+
+    restored = _RecoverableFailureCoordinator()
+    restored.active_run = None
+    restored.session = logic.SessionState.from_dict(
+        coordinator.session.to_dict()
+    )
+    restored.set_state(restored.vacuum_entity, "error")
+    restored.set_state("sensor.robot_error", "Cannot reach target")
+
+    asyncio.run(restored._async_maybe_start_next_room())
+
+    assert restored.started_rooms == []
+    assert "return_to_base" not in _service_names(restored)
+
+    restored.set_state("sensor.robot_error", "No error")
+    _handle_event(restored, restored.vacuum_entity, "docked")
+
+    assert restored.started_rooms == ["room_two"]
+    assert (
+        restored.session.last_command_recovery[
+            "return_recovery_confirmed_at"
+        ]
+        is not None
+    )
+
+
+def test_navigation_recovery_advances_then_retries_once() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+
+    assert coordinator.session is not None
+    assert coordinator.started_rooms == ["room_two"]
+    assert coordinator.session.retry_room_ids == ["room_one"]
+    assert coordinator.session.retried_room_ids == []
+
+    coordinator.session.mark_completed("room_two")
+    coordinator.active_run = None
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["room_two", "room_one"]
     assert coordinator.session.retry_room_ids == []
-    assert coordinator.started_rooms == ["room_one"]
+    assert coordinator.session.retried_room_ids == ["room_one"]
+
+    assert coordinator.active_run is not None
+    coordinator.active_run.command_published = True
+    _confirm_active_room_started(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.pending_recovery_room_id == "room_one"
+    assert coordinator.session.can_retry_room("room_one") is False
+
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+
+    assert coordinator.started_rooms == ["room_two", "room_one"]
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.session.retried_room_ids == ["room_one"]
+    assert coordinator.session.failed_room_ids == ["room_one"]
+    assert coordinator.session.active is False
+    projection = next(
+        room
+        for room in coordinator.while_away_outcome_contract["rooms"]
+        if room["room_id"] == "room_one"
+    )
+    assert projection["status"] == "failed"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
+
+
+def test_navigation_recovery_round_trip_preserves_tail_retry() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _confirm_active_room_started(coordinator)
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    restored = _RecoverableFailureCoordinator()
+    restored.active_run = None
+    restored.session = logic.SessionState.from_dict(
+        coordinator.session.to_dict() if coordinator.session else None
+    )
+    restored.set_state(restored.vacuum_entity, "docked")
+    restored.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(restored._async_maybe_start_next_room())
+
+    assert restored.session is not None
+    assert restored.started_rooms == ["room_two"]
+    assert restored.session.retry_room_ids == ["room_one"]
+    assert restored.session.failed_room_ids == ["room_one"]
+
+
+def test_navigation_error_before_start_uses_bounded_dispatch_backoff() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+
+    for expected_count in (1, 2, 3):
+        if expected_count > 1:
+            coordinator.active_run = logic.ActiveRun(
+                room_id="room_one",
+                segment_id="1",
+                session_id="session",
+                started_at=logic.utcnow_iso(),
+                command_published=True,
+            )
+            coordinator.session.mark_attempted("room_one")
+        asyncio.run(
+            coordinator._async_handle_active_run_error(
+                "Cannot reach target"
+            )
+        )
+
+        assert coordinator.session.failed_room_ids == []
+        assert coordinator.session.pending_recovery_room_id is None
+        assert coordinator.session.dispatch_failure_counts["room_one"] == (
+            expected_count
+        )
+
+    assert coordinator.session.dispatch_escalated_room_ids == ["room_one"]
+    assert coordinator.session.last_command_recovery[
+        "dispatch_failure_code"
+    ] == "dispatch.navigation_before_start"
+    assert coordinator.started_rooms == []
+
+
+def test_existing_dispatch_failure_is_not_converted_to_room_recovery() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    assert coordinator.active_run is not None
+    coordinator.active_run.dispatch_failure_code = (
+        "dispatch.publish_ack_pending"
+    )
+
+    _handle_event(
+        coordinator,
+        "sensor.robot_error",
+        "Cannot reach broker",
+    )
+
+    assert coordinator.session.pending_recovery_room_id is None
+    assert coordinator.session.failed_room_ids == []
+    assert coordinator.session.dispatch_failure_counts == {"room_one": 1}
+    assert coordinator.session.last_command_recovery[
+        "dispatch_failure_code"
+    ] == "dispatch.publish_ack_pending"
+
+
+def test_degraded_navigation_retry_follows_unattempted_rooms() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={"room_one": "Cannot reach target"},
+        retry_room_ids=["room_one"],
+        degraded_reason="fresh water is unavailable",
+        degraded_preparation_completed=True,
+    )
+
+    assert [room.room_id for room in coordinator.pending_rooms] == [
+        "room_two",
+        "room_one",
+    ]
+    assert coordinator.next_candidate_room_id == "room_two"
+    assert coordinator._next_degraded_native_room().room_id == "room_two"
+    assert coordinator._next_degraded_retry_room().room_id == "room_one"
+
+    coordinator.session.mark_attempted("room_two")
+
+    assert coordinator._next_degraded_native_room() is None
+    assert coordinator._next_degraded_retry_room().room_id == "room_one"
+    assert coordinator.next_candidate_room_id == "room_one"
+
+
+def test_degraded_candidate_order_is_native_fallback_then_retry() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    native = logic.RoomConfig(
+        room_id="native",
+        name="Office",
+        segment_id="1",
+    )
+    fallback = logic.RoomConfig(
+        room_id="fallback",
+        name="Bathroom",
+        segment_id="2",
+        mop_required=True,
+    )
+    retry = logic.RoomConfig(
+        room_id="retry",
+        name="Gym",
+        segment_id="3",
+    )
+    _set_rooms(coordinator, [fallback, retry, native])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["retry"],
+        retry_room_ids=["retry"],
+        degraded_reason="fresh water is unavailable",
+        degraded_preparation_completed=True,
+    )
+    resources = coordinator._resource_state()
+
+    selection = coordinator._planned_degraded_room(
+        resources,
+        assume_pending_recovery_resolved=False,
+    )
+    assert selection is not None
+    assert selection.room.room_id == "native"
+    assert selection.fallback_vacuum is False
+
+    coordinator.session.mark_attempted("native")
+    selection = coordinator._planned_degraded_room(
+        resources,
+        assume_pending_recovery_resolved=False,
+    )
+    assert selection is not None
+    assert selection.room.room_id == "fallback"
+    assert selection.fallback_vacuum is True
+
+    coordinator.session.mark_fallback_attempted("fallback")
+    selection = coordinator._planned_degraded_room(
+        resources,
+        assume_pending_recovery_resolved=False,
+    )
+    assert selection is not None
+    assert selection.room.room_id == "retry"
+    assert selection.fallback_vacuum is False
+
+
+def test_degraded_navigation_retry_starts_after_unattempted_room() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={"room_one": "Cannot reach target"},
+        retry_room_ids=["room_one"],
+        degraded_reason="fresh water is unavailable",
+        degraded_preparation_completed=True,
+    )
+
+    asyncio.run(
+        coordinator._async_maybe_start_degraded_room(
+            coordinator._resource_state()
+        )
+    )
+
+    assert coordinator.started_rooms == ["room_two"]
+    assert coordinator.active_run is not None
+    coordinator.session.mark_completed("room_two")
+    coordinator.active_run = None
+
+    asyncio.run(
+        coordinator._async_maybe_start_degraded_room(
+            coordinator._resource_state()
+        )
+    )
+
+    assert coordinator.started_rooms == ["room_two", "room_one"]
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.session.retried_room_ids == ["room_one"]
+
+
+def test_degraded_navigation_incident_advances_before_one_tail_retry() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    gym = logic.RoomConfig(room_id="gym", name="Gym", segment_id="7")
+    office = logic.RoomConfig(room_id="office", name="Office", segment_id="14")
+    hallway = logic.RoomConfig(
+        room_id="hallway",
+        name="Hallway",
+        segment_id="12",
+    )
+    kitchen = logic.RoomConfig(
+        room_id="kitchen",
+        name="Kitchen",
+        segment_id="4",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [gym, office, hallway, kitchen])
+    coordinator.ledgers["gym"].last_successful_clean = (
+        "2026-08-31T20:48:16+00:00"
+    )
+    coordinator.ledgers["office"].last_successful_clean = (
+        "2026-08-31T21:17:42+00:00"
+    )
+    coordinator.ledgers["hallway"].last_successful_clean = (
+        "2026-09-10T22:22:19+00:00"
+    )
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["gym"],
+        active_room_id="gym",
+        degraded_reason="fresh water is unavailable",
+        degraded_preparation_completed=True,
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="gym",
+        segment_id="7",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        command_published=True,
+        observed_cleaning=True,
+        phase=logic.RUN_PHASE_CLEANING,
+    )
+
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    assert coordinator.session.pending_recovery_room_id == "gym"
+    assert coordinator.session.failed_room_ids == ["gym"]
+    assert coordinator.next_candidate_room_id == "office"
+    assert [room.room_id for room in coordinator.pending_rooms] == [
+        "office",
+        "hallway",
+    ]
+
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+
+    assert coordinator.started_rooms == ["office"]
+    assert coordinator.session.retry_room_ids == ["gym"]
+
+    coordinator.session.mark_completed("office")
+    coordinator.active_run = None
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["office", "hallway"]
+
+    coordinator.session.mark_completed("hallway")
+    coordinator.active_run = None
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["office", "hallway", "gym"]
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.session.retried_room_ids == ["gym"]
+    assert coordinator.session.deferred_full_clean_room_ids == ["kitchen"]
+
+
+def test_mop_fallback_preserves_one_later_full_clean_retry() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="4",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["mop_room"],
+        failed_room_ids=["mop_room"],
+        failed_room_reasons={"mop_room": "Cannot reach target"},
+        retry_room_ids=["mop_room"],
+        deferred_full_clean_room_ids=["mop_room"],
+        deferred_full_clean_reasons={
+            "mop_room": "fresh water is unavailable"
+        },
+        degraded_reason="fresh water is unavailable",
+    )
+    fallback_run = logic.ActiveRun(
+        room_id="mop_room",
+        segment_id="4",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        vacuum_only=True,
+        fallback_vacuum=True,
+    )
+
+    coordinator_module.ValetudoVacuumCoordinator._record_published_run(
+        coordinator,
+        coordinator.session,
+        fallback_run,
+        room,
+        was_retry=True,
+        was_priority_retry=False,
+    )
+
+    assert coordinator.session.fallback_attempted_room_ids == ["mop_room"]
+    assert coordinator.session.retry_room_ids == ["mop_room"]
+    assert coordinator.session.retried_room_ids == []
+    assert coordinator._next_degraded_retry_room() is None
+
+    coordinator.set_state("sensor.robot_fresh_water", "ok")
+    coordinator._queue_refilled_normal_retries()
+
+    assert coordinator.session.retry_room_ids == []
+    assert coordinator.session.priority_retry_room_ids == ["mop_room"]
+
+    full_clean_run = logic.ActiveRun(
+        room_id="mop_room",
+        segment_id="4",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator_module.ValetudoVacuumCoordinator._record_published_run(
+        coordinator,
+        coordinator.session,
+        full_clean_run,
+        room,
+        was_retry=False,
+        was_priority_retry=True,
+    )
+
+    assert coordinator.session.priority_retry_room_ids == []
+    assert coordinator.session.retried_room_ids == ["mop_room"]
 
 
 def test_low_battery_suspends_same_run_without_commands() -> None:
@@ -1793,7 +2734,7 @@ def test_arrival_stops_suspended_task_exactly_once() -> None:
     )
 
 
-def test_cancel_returns_to_base_only_when_robot_is_moving() -> None:
+def test_cancel_returns_to_base_only_when_robot_is_moving_by_default() -> None:
     for vacuum_state in ("idle", "returning"):
         coordinator = _RecoverableFailureCoordinator()
         _trigger_low_battery(coordinator)
@@ -4145,6 +5086,7 @@ def test_blocked_watchdog_uses_long_battery_bound_without_extending_deadline() -
     long_deadline = logic.parse_datetime(coordinator.session.blocked_deadline)
     assert long_deadline is not None
     assert (long_deadline - before_long).total_seconds() > 10000
+    assert coordinator.session.retry_cadence_reason == "battery_reason"
 
     coordinator.set_state(coordinator.vacuum_entity, "error")
     coordinator.set_state("sensor.robot_battery", "100")
@@ -4159,6 +5101,9 @@ def test_blocked_watchdog_uses_long_battery_bound_without_extending_deadline() -
     assert short_deadline is not None
     assert 250 < (short_deadline - before_short).total_seconds() < 301
     assert short_deadline < long_deadline
+    assert coordinator.session.retry_cadence_reason == (
+        "blocked_session_recheck"
+    )
 
     coordinator.set_state(coordinator.vacuum_entity, "charging")
     coordinator.set_state("sensor.robot_battery", "20")
@@ -4169,6 +5114,167 @@ def test_blocked_watchdog_uses_long_battery_bound_without_extending_deadline() -
     )
 
     assert logic.parse_datetime(coordinator.session.blocked_deadline) == short_deadline
+    assert coordinator.session.retry_cadence_reason == (
+        "blocked_session_recheck"
+    )
+
+
+def test_navigation_watchdog_keeps_short_cadence_below_minimum_battery() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_BLOCKED_SESSION_TIMEOUT] = 300
+    coordinator.config[const.CONF_NATIVE_RESUME_TIMEOUT] = 10800
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_battery", "20")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_error", "Cannot reach target")
+
+    assert coordinator._blocked_session_timeout_seconds(
+        "Cannot reach target"
+    ) == 300
+
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog(
+            "Cannot reach target"
+        )
+    )
+
+    assert coordinator.session.retry_cadence_reason == "navigation_recheck"
+    deadline = logic.parse_datetime(coordinator.session.next_retry_at)
+    assert deadline is not None
+    assert 250 < (deadline - datetime.now(UTC)).total_seconds() < 301
+
+
+@pytest.mark.parametrize("error_state", ["unavailable", "No error"])
+def test_pending_navigation_recovery_keeps_short_cadence_when_error_changes(
+    error_state: str,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_BLOCKED_SESSION_TIMEOUT] = 300
+    coordinator.config[const.CONF_NATIVE_RESUME_TIMEOUT] = 10800
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={"room_one": "Cannot reach target"},
+        pending_recovery_room_id="room_one",
+        pending_recovery_reason="Cannot reach target",
+        pending_recovery_policy="navigation_retry_later",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_battery", "20")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_error", error_state)
+
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog(
+            "Cannot reach target"
+        )
+    )
+
+    assert coordinator.session.retry_cadence_reason == "navigation_recheck"
+    deadline = logic.parse_datetime(coordinator.session.next_retry_at)
+    assert deadline is not None
+    assert 250 < (deadline - datetime.now(UTC)).total_seconds() < 301
+
+
+@pytest.mark.parametrize(
+    "changed_error",
+    ["Low battery", "Main brush jammed", "unavailable"],
+)
+def test_pending_navigation_error_update_preserves_tail_policy(
+    changed_error: str,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _confirm_active_room_started(coordinator)
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+
+    _handle_event(coordinator, "sensor.robot_error", changed_error)
+
+    assert coordinator.session is not None
+    assert coordinator.session.pending_recovery_room_id == "room_one"
+    assert coordinator.session.pending_recovery_policy == (
+        "navigation_retry_later"
+    )
+    assert coordinator.session.pending_recovery_priority is False
+    assert coordinator.session.retry_cadence_reason == "navigation_recheck"
+    assert coordinator.next_candidate_room_id == "room_two"
+
+
+def test_restored_pending_navigation_error_preserves_tail_policy() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        failed_room_ids=["room_one"],
+        failed_room_reasons={"room_one": "Cannot reach target"},
+        pending_recovery_room_id="room_one",
+        pending_recovery_reason="Cannot reach target",
+        pending_recovery_policy="navigation_retry_later",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_error", "Cannot reach target")
+
+    asyncio.run(coordinator._async_reconcile_restored_session())
+
+    assert coordinator.session.pending_recovery_policy == (
+        "navigation_retry_later"
+    )
+    assert coordinator.session.pending_recovery_priority is False
+    assert coordinator.session.retry_cadence_reason == "navigation_recheck"
+    assert coordinator.next_candidate_room_id == "room_two"
+
+
+def test_recovered_navigation_can_return_to_long_power_cadence() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_BLOCKED_SESSION_TIMEOUT] = 300
+    coordinator.config[const.CONF_NATIVE_RESUME_TIMEOUT] = 10800
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "charging")
+    coordinator.set_state("sensor.robot_battery", "20")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_error", "No error")
+
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog(
+            "battery is 20%, below 40%"
+        )
+    )
+
+    assert coordinator.session.retry_cadence_reason == "battery_reason"
+    deadline = logic.parse_datetime(coordinator.session.next_retry_at)
+    assert deadline is not None
+    assert (deadline - datetime.now(UTC)).total_seconds() > 10000
+
+
+def test_restored_deadline_keeps_unknown_cadence_provenance() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    restored_deadline = datetime.now(UTC) + timedelta(seconds=60)
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        next_retry_at=restored_deadline.isoformat(),
+    )
+
+    asyncio.run(
+        coordinator._async_arm_blocked_session_watchdog("dock busy")
+    )
+
+    assert coordinator.session.next_retry_at == restored_deadline.isoformat()
+    assert coordinator.session.retry_cadence_reason == "restored_deadline"
 
 
 def test_blocked_watchdog_runtime_clamps_zero_to_one_second() -> None:

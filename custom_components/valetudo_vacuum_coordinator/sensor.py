@@ -35,7 +35,12 @@ from .const import (
     ATTR_LAST_VACUUMED,
     ATTR_MOP_DEFERRED,
     ATTR_MOP_DEFERRED_REASON,
+    ATTR_NAVIGATION_ERROR_RETURN_ENABLED,
+    ATTR_NEXT_CANDIDATE_ROOM,
     ATTR_PENDING_ROOMS,
+    ATTR_PENDING_RECOVERY_REASON,
+    ATTR_PENDING_RECOVERY_ROOM,
+    ATTR_PENDING_RECOVERY_POLICY,
     ATTR_PHASE,
     ATTR_SUSPENDED_AT,
     ATTR_SUSPEND_REASON,
@@ -56,6 +61,9 @@ from .const import (
     ATTR_PRESERVED_ROOMS,
     ATTR_RECOVERY_PHASE,
     ATTR_RECOVERY_STARTED_AT,
+    ATTR_RETRIED_ROOMS,
+    ATTR_RETRY_CADENCE_REASON,
+    ATTR_RETRY_ROOMS,
     ATTR_SUCCESSFUL_COUNT,
     ATTR_TERMINAL_MESSAGE,
     ATTR_TERMINAL_REASON,
@@ -205,8 +213,26 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
                 session.recovery_started_at if session else None
             ),
             ATTR_NEXT_RETRY_AT: session.next_retry_at if session else None,
+            ATTR_RETRY_CADENCE_REASON: (
+                session.retry_cadence_reason if session else None
+            ),
             ATTR_WAITING_FOR_PHYSICAL_FIX: (
                 session.waiting_for_physical_fix if session else False
+            ),
+            ATTR_PENDING_RECOVERY_ROOM: (
+                session.pending_recovery_room_id if session else None
+            ),
+            ATTR_PENDING_RECOVERY_REASON: (
+                session.pending_recovery_reason if session else None
+            ),
+            ATTR_PENDING_RECOVERY_POLICY: (
+                session.pending_recovery_policy if session else None
+            ),
+            ATTR_RETRY_ROOMS: session.retry_room_ids if session else [],
+            ATTR_RETRIED_ROOMS: session.retried_room_ids if session else [],
+            ATTR_NEXT_CANDIDATE_ROOM: self.coordinator.next_candidate_room_id,
+            ATTR_NAVIGATION_ERROR_RETURN_ENABLED: (
+                self.coordinator.navigation_error_return_enabled
             ),
             "recovery_notification_attempts": (
                 session.recovery_notification_attempts if session else 0
@@ -339,12 +365,29 @@ class ValetudoCurrentRoomSensor(ValetudoCoordinatorEntity, SensorEntity):
             "cancel_stop_physical_acknowledged_at": (
                 run.cancel_stop_physical_acknowledged_at if run else None
             ),
+            "cancel_ack_deadline": run.cancel_ack_deadline if run else None,
             "cancel_return_attempts": (
                 run.cancel_return_attempts if run else 0
             ),
-            "cancel_return_acknowledged_at": (
-                run.cancel_return_acknowledged_at if run else None
+            "cancel_return_requested_at": (
+                run.cancel_return_requested_at if run else None
             ),
+            "cancel_return_acknowledged_at": (
+                (
+                    run.cancel_return_service_acknowledged_at
+                    or run.cancel_return_state_acknowledged_at
+                    or run.cancel_return_acknowledged_at
+                )
+                if run
+                else None
+            ),
+            "cancel_return_service_acknowledged_at": (
+                run.cancel_return_service_acknowledged_at if run else None
+            ),
+            "cancel_return_state_acknowledged_at": (
+                run.cancel_return_state_acknowledged_at if run else None
+            ),
+            "cancel_recover_room": run.cancel_recover_room if run else False,
             "floor_completion_status": (
                 run.floor_completion_status if run else None
             ),
@@ -376,6 +419,18 @@ class ValetudoQueueSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_PENDING_ROOMS: [
                 room.room_id for room in self.coordinator.pending_rooms
             ],
+            ATTR_PENDING_RECOVERY_ROOM: (
+                session.pending_recovery_room_id if session else None
+            ),
+            ATTR_PENDING_RECOVERY_REASON: (
+                session.pending_recovery_reason if session else None
+            ),
+            ATTR_PENDING_RECOVERY_POLICY: (
+                session.pending_recovery_policy if session else None
+            ),
+            ATTR_RETRY_ROOMS: session.retry_room_ids if session else [],
+            ATTR_RETRIED_ROOMS: session.retried_room_ids if session else [],
+            ATTR_NEXT_CANDIDATE_ROOM: self.coordinator.next_candidate_room_id,
             ATTR_PRESERVED_ROOMS: self.coordinator.preserved_room_ids,
             ATTR_DEFERRED_FULL_CLEAN_ROOMS: (
                 session.deferred_full_clean_room_ids if session else []
