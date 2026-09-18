@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import json
 import logging
@@ -160,7 +161,7 @@ from .logic import (
 _LOGGER = logging.getLogger(__name__)
 
 _READY_VACUUM_STATES = {"docked", "idle", "charging"}
-_AT_DOCK_VACUUM_STATES = {"docked", "idle", "charging"}
+_AT_DOCK_VACUUM_STATES = {"docked", "charging"}
 _BUSY_DOCK_STATES = {"cleaning", "emptying", "pause"}
 _READY_DOCK_STATES = {"idle", "drying"}
 _MOVING_VACUUM_STATES = {
@@ -187,6 +188,16 @@ _MAX_TERMINAL_CLEANUP_RETRIES = 3
 _MAX_AUTOMATIC_DISPATCH_FAILURES = 3
 _VALIDATED_NAVIGATION_RETURN_ERRORS = {"cannot reach target"}
 _NAVIGATION_RETRY_LATER_POLICY = "navigation_retry_later"
+
+
+@dataclass(frozen=True, slots=True)
+class _StateEventObservation:
+    """One immutable Home Assistant state callback observation."""
+
+    sequence: int
+    entity_id: str | None
+    new_state: State | None
+    superseded_at_receipt: bool
 
 
 class ValetudoVacuumCoordinator:
@@ -251,6 +262,13 @@ class ValetudoVacuumCoordinator:
         self._terminal_cleanup_retry_attempts = 0
         self._terminal_settings_restore_deferred = False
         self._event_lock = asyncio.Lock()
+        self._event_queue: deque[_StateEventObservation] = deque()
+        self._event_drain_scheduled = False
+        self._state_event_sequence = 0
+        self._processing_state_event_sequence: int | None = None
+        self._event_state_snapshot: dict[str, State | None] = {}
+        self._event_state_sequences: dict[str, int] = {}
+        self._telemetry_outage_started_sequence: int | None = None
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline: datetime | None = None
         self._store = Store(hass, STORE_VERSION, f"{STORE_KEY}.{self.coordinator_id}")
@@ -262,6 +280,10 @@ class ValetudoVacuumCoordinator:
         for entity_id in self._configured_sensor_entities():
             if entity_id:
                 entities_to_watch.add(entity_id)
+        self._event_state_snapshot = {
+            entity_id: self.hass.states.get(entity_id)
+            for entity_id in entities_to_watch
+        }
 
         self._unsubscribers.append(
             async_track_state_change_event(
@@ -1010,6 +1032,8 @@ class ValetudoVacuumCoordinator:
             and not retained_stop_consumed
             and not (
                 self.retained_task_guard
+                and self.retained_task_guard.phase
+                != RETAINED_TASK_PHASE_CLEARED
                 and self.retained_task_guard.owner
                 in {
                     RETAINED_TASK_OWNER_MANUAL,
@@ -1199,7 +1223,10 @@ class ValetudoVacuumCoordinator:
             await self._async_save_store()
         if (
             (
-                vacuum_state in _MOVING_VACUUM_STATES
+                (
+                    vacuum_state in _MOVING_VACUUM_STATES
+                    or vacuum_state == "idle"
+                )
                 and run.cancel_return_attempts == 0
             )
             or self._navigation_error_return_allowed(run, vacuum_state)
@@ -1541,8 +1568,17 @@ class ValetudoVacuumCoordinator:
 
     @callback
     def _handle_state_change_event(self, event: Event) -> None:
-        """Schedule handling for HA state changes."""
-        self.hass.async_create_task(self._async_handle_state_change_event(event))
+        """Queue every state callback for ordered processing."""
+        self._event_queue.append(self._capture_state_event(event))
+        self._schedule_event_drain()
+
+    @callback
+    def _schedule_event_drain(self) -> None:
+        """Ensure queued state callbacks have exactly one drain task."""
+        if self._event_drain_scheduled:
+            return
+        self._event_drain_scheduled = True
+        self.hass.async_create_task(self._async_drain_event_queue())
 
     @callback
     def _handle_delayed_restore_reconcile(self, _now: datetime) -> None:
@@ -1557,13 +1593,76 @@ class ValetudoVacuumCoordinator:
     async def _async_handle_state_change_event(self, event: Event) -> None:
         """Handle a monitored Home Assistant state change."""
         async with self._event_lock:
-            await self._async_process_state_change_event(event)
+            try:
+                await self._async_process_state_change_event(
+                    self._capture_state_event(event)
+                )
+            finally:
+                self._processing_state_event_sequence = None
 
-    async def _async_process_state_change_event(self, event: Event) -> None:
-        """Process one monitored state change while event handling is serialized."""
+    async def _async_drain_event_queue(self) -> None:
+        """Process queued state observations in callback order."""
+        try:
+            async with self._event_lock:
+                while self._event_queue:
+                    try:
+                        await self._async_process_state_change_event(
+                            self._event_queue.popleft()
+                        )
+                    finally:
+                        self._processing_state_event_sequence = None
+        finally:
+            self._finish_event_drain()
+
+    @callback
+    def _finish_event_drain(self) -> None:
+        """Release the drain flag and reschedule callbacks queued at completion."""
+        self._event_drain_scheduled = False
+        if self._event_queue:
+            self._schedule_event_drain()
+
+    def _capture_state_event(self, event: Event) -> _StateEventObservation:
+        """Freeze one callback's state payload before the registry advances."""
+        self._state_event_sequence += 1
         entity_id = event.data.get("entity_id")
-        new_state: State | None = event.data.get("new_state")
-        if new_state is None:
+        new_state = event.data.get("new_state")
+        current_state = (
+            self.hass.states.get(entity_id)
+            if entity_id and hasattr(self, "hass")
+            else None
+        )
+        return _StateEventObservation(
+            sequence=self._state_event_sequence,
+            entity_id=entity_id,
+            new_state=new_state,
+            superseded_at_receipt=bool(
+                new_state is not None
+                and current_state is not None
+                and normalize_state(current_state.state)
+                != normalize_state(new_state.state)
+            ),
+        )
+
+    def _apply_state_event(self, observation: _StateEventObservation) -> None:
+        """Advance the coordinator-owned snapshot to one queued observation."""
+        self._processing_state_event_sequence = observation.sequence
+        if observation.entity_id and not observation.superseded_at_receipt:
+            self._event_state_snapshot[observation.entity_id] = (
+                observation.new_state
+            )
+            self._event_state_sequences[observation.entity_id] = (
+                observation.sequence
+            )
+
+    async def _async_process_state_change_event(
+        self,
+        observation: _StateEventObservation,
+    ) -> None:
+        """Process one monitored state change while event handling is serialized."""
+        self._apply_state_event(observation)
+        entity_id = observation.entity_id
+        new_state = observation.new_state
+        if new_state is None or observation.superseded_at_receipt:
             return
 
         if self.session and self.session.native_guard_cancel_pending:
@@ -1598,7 +1697,7 @@ class ValetudoVacuumCoordinator:
                     await self._async_maybe_send_auto_clean_summary()
             return
 
-        now = dt_util.utcnow()
+        now = self._state_observed_at(new_state)
         if self._restore_active_run_observations(now):
             await self._async_save_store()
             self._notify_listeners()
@@ -2276,6 +2375,9 @@ class ValetudoVacuumCoordinator:
         run.phase = RUN_PHASE_TELEMETRY_GAP
         run.telemetry_outage_previous_phase = previous_phase
         run.telemetry_outage_started_at = now.isoformat()
+        self._telemetry_outage_started_sequence = (
+            self._processing_state_event_sequence
+        )
         run.telemetry_outage_count += 1
         run.telemetry_outage_unresolved = False
         if run.telemetry_outage_deadline is None:
@@ -2329,13 +2431,23 @@ class ValetudoVacuumCoordinator:
         """Return whether one source has a fresh usable post-outage value."""
         if not entity_id:
             return True
-        state = self.hass.states.get(entity_id)
+        state = self._state_object(entity_id)
         outage_started = parse_datetime(outage_started_at)
-        if (
+        outage_sequence = self._telemetry_outage_started_sequence
+        if outage_sequence is not None:
+            observed_sequence = self._event_state_sequences.get(entity_id)
+            if (
+                observed_sequence is None
+                or observed_sequence <= outage_sequence
+            ):
+                return False
+        elif (
             state is None
             or outage_started is None
             or state.last_changed <= outage_started
         ):
+            return False
+        if state is None:
             return False
         value = normalize_state(state.state)
         if numeric:
@@ -2433,6 +2545,7 @@ class ValetudoVacuumCoordinator:
         run.phase = previous_phase
         run.telemetry_outage_started_at = None
         run.telemetry_outage_previous_phase = None
+        self._telemetry_outage_started_sequence = None
         run.telemetry_outage_unresolved = not recovered
         self._cancel_telemetry_outage_timeout()
         return previous_phase
@@ -2542,6 +2655,7 @@ class ValetudoVacuumCoordinator:
             )
         run.telemetry_outage_started_at = None
         run.telemetry_outage_previous_phase = None
+        self._telemetry_outage_started_sequence = None
         run.telemetry_outage_unresolved = True
         run.mark_statistics_uncertain(
             area=bool(self.config.get(CONF_CURRENT_AREA_ENTITY)),
@@ -2775,7 +2889,7 @@ class ValetudoVacuumCoordinator:
 
         suspended_at = parse_datetime(run.suspended_at)
         docked_at = parse_datetime(run.docked_at)
-        status_state = self.hass.states.get(status_entity)
+        status_state = self._state_object(status_entity)
         if (
             suspended_at is None
             or docked_at is None
@@ -3288,6 +3402,7 @@ class ValetudoVacuumCoordinator:
     def _clear_active_run(self, *, retain_task_guard: bool = False) -> None:
         """Clear the active run and all timers tied to it."""
         self.active_run = None
+        self._telemetry_outage_started_sequence = None
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline = None
         if self.session:
@@ -4510,7 +4625,7 @@ class ValetudoVacuumCoordinator:
                 return False
             guard.phase = RETAINED_TASK_PHASE_DOCK_VERIFYING
 
-        vacuum_ack_safe = vacuum_state in {"docked", "idle"}
+        vacuum_ack_safe = vacuum_state in _AT_DOCK_VACUUM_STATES
         dock_idle = not dock_configured or dock_status in _READY_DOCK_STATES
         if guard.phase in {
             RETAINED_TASK_PHASE_VERIFYING,
@@ -7995,19 +8110,29 @@ class ValetudoVacuumCoordinator:
             )
             return
 
-        if (
-            vacuum_state in _AT_DOCK_VACUUM_STATES
-            and self._status_flag() == "resumable"
-        ):
+        if self._status_flag() == "resumable":
             await self.hass.services.async_call(
                 "vacuum",
                 "stop",
                 {ATTR_ENTITY_ID: self.vacuum_entity},
                 blocking=True,
             )
+            if (
+                vacuum_state in _MOVING_VACUUM_STATES
+                or vacuum_state == "idle"
+            ):
+                await self.hass.services.async_call(
+                    "vacuum",
+                    "return_to_base",
+                    {ATTR_ENTITY_ID: self.vacuum_entity},
+                    blocking=True,
+                )
             return
 
-        if vacuum_state in _MOVING_VACUUM_STATES:
+        if (
+            vacuum_state in _MOVING_VACUUM_STATES
+            or vacuum_state == "idle"
+        ):
             _LOGGER.info("Returning %s to dock because %s", self.vacuum_entity, reason)
             await self.hass.services.async_call(
                 "vacuum",
@@ -8195,7 +8320,7 @@ class ValetudoVacuumCoordinator:
         """Return the latest last-changed time among away tracked people."""
         latest_away_since: datetime | None = None
         for entity_id in self.people_entities:
-            state = self.hass.states.get(entity_id)
+            state = self._state_object(entity_id)
             if state is None or not self._person_is_away(entity_id):
                 continue
             if latest_away_since is None or state.last_changed > latest_away_since:
@@ -8225,10 +8350,29 @@ class ValetudoVacuumCoordinator:
 
     def _state(self, entity_id: str | None) -> str | None:
         """Return a Home Assistant state string."""
+        state = self._state_object(entity_id)
+        return state.state if state else None
+
+    def _state_object(self, entity_id: str | None) -> State | None:
+        """Return the event-ordered state snapshot for one entity."""
         if not entity_id:
             return None
-        state = self.hass.states.get(entity_id)
-        return state.state if state else None
+        if entity_id in self._event_state_snapshot:
+            return self._event_state_snapshot[entity_id]
+        return self.hass.states.get(entity_id)
+
+    @staticmethod
+    def _state_observed_at(state: State) -> datetime:
+        """Return when Home Assistant observed one state callback."""
+        observed_at = (
+            getattr(state, "last_updated", None)
+            or getattr(state, "last_changed", None)
+        )
+        return (
+            observed_at
+            if isinstance(observed_at, datetime)
+            else dt_util.utcnow()
+        )
 
     def _entity_changed_after(
         self,
@@ -8238,7 +8382,7 @@ class ValetudoVacuumCoordinator:
         """Return whether an entity state changed after a persisted timestamp."""
         if not entity_id or not timestamp:
             return False
-        state = self.hass.states.get(entity_id)
+        state = self._state_object(entity_id)
         changed_after = parse_datetime(timestamp)
         return bool(
             state
