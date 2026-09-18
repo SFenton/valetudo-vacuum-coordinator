@@ -289,6 +289,7 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
             const.CONF_MIN_BATTERY: 40,
             const.CONF_NATIVE_RESUME_ENABLED: True,
             const.CONF_NATIVE_RESUME_TIMEOUT: 10800,
+            const.CONF_TELEMETRY_OUTAGE_TIMEOUT: 300,
             const.CONF_NAVIGATION_ERROR_RETURN_ENABLED: False,
             const.CONF_DOCK_SETTLE: 0,
             const.CONF_STALE_RESUME_AUTO_CLEAR: False,
@@ -326,6 +327,7 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
         self._terminal_cleanup_retry_cancel = None
         self._dock_settle_cancel = None
         self._native_resume_timeout_cancel = None
+        self._telemetry_outage_timeout_cancel = None
         self._dispatch_start_timeout_cancel = None
         self._cancel_ack_timeout_cancel = None
         self._blocked_session_watchdog_cancel = None
@@ -459,16 +461,155 @@ def _observe_iteration_cycles(
         _handle_event(coordinator, "sensor.robot_status_flag", "none")
 
 
+def _prime_active_run_completion(
+    coordinator: _RecoverableFailureCoordinator,
+    *,
+    iterations: int | None = None,
+) -> None:
+    """Provide explicit counter and iteration evidence for a completed floor."""
+    run = coordinator.active_run
+    assert run is not None
+    if run.start_area is None:
+        run.start_area = 0
+    if run.start_time is None:
+        run.start_time = 0
+    run.accumulated_area = 0
+    run.accumulated_time = 0
+    run.last_area = 0
+    run.last_time = 0
+    run.area_measurement_uncertain = False
+    run.time_measurement_uncertain = False
+    coordinator.set_state("sensor.robot_area", "20")
+    coordinator.set_state("sensor.robot_time", "300")
+    run.observed_cleaning = True
+    run.observed_segment_cleaning = True
+    target_iterations = (
+        run.requested_iterations if iterations is None else iterations
+    )
+    while run.effective_observed_iteration_count < target_iterations:
+        run.observe_segment_iteration(
+            source="test_segment_transition",
+            count_new_iteration=True,
+        )
+        run.clear_segment_iteration()
+
+
+def _finish_active_room_successfully(
+    coordinator: _RecoverableFailureCoordinator,
+    **kwargs: bool,
+) -> None:
+    """Finish an active room with explicit floor-completion evidence."""
+    _prime_active_run_completion(coordinator)
+    assert coordinator.active_run is not None
+    coordinator.active_run.resume_required = False
+    asyncio.run(coordinator._async_finish_active_run(**kwargs))
+
+
+def _prepare_telemetry_outage_run(
+    *,
+    requested_iterations: int = 2,
+) -> _RecoverableFailureCoordinator:
+    """Create a confirmed room run with substantial pre-outage evidence."""
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_duration=120,
+        min_area=100,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="outage-session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        active_room_id="room_one",
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="outage-session",
+        started_at=logic.utcnow_iso(),
+        start_area=0,
+        start_time=0,
+        last_area=0,
+        last_time=0,
+        command_published=True,
+        start_confirmed_at=logic.utcnow_iso(),
+        phase=logic.RUN_PHASE_CLEANING,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+        requested_iterations=requested_iterations,
+    )
+    coordinator.active_run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    coordinator.active_run.checkpoint_statistics(161, 1440)
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_area", "161")
+    coordinator.set_state("sensor.robot_time", "1440")
+    coordinator.set_state("sensor.robot_estimated_segment", "1")
+    return coordinator
+
+
+def _enter_correlated_telemetry_outage(
+    coordinator: _RecoverableFailureCoordinator,
+) -> logic.ActiveRun:
+    """Drop the correlated Valetudo surface and retain the active run."""
+    run = coordinator.active_run
+    assert run is not None
+    for entity_id in (
+        "sensor.robot_error",
+        "sensor.robot_status_flag",
+        "sensor.robot_dock_status",
+        "sensor.robot_area",
+        "sensor.robot_time",
+        "sensor.robot_estimated_segment",
+    ):
+        coordinator.set_state(entity_id, "unavailable")
+    _handle_event(coordinator, coordinator.vacuum_entity, "unavailable")
+    assert coordinator.active_run is run
+    assert run.phase == logic.RUN_PHASE_TELEMETRY_GAP
+    return run
+
+
+def _recover_telemetry_outage(
+    coordinator: _RecoverableFailureCoordinator,
+    *,
+    room_segment: str = "1",
+    error: str = "No error",
+) -> None:
+    """Publish a fresh coherent post-outage snapshot."""
+    for entity_id, value in (
+        (coordinator.vacuum_entity, "cleaning"),
+        ("sensor.robot_error", error),
+        ("sensor.robot_status_flag", "segment"),
+        ("sensor.robot_dock_status", "idle"),
+        ("sensor.robot_area", "180"),
+        ("sensor.robot_time", "1500"),
+        ("sensor.robot_estimated_segment", room_segment),
+    ):
+        _handle_event(coordinator, entity_id, value)
+
+
 def _trigger_final_resumable_return(
     coordinator: _RecoverableFailureCoordinator,
 ) -> logic.ActiveRun:
     active_run = coordinator.active_run
     assert active_run is not None
     active_run.phase = logic.RUN_PHASE_RESUMED_CLEANING
+    active_run.start_area = 0
+    active_run.start_time = 0
     active_run.observed_cleaning = True
     active_run.observed_segment_cleaning = True
     active_run.resumed_after_suspend = True
     active_run.resume_source = "native_segment"
+    coordinator.set_state("sensor.robot_area", "20")
+    coordinator.set_state("sensor.robot_time", "300")
     coordinator.set_state(coordinator.vacuum_entity, "returning")
     _handle_event(coordinator, "sensor.robot_status_flag", "resumable")
 
@@ -1386,6 +1527,10 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
             source="status_segment_transition",
             count_new_iteration=True,
         )
+        coordinator.active_run.mark_statistics_uncertain(
+            area=True,
+            time=True,
+        )
         coordinator.session.active_room_id = "dining_room"
         coordinator.set_state(coordinator.vacuum_entity, "error")
         coordinator.set_state("sensor.robot_dock_status", "pause")
@@ -1399,9 +1544,7 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
         assert coordinator.active_run.room_id == "gym"
         assert coordinator.active_run.vacuum_only is True
         assert coordinator.active_run.fallback_vacuum is False
-        asyncio.run(
-            coordinator._async_finish_active_run(success_override=True)
-        )
+        _finish_active_room_successfully(coordinator)
 
         assert coordinator.active_run is not None
         assert coordinator.active_run.room_id == "office"
@@ -1418,12 +1561,10 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
         assert coordinator.active_run.allowed_error_fingerprint == (
             "dock.dustbag_full_or_duct_blocked"
         )
-        asyncio.run(
-            coordinator._async_finish_active_run(
-                success_override=True,
-                continue_session=False,
-                send_summary=False,
-            )
+        _finish_active_room_successfully(
+            coordinator,
+            continue_session=False,
+            send_summary=False,
         )
         assert coordinator.active_run is None
 
@@ -1450,6 +1591,10 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
             source="status_segment_transition",
             count_new_iteration=True,
         )
+        coordinator.active_run.mark_statistics_uncertain(
+            area=True,
+            time=True,
+        )
         coordinator.session.active_room_id = "dining_room"
         coordinator.set_state(coordinator.vacuum_entity, "error")
         coordinator.set_state("sensor.robot_dock_status", "pause")
@@ -1467,9 +1612,7 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
             assert coordinator.active_run.room_id == expected_room
             assert coordinator.active_run.vacuum_only is True
             assert coordinator.active_run.fallback_vacuum is False
-            asyncio.run(
-                coordinator._async_finish_active_run(success_override=True)
-            )
+            _finish_active_room_successfully(coordinator)
 
         assert coordinator.active_run is not None
         assert coordinator.active_run.room_id == "hallway"
@@ -2562,13 +2705,13 @@ def test_degraded_lane_orders_all_native_rooms_before_fallbacks() -> None:
 
     asyncio.run(coordinator._async_maybe_start_next_room())
     assert coordinator.started_rooms == ["native_old"]
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
     assert coordinator.started_rooms == ["native_old", "native_new"]
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
     assert coordinator.started_rooms == ["native_old", "native_new", "dual_old"]
     assert coordinator.active_run is not None
     assert coordinator.active_run.fallback_vacuum is True
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
     assert coordinator.started_rooms == [
         "native_old",
         "native_new",
@@ -2625,7 +2768,7 @@ def test_fallback_partial_credit_stays_due_for_new_same_day_session() -> None:
         "Mop Dock Clean Water Tank empty",
     )
 
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
 
     assert ledger.last_fallback_vacuumed is not None
     assert ledger.last_vacuumed == ledger.last_fallback_vacuumed
@@ -3265,6 +3408,7 @@ def test_restored_final_resumable_task_clears_after_stable_dock() -> None:
     coordinator = _RecoverableFailureCoordinator()
     active_run = coordinator.active_run
     assert active_run is not None
+    _prime_active_run_completion(coordinator)
     now = datetime.now(UTC)
     active_run.phase = logic.RUN_PHASE_SUSPENDED
     active_run.observed_cleaning = True
@@ -3590,6 +3734,7 @@ def test_cancel_failure_keeps_guard_without_duplicate_stop() -> None:
 def test_completed_restored_run_is_not_misclassified_as_low_battery() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator._active_run_restored = True
@@ -3721,6 +3866,7 @@ def test_normal_final_dock_completes_after_stable_settle() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.config[const.CONF_DOCK_SETTLE] = 60
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.active_run.docked_at = (
@@ -3745,6 +3891,7 @@ def test_final_mop_drying_does_not_trigger_native_resume_timeout() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.config[const.CONF_DOCK_SETTLE] = 60
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.active_run.docked_at = (
@@ -3799,6 +3946,7 @@ def test_dominant_wrong_room_estimated_dwell_is_never_credited() -> None:
 def test_unresolvable_room_does_not_trigger_wrong_room_needs_help() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.active_run.estimated_dwell_seconds = {"room_two": 90}
@@ -3829,6 +3977,7 @@ def test_restored_downtime_is_not_counted_as_wrong_room_dwell() -> None:
     )
     coordinator.room_by_id["room_one"] = coordinator.rooms[0]
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.active_run.estimated_dwell_seconds = {"room_one": 300}
@@ -3961,6 +4110,7 @@ def test_completion_works_without_optional_status_flag_sensor() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.config.pop(const.CONF_STATUS_FLAG_ENTITY)
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.set_state(coordinator.vacuum_entity, "docked")
     coordinator.set_state("sensor.robot_error", "No error")
@@ -3976,6 +4126,7 @@ def test_completion_works_without_optional_status_flag_sensor() -> None:
 def test_docked_run_finalizes_when_error_sensor_recovers() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.set_state(coordinator.vacuum_entity, "docked")
@@ -3997,6 +4148,7 @@ def test_docked_run_finalizes_when_error_sensor_recovers() -> None:
 def test_configured_unavailable_status_waits_before_completion() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.set_state(coordinator.vacuum_entity, "docked")
@@ -4016,6 +4168,7 @@ def test_configured_unavailable_status_waits_before_completion() -> None:
 def test_configured_unavailable_dock_status_waits_before_completion() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator.set_state(coordinator.vacuum_entity, "docked")
@@ -4036,6 +4189,7 @@ def test_configured_unavailable_dock_status_waits_before_completion() -> None:
 def test_restored_run_waits_for_configured_status_sensor_recovery() -> None:
     coordinator = _RecoverableFailureCoordinator()
     assert coordinator.active_run is not None
+    _prime_active_run_completion(coordinator)
     coordinator.active_run.observed_cleaning = True
     coordinator.active_run.observed_segment_cleaning = True
     coordinator._active_run_restored = True
@@ -4447,7 +4601,7 @@ def test_refill_keeps_native_lane_then_runs_untouched_dual_normally() -> None:
     assert coordinator.active_run is not None
     assert coordinator.active_run.fallback_vacuum is False
 
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
     assert coordinator.started_rooms == ["native", "dual"]
     assert coordinator.active_run is not None
     assert coordinator.active_run.vacuum_only is False
@@ -4542,7 +4696,7 @@ def test_refill_during_fallback_finishes_it_then_runs_other_dual_normally() -> N
     coordinator.set_state("sensor.robot_dock_status", "idle")
     coordinator.set_state("sensor.robot_error", "No error")
 
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
 
     assert coordinator.session is not None
     assert coordinator.session.fallback_completed_room_ids == ["fallback_room"]
@@ -4727,6 +4881,7 @@ def test_restored_allowed_clean_water_run_finishes_without_error_reclassificatio
         observed_segment_cleaning=True,
         requested_iterations=1,
     )
+    _prime_active_run_completion(coordinator)
     coordinator._active_run_restored = True
     coordinator.set_state(coordinator.vacuum_entity, "error")
     coordinator.set_state("sensor.robot_status_flag", "none")
@@ -4777,6 +4932,7 @@ def test_allowed_clean_water_error_is_tolerated_at_dock_completion_gate() -> Non
         observed_segment_cleaning=True,
         requested_iterations=1,
     )
+    _prime_active_run_completion(coordinator)
     coordinator.set_state(coordinator.vacuum_entity, "docked")
     coordinator.set_state("sensor.robot_status_flag", "none")
     coordinator.set_state("sensor.robot_dock_status", "pause")
@@ -7271,9 +7427,9 @@ def test_clean_water_fallback_false_still_runs_all_native_vacuum_rooms():
 
     asyncio.run(coordinator._async_maybe_start_next_room())
     assert coordinator.started_rooms == ["native_one"]
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
     assert coordinator.started_rooms == ["native_one", "native_two"]
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
 
     assert coordinator.session is not None
     assert coordinator.session.active is True
@@ -7423,7 +7579,7 @@ def test_recoverable_resource_wait_rearms_and_resumes_on_clear():
     assert coordinator.active_run.vacuum_only is True
     assert coordinator.session.deferred_full_clean_room_ids == ["mop_room"]
 
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
 
     first_retry = coordinator.session.next_retry_at
     assert coordinator.active_run is None
@@ -7529,10 +7685,7 @@ def test_post_clean_resource_fault_preserves_completed_floor_credit(
     assert projection["credit"]["status"] == "full"
 
 
-@pytest.mark.parametrize("status_configured", [True, False])
-def test_ordinary_two_iteration_completion_preserves_legacy_credit(
-    status_configured,
-):
+def test_ordinary_two_iteration_completion_preserves_legacy_credit():
     coordinator = _RecoverableFailureCoordinator()
     room = logic.RoomConfig(
         room_id="room_one",
@@ -7541,8 +7694,6 @@ def test_ordinary_two_iteration_completion_preserves_legacy_credit(
         min_duration=120,
     )
     _set_rooms(coordinator, [room])
-    if not status_configured:
-        coordinator.config.pop(const.CONF_STATUS_FLAG_ENTITY)
     coordinator.session = logic.SessionState(
         session_id="same-away",
         started_at=logic.utcnow_iso(),
@@ -7559,10 +7710,11 @@ def test_ordinary_two_iteration_completion_preserves_legacy_credit(
         start_confirmed_at=logic.utcnow_iso(),
         phase=logic.RUN_PHASE_CLEANING,
         observed_cleaning=True,
-        observed_segment_cleaning=status_configured,
         requested_iterations=2,
     )
     coordinator.set_state("sensor.robot_time", "200")
+    _observe_iteration_cycles(coordinator, 2)
+    assert coordinator.active_run.observed_iteration_count == 2
     coordinator.set_state(coordinator.vacuum_entity, "docked")
     coordinator.set_state("sensor.robot_error", "No error")
     coordinator.set_state("sensor.robot_status_flag", "none")
@@ -7573,6 +7725,50 @@ def test_ordinary_two_iteration_completion_preserves_legacy_credit(
     assert coordinator.ledgers["room_one"].successful_count == 1
     assert coordinator.session.completed_room_ids == ["room_one"]
     assert coordinator.session.uncertain_room_ids == []
+
+
+def test_two_iteration_completion_without_pass_evidence_is_uncertain():
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_duration=120,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.config.pop(const.CONF_STATUS_FLAG_ENTITY)
+    coordinator.session = logic.SessionState(
+        session_id="same-away",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["room_one"],
+        active_room_id="room_one",
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="same-away",
+        started_at=logic.utcnow_iso(),
+        start_time=0,
+        command_published=True,
+        start_confirmed_at=logic.utcnow_iso(),
+        phase=logic.RUN_PHASE_CLEANING,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+        requested_iterations=2,
+    )
+    coordinator.set_state("sensor.robot_time", "200")
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+
+    asyncio.run(coordinator._async_finish_active_run())
+
+    assert coordinator.ledgers["room_one"].successful_count == 0
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.session.uncertain_room_ids == ["room_one"]
+    assert coordinator.session.uncertain_room_reasons["room_one"] == (
+        "Observed 1 of 2 requested iterations"
+    )
 
 
 def test_partial_iterations_record_uncertain_without_full_credit_or_repeat():
@@ -7637,6 +7833,411 @@ def test_partial_iterations_record_uncertain_without_full_credit_or_repeat():
     assert coordinator.started_rooms == []
     assert coordinator.session.active is False
     assert coordinator.session.terminal_reason == "complete_with_uncertainty"
+
+
+def test_gym_counter_reset_then_surpass_preserves_observed_work():
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="gym",
+        name="Gym",
+        segment_id="5",
+        min_duration=120,
+        min_area=100,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.session = logic.SessionState(
+        session_id="gym-session",
+        started_at=logic.utcnow_iso(),
+        attempted_room_ids=["gym"],
+        active_room_id="gym",
+    )
+    coordinator.active_run = logic.ActiveRun(
+        room_id="gym",
+        segment_id="5",
+        session_id="gym-session",
+        started_at=logic.utcnow_iso(),
+        start_area=100,
+        start_time=1440,
+        last_area=100,
+        last_time=1440,
+        command_published=True,
+        start_confirmed_at=logic.utcnow_iso(),
+        phase=logic.RUN_PHASE_CLEANING,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+        requested_iterations=2,
+    )
+    coordinator.active_run.observe_segment_iteration(
+        source="status_segment_transition",
+        count_new_iteration=True,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_area", "100")
+    coordinator.set_state("sensor.robot_time", "1440")
+    coordinator.set_state("sensor.robot_estimated_segment", "5")
+
+    _handle_event(coordinator, "sensor.robot_time", "0")
+    _handle_event(coordinator, "sensor.robot_area", "0")
+    _handle_event(coordinator, "sensor.robot_time", "1500")
+    _handle_event(coordinator, "sensor.robot_area", "161")
+
+    assert coordinator.active_run.time_reset_count == 1
+    assert coordinator.active_run.area_reset_count == 1
+    assert coordinator.active_run.total_time(1500) == 1500
+    assert coordinator.active_run.total_area(161) == 161
+
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    asyncio.run(coordinator._async_finish_active_run())
+
+    assert coordinator.ledgers["gym"].successful_count == 0
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.session.uncertain_room_ids == ["gym"]
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["status"] == "uncertain"
+    assert projection["credit"]["status"] == "none"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "verification.iterations_incomplete"
+    )
+    assert projection["latest_attempt"]["evidence"]["duration"] == {
+        "status": "passed",
+        "observed": 1500,
+        "minimum": 120,
+        "unit": "seconds",
+        "reset_count": 1,
+        "attribution_uncertain": False,
+    }
+
+
+def test_office_outage_recovers_same_task_without_duplicate_dispatch():
+    coordinator = _prepare_telemetry_outage_run()
+    run = _enter_correlated_telemetry_outage(coordinator)
+    deadline = run.telemetry_outage_deadline
+
+    assert coordinator.session is not None
+    assert coordinator.session.recovery_phase == "telemetry_gap"
+    assert coordinator.started_rooms == []
+    assert coordinator.hass.services.calls == []
+
+    recovered_states = (
+        (coordinator.vacuum_entity, "cleaning"),
+        ("sensor.robot_error", "No error"),
+        ("sensor.robot_status_flag", "segment"),
+        ("sensor.robot_dock_status", "idle"),
+        ("sensor.robot_area", "180"),
+        ("sensor.robot_time", "1500"),
+    )
+    for entity_id, value in recovered_states:
+        _handle_event(coordinator, entity_id, value)
+        assert coordinator.active_run is run
+        assert run.phase == logic.RUN_PHASE_TELEMETRY_GAP
+
+    _handle_event(coordinator, "sensor.robot_estimated_segment", "1")
+
+    assert coordinator.active_run is run
+    assert run.phase == logic.RUN_PHASE_CLEANING
+    assert run.telemetry_outage_count == 1
+    assert run.telemetry_outage_deadline == deadline
+    assert run.time_measurement_uncertain is True
+    assert run.area_measurement_uncertain is True
+    assert coordinator.session.blocker_code is None
+    assert coordinator.started_rooms == []
+    assert coordinator.hass.services.calls == []
+
+
+@pytest.mark.parametrize(
+    "outage_order",
+    [
+        (
+            "sensor.robot_error",
+            "sensor.robot_status_flag",
+            "sensor.robot_area",
+            "vacuum.robot",
+        ),
+        (
+            "vacuum.robot",
+            "sensor.robot_error",
+            "sensor.robot_status_flag",
+            "sensor.robot_area",
+        ),
+    ],
+)
+def test_staggered_outage_onset_never_cancels_the_owned_run(outage_order):
+    coordinator = _prepare_telemetry_outage_run()
+    run = coordinator.active_run
+    assert run is not None
+
+    for entity_id in outage_order:
+        _handle_event(coordinator, entity_id, "unavailable")
+        assert coordinator.active_run is run
+        assert coordinator.hass.services.calls == []
+
+    assert run.phase == logic.RUN_PHASE_TELEMETRY_GAP
+    assert coordinator.session is not None
+    assert coordinator.session.recovery_phase == "telemetry_gap"
+
+
+def test_office_recovery_keeps_one_of_two_passes_uncertain():
+    coordinator = _prepare_telemetry_outage_run()
+    _enter_correlated_telemetry_outage(coordinator)
+    _recover_telemetry_outage(coordinator)
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.observed_iteration_count == 1
+
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    asyncio.run(coordinator._async_finish_active_run())
+
+    assert coordinator.ledgers["room_one"].successful_count == 0
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.session.uncertain_room_ids == ["room_one"]
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    attempt = projection["latest_attempt"]
+    assert attempt["reason"]["code"] == "verification.iterations_incomplete"
+    assert attempt["evidence"]["physical_work"]["status"] == "substantial"
+    assert attempt["evidence"]["duration"]["status"] == "passed_lower_bound"
+    assert attempt["evidence"]["iterations"] == {
+        "status": "unverified",
+        "requested": 2,
+        "observed": 1,
+    }
+    assert projection["credit"]["status"] == "none"
+
+
+def test_office_recovery_credits_only_after_second_pass_is_observed():
+    coordinator = _prepare_telemetry_outage_run()
+    _enter_correlated_telemetry_outage(coordinator)
+    _recover_telemetry_outage(coordinator)
+    assert coordinator.active_run is not None
+
+    _handle_event(coordinator, "sensor.robot_status_flag", "none")
+    _handle_event(coordinator, "sensor.robot_status_flag", "segment")
+    assert coordinator.active_run.observed_iteration_count == 2
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    asyncio.run(coordinator._async_finish_active_run())
+
+    assert coordinator.ledgers["room_one"].successful_count == 1
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    projection = coordinator.while_away_outcome_contract["rooms"][0]
+    assert projection["status"] == "completed"
+    assert projection["credit"]["status"] == "full"
+    assert projection["latest_attempt"]["evidence"]["telemetry"]["status"] == (
+        "recovered"
+    )
+
+
+def test_outage_recovery_at_dock_does_not_require_room_identity_sensor():
+    coordinator = _prepare_telemetry_outage_run(requested_iterations=1)
+    _enter_correlated_telemetry_outage(coordinator)
+
+    for entity_id, value in (
+        (coordinator.vacuum_entity, "docked"),
+        ("sensor.robot_error", "No error"),
+        ("sensor.robot_status_flag", "none"),
+        ("sensor.robot_dock_status", "idle"),
+        ("sensor.robot_area", "180"),
+        ("sensor.robot_time", "1500"),
+    ):
+        _handle_event(coordinator, entity_id, value)
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    assert coordinator.ledgers["room_one"].successful_count == 1
+    assert coordinator.started_rooms == []
+
+
+def test_conflicting_room_recovery_terminalizes_once_without_dispatch():
+    coordinator = _prepare_telemetry_outage_run()
+    _set_rooms(
+        coordinator,
+        [
+            coordinator.rooms[0],
+            logic.RoomConfig(
+                room_id="room_two",
+                name="Room Two",
+                segment_id="2",
+            ),
+        ],
+    )
+    _enter_correlated_telemetry_outage(coordinator)
+    _recover_telemetry_outage(coordinator, room_segment="2")
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    assert coordinator.session.uncertain_room_ids == ["room_one"]
+    assert coordinator.started_rooms == []
+    assert coordinator.hass.services.calls == []
+    assert coordinator.retained_task_guard is not None
+    assert coordinator.retained_task_guard.phase == (
+        logic.RETAINED_TASK_PHASE_STALE_CANDIDATE
+    )
+    attempts = [
+        outcome
+        for outcome in coordinator.while_away_outcomes
+        if outcome.event_type == "attempt"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0].reason_descriptor is not None
+    assert attempts[0].reason_descriptor.code == (
+        "telemetry.task_identity_conflict"
+    )
+
+    _handle_event(coordinator, "sensor.robot_battery", "100")
+
+    assert coordinator.started_rooms == []
+    assert len(
+        [
+            outcome
+            for outcome in coordinator.while_away_outcomes
+            if outcome.event_type == "attempt"
+        ]
+    ) == 1
+
+
+def test_telemetry_outage_timeout_retains_task_and_never_redispatches():
+    coordinator = _prepare_telemetry_outage_run()
+    run = _enter_correlated_telemetry_outage(coordinator)
+    deadline = logic.parse_datetime(run.telemetry_outage_deadline)
+    assert deadline is not None
+
+    asyncio.run(
+        coordinator._async_expire_telemetry_outage(
+            deadline + timedelta(seconds=1)
+        )
+    )
+    asyncio.run(
+        coordinator._async_expire_telemetry_outage(
+            deadline + timedelta(seconds=2)
+        )
+    )
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    assert coordinator.session.uncertain_room_ids == ["room_one"]
+    assert coordinator.session.recovery_phase == "operator_required"
+    assert coordinator.retained_task_guard is not None
+    assert coordinator.retained_task_guard.phase == (
+        logic.RETAINED_TASK_PHASE_STALE_CANDIDATE
+    )
+    assert coordinator.started_rooms == []
+    attempts = [
+        outcome
+        for outcome in coordinator.while_away_outcomes
+        if outcome.event_type == "attempt"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0].reason_descriptor is not None
+    assert attempts[0].reason_descriptor.code == (
+        "telemetry.source_outage_unresolved"
+    )
+    assert attempts[0].evidence["duration"]["status"] == (
+        "passed_lower_bound"
+    )
+    assert attempts[0].evidence["duration"]["lower_bound"] == 1440
+    assert attempts[0].evidence["area"]["lower_bound"] == 161
+
+    _handle_event(coordinator, "sensor.robot_battery", "100")
+    _recover_telemetry_outage(coordinator)
+
+    assert coordinator.started_rooms == []
+    assert coordinator.hass.services.calls == []
+    assert len(
+        [
+            outcome
+            for outcome in coordinator.while_away_outcomes
+            if outcome.event_type == "attempt"
+        ]
+    ) == 1
+
+
+def test_real_fault_after_outage_takes_precedence_over_recovery():
+    coordinator = _prepare_telemetry_outage_run()
+    _enter_correlated_telemetry_outage(coordinator)
+    _handle_event(coordinator, "sensor.robot_error", "Robot is stuck")
+
+    assert coordinator.active_run is None
+    assert coordinator.session is not None
+    assert coordinator.session.completed_room_ids == []
+    assert coordinator.ledgers["room_one"].successful_count == 0
+    assert "stop" in _service_names(coordinator)
+    attempt = coordinator.while_away_outcome_contract["rooms"][0][
+        "latest_attempt"
+    ]
+    assert attempt["reason"]["code"] == "navigation.stuck"
+
+
+def test_operator_cancellation_takes_precedence_during_telemetry_gap():
+    coordinator = _prepare_telemetry_outage_run()
+    _enter_correlated_telemetry_outage(coordinator)
+
+    asyncio.run(coordinator.async_cancel_session("Operator cancelled"))
+
+    assert coordinator.session is not None
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "cancelled"
+    assert coordinator.active_run is None
+    assert _service_names(coordinator).count("stop") == 1
+    assert coordinator.started_rooms == []
+
+
+def test_repeated_telemetry_gap_does_not_renew_recovery_budget():
+    coordinator = _prepare_telemetry_outage_run()
+    run = _enter_correlated_telemetry_outage(coordinator)
+    first_deadline = run.telemetry_outage_deadline
+    _recover_telemetry_outage(coordinator)
+
+    _enter_correlated_telemetry_outage(coordinator)
+
+    assert coordinator.active_run is run
+    assert run.telemetry_outage_count == 2
+    assert run.telemetry_outage_deadline == first_deadline
+
+
+def test_restored_telemetry_gap_keeps_run_ownership_until_recovery():
+    coordinator = _prepare_telemetry_outage_run()
+    run = _enter_correlated_telemetry_outage(coordinator)
+    stored_run = run.to_dict()
+    stored_session = coordinator.session.to_dict()
+    stored_guard = coordinator.retained_task_guard.to_dict()
+
+    restored = _prepare_telemetry_outage_run()
+    restored.active_run = logic.ActiveRun.from_dict(stored_run)
+    restored.session = logic.SessionState.from_dict(stored_session)
+    restored.retained_task_guard = logic.RetainedTaskGuard.from_dict(
+        stored_guard
+    )
+    restored._active_run_restored = True
+    for entity_id in (
+        restored.vacuum_entity,
+        "sensor.robot_error",
+        "sensor.robot_status_flag",
+        "sensor.robot_dock_status",
+        "sensor.robot_area",
+        "sensor.robot_time",
+        "sensor.robot_estimated_segment",
+    ):
+        restored.set_state(entity_id, "unavailable")
+
+    asyncio.run(restored._async_reconcile_restored_active_run())
+
+    assert restored.active_run is not None
+    assert restored.active_run.phase == logic.RUN_PHASE_TELEMETRY_GAP
+    assert restored.started_rooms == []
+
+    _recover_telemetry_outage(restored)
+
+    assert restored.active_run is not None
+    assert restored.active_run.phase == logic.RUN_PHASE_CLEANING
+    assert restored.active_run.room_id == "room_one"
+    assert restored.started_rooms == []
 
 
 def test_resource_flapping_is_coherent_and_commands_notifications_do_not_storm():
@@ -7942,7 +8543,7 @@ def test_v020_terminal_migration_resets_notice_and_settings_lifecycle():
     assert coordinator.started_rooms == ["room_one"]
     assert _service_names(coordinator).count("household") == 2
 
-    asyncio.run(coordinator._async_finish_active_run(success_override=True))
+    _finish_active_room_successfully(coordinator)
 
     assert coordinator.session.active is False
     assert coordinator.session.notification_sent is True

@@ -21,6 +21,9 @@ valetudo_vacuum_coordinator:
   dispatch_start_timeout: 120
   # Bounded retry cadence for recoverable waits; it no longer ends a session.
   blocked_session_timeout: 300
+  # Retain an owned room task while the correlated Valetudo telemetry surface
+  # is unavailable. This bound never overrides safety or operator cancellation.
+  telemetry_outage_timeout: 300
   # Debounce component-sensor faults during active floor accounting.
   resource_settle: 3
   # Shadow-safe by default for unowned stale tasks. Enable only after
