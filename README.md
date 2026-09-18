@@ -34,6 +34,8 @@ valetudo_vacuum_coordinator:
   dispatch_start_timeout: 120
   # Recoverable blockers recheck on this cadence; they do not end the session.
   blocked_session_timeout: 300
+  # Retain an owned room task through a correlated Valetudo source outage.
+  telemetry_outage_timeout: 300
   # Debounce dock-component faults during an active run.
   resource_settle: 3
   stale_resume_auto_clear: false
@@ -227,6 +229,18 @@ Only errors whose text explicitly identifies an unrecoverable/fatal permanent
 failure terminalize the session. Unknown firmware errors default to
 recoverable waiting so a newly introduced error cannot silently discard the
 queue.
+
+Version 0.3.3 makes correlated Valetudo entity loss during a confirmed room
+run enter a
+`telemetry_gap` instead of cancelling the task or dispatching another room.
+The coordinator retains ownership for `telemetry_outage_timeout`, requires a
+fresh coherent vacuum/error/status/dock/counter snapshot, and additionally
+requires the estimated segment to match before adopting a recovered cleaning
+task. Repeated gaps do not renew the original deadline. If recovery remains
+unresolved or identifies a different room, the run is recorded as uncertain,
+its proven lower-bound work remains in structured outcome evidence, and a
+retained-task guard blocks duplicate dispatch until the robot task is
+confirmed clear.
 
 Version 0.3.2 makes recoverable room-navigation failures retain the failed room as attempted,
 wait for a coherent docked and error-clear state, run every unattempted room

@@ -73,6 +73,7 @@ RUN_PHASE_CLEANING = "cleaning"
 RUN_PHASE_DOCK_INTERRUPT = "dock_interrupt"
 RUN_PHASE_SUSPENDED = "suspended"
 RUN_PHASE_RESUMED_CLEANING = "resumed_cleaning"
+RUN_PHASE_TELEMETRY_GAP = "telemetry_gap"
 RUN_PHASE_CANCEL_PENDING = "cancel_pending"
 RUN_PHASE_RECOVERY_STALLED = "recovery_stalled"
 
@@ -82,6 +83,7 @@ RUN_PHASES = {
     RUN_PHASE_DOCK_INTERRUPT,
     RUN_PHASE_SUSPENDED,
     RUN_PHASE_RESUMED_CLEANING,
+    RUN_PHASE_TELEMETRY_GAP,
     RUN_PHASE_CANCEL_PENDING,
     RUN_PHASE_RECOVERY_STALLED,
 }
@@ -306,6 +308,16 @@ class ActiveRun:
     accumulated_time: float = 0.0
     last_area: float | None = None
     last_time: float | None = None
+    area_reset_count: int = 0
+    time_reset_count: int = 0
+    area_measurement_uncertain: bool = False
+    time_measurement_uncertain: bool = False
+    telemetry_outage_started_at: str | None = None
+    telemetry_outage_deadline: str | None = None
+    telemetry_outage_previous_phase: str | None = None
+    telemetry_outage_count: int = 0
+    telemetry_outage_seconds: float = 0.0
+    telemetry_outage_unresolved: bool = False
     cancel_requested_at: str | None = None
     cancel_reason: str | None = None
     cancel_stop_attempted: bool = False
@@ -326,6 +338,8 @@ class ActiveRun:
     cancel_outcome_result: str | None = None
     floor_completion_status: str | None = None
     floor_completion_reason: str | None = None
+    floor_completion_duration: float | None = None
+    floor_completion_area: float | None = None
     floor_completion_recorded_at: str | None = None
     last_estimated_room_id: str | None = None
     last_estimated_changed_at: str | None = None
@@ -344,6 +358,14 @@ class ActiveRun:
             self.start_confirmed_at
             or self.observed_cleaning
             or self.observed_segment_cleaning
+        )
+
+    @property
+    def effective_observed_iteration_count(self) -> int:
+        """Return conservative iteration evidence including one observed segment."""
+        return max(
+            self.observed_iteration_count,
+            1 if self.observed_segment_cleaning else 0,
         )
 
     @property
@@ -388,24 +410,70 @@ class ActiveRun:
         self,
         current_area: float | None,
         current_time: float | None,
-    ) -> None:
+    ) -> bool:
         """Accumulate counters before a dock interruption can reset them."""
+        changed = False
         area_baseline = self.last_area if self.last_area is not None else self.start_area
         if area_baseline is not None and current_area is not None:
-            self.accumulated_area += counter_delta(area_baseline, current_area)
-            self.last_area = current_area
+            area_delta = counter_delta(area_baseline, current_area)
+            if current_area < area_baseline:
+                self.area_reset_count += 1
+                changed = True
+            if area_delta:
+                self.accumulated_area += area_delta
+                changed = True
+            if self.last_area != current_area:
+                self.last_area = current_area
+                changed = True
         elif current_area is not None:
-            self.last_area = current_area
+            if not self.area_measurement_uncertain:
+                self.area_measurement_uncertain = True
+                changed = True
+            if self.last_area != current_area:
+                self.last_area = current_area
+                changed = True
 
         time_baseline = self.last_time if self.last_time is not None else self.start_time
         if time_baseline is not None and current_time is not None:
-            self.accumulated_time += counter_delta(time_baseline, current_time)
-            self.last_time = current_time
+            time_delta = counter_delta(time_baseline, current_time)
+            if current_time < time_baseline:
+                self.time_reset_count += 1
+                changed = True
+            if time_delta:
+                self.accumulated_time += time_delta
+                changed = True
+            if self.last_time != current_time:
+                self.last_time = current_time
+                changed = True
         elif current_time is not None:
-            self.last_time = current_time
+            if not self.time_measurement_uncertain:
+                self.time_measurement_uncertain = True
+                changed = True
+            if self.last_time != current_time:
+                self.last_time = current_time
+                changed = True
+        return changed
+
+    def mark_statistics_uncertain(
+        self,
+        *,
+        area: bool = False,
+        time: bool = False,
+    ) -> bool:
+        """Mark counter attribution unknown without erasing observed work."""
+        changed = False
+        if area and not self.area_measurement_uncertain:
+            self.area_measurement_uncertain = True
+            changed = True
+        if time and not self.time_measurement_uncertain:
+            self.time_measurement_uncertain = True
+            changed = True
+        return changed
 
     def total_area(self, end_area: float | None) -> float | None:
         """Return accumulated cleaned area across counter resets."""
+        if self.area_measurement_uncertain:
+            return None
         baseline = self.last_area if self.last_area is not None else self.start_area
         if baseline is None or end_area is None:
             return None
@@ -413,6 +481,8 @@ class ActiveRun:
 
     def total_time(self, end_time: float | None) -> float | None:
         """Return accumulated cleaning time across counter resets."""
+        if self.time_measurement_uncertain:
+            return None
         baseline = self.last_time if self.last_time is not None else self.start_time
         if baseline is None or end_time is None:
             return None
@@ -590,6 +660,38 @@ class ActiveRun:
             accumulated_time=parse_float(data.get("accumulated_time")) or 0.0,
             last_area=parse_float(data.get("last_area", start_area)),
             last_time=parse_float(data.get("last_time", start_time)),
+            area_reset_count=max(
+                0,
+                int(parse_float(data.get("area_reset_count")) or 0),
+            ),
+            time_reset_count=max(
+                0,
+                int(parse_float(data.get("time_reset_count")) or 0),
+            ),
+            area_measurement_uncertain=bool(
+                data.get("area_measurement_uncertain", False)
+            ),
+            time_measurement_uncertain=bool(
+                data.get("time_measurement_uncertain", False)
+            ),
+            telemetry_outage_started_at=data.get(
+                "telemetry_outage_started_at"
+            ),
+            telemetry_outage_deadline=data.get("telemetry_outage_deadline"),
+            telemetry_outage_previous_phase=data.get(
+                "telemetry_outage_previous_phase"
+            ),
+            telemetry_outage_count=max(
+                0,
+                int(parse_float(data.get("telemetry_outage_count")) or 0),
+            ),
+            telemetry_outage_seconds=max(
+                0.0,
+                parse_float(data.get("telemetry_outage_seconds")) or 0.0,
+            ),
+            telemetry_outage_unresolved=bool(
+                data.get("telemetry_outage_unresolved", False)
+            ),
             cancel_requested_at=data.get("cancel_requested_at"),
             cancel_reason=cancel_reason,
             cancel_stop_attempted=bool(
@@ -626,6 +728,12 @@ class ActiveRun:
             cancel_outcome_result=data.get("cancel_outcome_result"),
             floor_completion_status=data.get("floor_completion_status"),
             floor_completion_reason=data.get("floor_completion_reason"),
+            floor_completion_duration=parse_float(
+                data.get("floor_completion_duration")
+            ),
+            floor_completion_area=parse_float(
+                data.get("floor_completion_area")
+            ),
             floor_completion_recorded_at=data.get(
                 "floor_completion_recorded_at"
             ),
@@ -687,6 +795,18 @@ class ActiveRun:
             "accumulated_time": self.accumulated_time,
             "last_area": self.last_area,
             "last_time": self.last_time,
+            "area_reset_count": self.area_reset_count,
+            "time_reset_count": self.time_reset_count,
+            "area_measurement_uncertain": self.area_measurement_uncertain,
+            "time_measurement_uncertain": self.time_measurement_uncertain,
+            "telemetry_outage_started_at": self.telemetry_outage_started_at,
+            "telemetry_outage_deadline": self.telemetry_outage_deadline,
+            "telemetry_outage_previous_phase": (
+                self.telemetry_outage_previous_phase
+            ),
+            "telemetry_outage_count": self.telemetry_outage_count,
+            "telemetry_outage_seconds": self.telemetry_outage_seconds,
+            "telemetry_outage_unresolved": self.telemetry_outage_unresolved,
             "cancel_requested_at": self.cancel_requested_at,
             "cancel_reason": self.cancel_reason,
             "cancel_stop_attempted": self.cancel_stop_attempted,
@@ -715,6 +835,8 @@ class ActiveRun:
             "cancel_outcome_result": self.cancel_outcome_result,
             "floor_completion_status": self.floor_completion_status,
             "floor_completion_reason": self.floor_completion_reason,
+            "floor_completion_duration": self.floor_completion_duration,
+            "floor_completion_area": self.floor_completion_area,
             "floor_completion_recorded_at": self.floor_completion_recorded_at,
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
@@ -934,6 +1056,7 @@ class WhileAwayOutcome:
     attempt_result: str | None = None
     outstanding_operation: str | None = None
     reason_descriptor: OutcomeReason | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
     legacy_visible: bool = True
 
     @property
@@ -1005,6 +1128,11 @@ class WhileAwayOutcome:
                 else None
             ),
             reason_descriptor=OutcomeReason.from_dict(data.get("typed_reason")),
+            evidence=(
+                dict(data["evidence"])
+                if isinstance(data.get("evidence"), dict)
+                else {}
+            ),
             legacy_visible=bool(data.get("legacy_visible", True)),
         )
 
@@ -1029,6 +1157,7 @@ class WhileAwayOutcome:
                 if self.reason_descriptor
                 else None
             ),
+            "evidence": self.evidence,
             "legacy_visible": self.legacy_visible,
         }
 
@@ -1055,6 +1184,8 @@ class WhileAwayOutcome:
         if self.event_type == "attempt":
             event["attempt_mode"] = self.attempt_mode
             event["attempt_result"] = self.attempt_result
+            if self.evidence:
+                event["evidence"] = self.evidence
         else:
             event["outstanding_operation"] = self.outstanding_operation
         return event
@@ -1198,6 +1329,8 @@ def build_while_away_outcome_contract(
             "result": outcome.attempt_result,
             "reason": reason,
         }
+        if outcome.evidence:
+            attempt["evidence"] = outcome.evidence
         if (
             projection["credit"]["status"] == "full"
             and not (
@@ -2525,6 +2658,38 @@ def classify_outcome_reason(reason: str | None) -> OutcomeReason:
                 "minimum_area": _reason_number(area.group(2)),
             },
         )
+    if lowered in {
+        "floor completion time became ambiguous during a telemetry outage",
+        "floor completion area became ambiguous during a telemetry outage",
+    }:
+        return OutcomeReason(
+            "telemetry.counter_attribution_ambiguous",
+            "availability",
+            normalized,
+            {
+                "measurement": (
+                    "time"
+                    if lowered.startswith("floor completion time")
+                    else "area"
+                )
+            },
+        )
+    if lowered in {
+        "floor completion time was unavailable during dock servicing",
+        "floor completion area was unavailable during dock servicing",
+    }:
+        return OutcomeReason(
+            "verification.measurement_unavailable",
+            "verification",
+            normalized,
+            {
+                "measurement": (
+                    "time"
+                    if lowered.startswith("floor completion time")
+                    else "area"
+                )
+            },
+        )
     dwell = re.fullmatch(
         r"Estimated in-room dwell ([0-9]+(?:\.[0-9]+)?)s, below ([0-9]+(?:\.[0-9]+)?)s threshold",
         normalized,
@@ -2598,6 +2763,20 @@ def classify_outcome_reason(reason: str | None) -> OutcomeReason:
             "recovery",
             normalized,
             {"timeout_seconds": int(timeout.group(1))} if timeout else {},
+        )
+    if lowered.startswith("telemetry recovery was not coherent within "):
+        timeout = re.search(r"([0-9]+)s", lowered)
+        return OutcomeReason(
+            "telemetry.source_outage_unresolved",
+            "availability",
+            normalized,
+            {"timeout_seconds": int(timeout.group(1))} if timeout else {},
+        )
+    if lowered.startswith("telemetry recovered with conflicting room evidence"):
+        return OutcomeReason(
+            "telemetry.task_identity_conflict",
+            "availability",
+            normalized,
         )
     if "vacuum never entered cleaning state" in lowered:
         return OutcomeReason(
@@ -2931,25 +3110,54 @@ def evaluate_floor_completion_evidence(
             duration,
             area,
         )
-    if room.min_duration > 0 and duration is None:
-        return FloorCompletionEvidence(
-            "uncertain",
-            "Floor completion time was unavailable during dock servicing",
-            duration,
-            area,
-        )
-    if room.min_area > 0 and area is None:
-        return FloorCompletionEvidence(
-            "uncertain",
-            "Floor completion area was unavailable during dock servicing",
-            duration,
-            area,
-        )
-    if run.observed_iteration_count < run.requested_iterations:
+    duration_lower_bound_passed = bool(
+        run.time_measurement_uncertain
+        and run.accumulated_time >= room.min_duration
+    )
+    if (
+        room.min_duration > 0
+        and duration is None
+        and not duration_lower_bound_passed
+    ):
         return FloorCompletionEvidence(
             "uncertain",
             (
-                f"Observed {run.observed_iteration_count} of "
+                "Floor completion time became ambiguous during a telemetry "
+                "outage"
+                if run.time_measurement_uncertain
+                and run.telemetry_outage_count
+                else "Floor completion time was unavailable during dock servicing"
+            ),
+            duration,
+            area,
+        )
+    area_lower_bound_passed = bool(
+        run.area_measurement_uncertain
+        and run.accumulated_area >= room.min_area
+    )
+    if (
+        room.min_area > 0
+        and area is None
+        and not area_lower_bound_passed
+    ):
+        return FloorCompletionEvidence(
+            "uncertain",
+            (
+                "Floor completion area became ambiguous during a telemetry "
+                "outage"
+                if run.area_measurement_uncertain
+                and run.telemetry_outage_count
+                else "Floor completion area was unavailable during dock servicing"
+            ),
+            duration,
+            area,
+        )
+    observed_iterations = run.effective_observed_iteration_count
+    if observed_iterations < run.requested_iterations:
+        return FloorCompletionEvidence(
+            "uncertain",
+            (
+                f"Observed {observed_iterations} of "
                 f"{run.requested_iterations} requested iterations"
             ),
             duration,
@@ -2984,6 +3192,131 @@ def evaluate_floor_completion_evidence(
         duration,
         area,
     )
+
+
+def build_run_evidence(
+    room: RoomConfig,
+    run: ActiveRun,
+    completion: FloorCompletionEvidence,
+) -> dict[str, Any]:
+    """Build structured run evidence without granting scheduling credit."""
+
+    def measurement(
+        observed: float | None,
+        minimum: float,
+        *,
+        unit: str,
+        reset_count: int,
+        attribution_uncertain: bool,
+        lower_bound: float,
+    ) -> dict[str, Any]:
+        if minimum <= 0:
+            status = "not_required"
+        elif (
+            observed is None
+            and attribution_uncertain
+            and lower_bound >= minimum
+        ):
+            status = "passed_lower_bound"
+        elif observed is None:
+            status = "unknown"
+        elif observed >= minimum:
+            status = "passed"
+        else:
+            status = "failed"
+        result = {
+            "status": status,
+            "observed": observed,
+            "minimum": minimum,
+            "unit": unit,
+            "reset_count": reset_count,
+            "attribution_uncertain": attribution_uncertain,
+        }
+        if attribution_uncertain:
+            result["lower_bound"] = lower_bound
+        return result
+
+    duration = measurement(
+        completion.duration,
+        float(room.min_duration),
+        unit="seconds",
+        reset_count=run.time_reset_count,
+        attribution_uncertain=run.time_measurement_uncertain,
+        lower_bound=run.accumulated_time,
+    )
+    area = measurement(
+        completion.area,
+        float(room.min_area),
+        unit="square_inches",
+        reset_count=run.area_reset_count,
+        attribution_uncertain=run.area_measurement_uncertain,
+        lower_bound=run.accumulated_area,
+    )
+    target_dwell = run.estimated_dwell_seconds.get(room.room_id, 0.0)
+    physical_status = "not_observed"
+    if run.observed_cleaning or run.observed_segment_cleaning:
+        physical_status = "observed"
+    if (
+        run.observed_cleaning
+        and run.observed_segment_cleaning
+        and (
+            duration["status"] == "passed"
+            or duration["status"] == "passed_lower_bound"
+            or area["status"] == "passed"
+            or area["status"] == "passed_lower_bound"
+            or (
+                run.time_measurement_uncertain
+                and room.min_duration > 0
+                and run.accumulated_time >= room.min_duration
+            )
+            or (
+                run.area_measurement_uncertain
+                and room.min_area > 0
+                and run.accumulated_area >= room.min_area
+            )
+            or target_dwell >= float(room.min_estimated_dwell)
+        )
+    ):
+        physical_status = "substantial"
+
+    observed_iterations = run.effective_observed_iteration_count
+    evidence: dict[str, Any] = {
+        "physical_work": {
+            "status": physical_status,
+            "cleaning_observed": run.observed_cleaning,
+            "segment_cleaning_observed": run.observed_segment_cleaning,
+            "target_room_dwell_seconds": target_dwell,
+        },
+        "duration": duration,
+        "area": area,
+        "iterations": {
+            "status": (
+                "verified"
+                if observed_iterations >= run.requested_iterations
+                else "unverified"
+            ),
+            "requested": run.requested_iterations,
+            "observed": observed_iterations,
+        },
+        "completion": {
+            "status": completion.status,
+            "reason": completion.reason,
+        },
+    }
+    if run.telemetry_outage_count:
+        evidence["telemetry"] = {
+            "source_outage_count": run.telemetry_outage_count,
+            "source_outage_seconds": run.telemetry_outage_seconds,
+            "status": (
+                "unresolved"
+                if (
+                    run.telemetry_outage_started_at is not None
+                    or run.telemetry_outage_unresolved
+                )
+                else "recovered"
+            ),
+        }
+    return evidence
 
 
 def counter_delta(start_value: float, end_value: float) -> float:

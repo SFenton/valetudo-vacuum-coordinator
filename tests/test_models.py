@@ -684,6 +684,67 @@ def test_run_success_accepts_reset_current_statistics():
     assert reason is None
 
 
+def test_statistics_reset_then_surpass_uses_new_counter_generation():
+    run = logic.ActiveRun(
+        room_id="gym",
+        segment_id="5",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=1440,
+        start_area=100,
+        last_time=1440,
+        last_area=100,
+    )
+
+    assert run.checkpoint_statistics(0, 0) is True
+    assert run.checkpoint_statistics(161, 1500) is True
+    assert run.checkpoint_statistics(161, 1500) is False
+
+    assert run.time_reset_count == 1
+    assert run.area_reset_count == 1
+    assert run.total_time(1500) == 1500
+    assert run.total_area(161) == 161
+
+
+def test_statistics_ingest_area_and_time_independently_and_idempotently():
+    run = logic.ActiveRun(
+        room_id="office",
+        segment_id="6",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        start_time=100,
+        start_area=10,
+        last_time=100,
+        last_area=10,
+    )
+
+    assert run.checkpoint_statistics(25, None) is True
+    assert run.checkpoint_statistics(None, 160) is True
+    assert run.checkpoint_statistics(25, 160) is False
+
+    assert run.accumulated_area == 15
+    assert run.accumulated_time == 60
+    assert run.total_area(25) == 15
+    assert run.total_time(160) == 60
+
+
+def test_first_counter_sample_without_baseline_is_not_treated_as_zero_work():
+    run = logic.ActiveRun(
+        room_id="office",
+        segment_id="6",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+
+    assert run.checkpoint_statistics(25, 160) is True
+    assert run.checkpoint_statistics(25, 160) is False
+
+    assert run.area_measurement_uncertain is True
+    assert run.time_measurement_uncertain is True
+    assert run.total_area(25) is None
+    assert run.total_time(160) is None
+
+
 def test_manual_rooms_to_credit_requires_estimated_dwell():
     room_one = logic.RoomConfig(
         room_id="room_one",
@@ -824,11 +885,26 @@ def test_active_run_native_resume_metadata_round_trips():
         accumulated_time=610,
         last_area=12.5,
         last_time=610,
+        area_reset_count=1,
+        time_reset_count=2,
+        area_measurement_uncertain=True,
+        time_measurement_uncertain=True,
+        telemetry_outage_started_at="2026-08-04T12:12:30+00:00",
+        telemetry_outage_deadline="2026-08-04T12:17:30+00:00",
+        telemetry_outage_previous_phase=logic.RUN_PHASE_CLEANING,
+        telemetry_outage_count=2,
+        telemetry_outage_seconds=45,
+        telemetry_outage_unresolved=True,
         cancel_continue_session=True,
         cancel_recover_room=True,
         cancel_return_attempts=1,
         cancel_return_requested_at="2026-08-04T12:11:00+00:00",
         cancel_return_service_acknowledged_at="2026-08-04T12:11:01+00:00",
+        floor_completion_status="uncertain",
+        floor_completion_reason="Telemetry source was unavailable",
+        floor_completion_duration=610,
+        floor_completion_area=12.5,
+        floor_completion_recorded_at="2026-08-04T12:18:00+00:00",
     )
     run.observe_segment_iteration(
         source="status_segment_transition",
@@ -1035,6 +1111,16 @@ def test_while_away_outcome_round_trips():
             "Segment dispatch did not start within 90s",
             "dispatch.timeout",
             "dispatch",
+        ),
+        (
+            "Floor completion time became ambiguous during a telemetry outage",
+            "telemetry.counter_attribution_ambiguous",
+            "availability",
+        ),
+        (
+            "Floor completion area was unavailable during dock servicing",
+            "verification.measurement_unavailable",
+            "verification",
         ),
         ("Unexpected vendor failure", "unknown", "unknown"),
     ],
@@ -1969,6 +2055,60 @@ def test_partial_iteration_evidence_is_uncertain_not_full_credit():
 
     assert evidence.status == "uncertain"
     assert "iterations" in (evidence.reason or "")
+
+
+def test_run_evidence_preserves_substantial_work_without_granting_credit():
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="6",
+        min_duration=120,
+        min_area=100,
+    )
+    run = logic.ActiveRun(
+        room_id="office",
+        segment_id="6",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        requested_iterations=2,
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+        observed_iteration_count=1,
+        accumulated_time=1440,
+        accumulated_area=161,
+        time_measurement_uncertain=True,
+        area_measurement_uncertain=True,
+        telemetry_outage_count=1,
+        telemetry_outage_seconds=258,
+        telemetry_outage_unresolved=True,
+    )
+    completion = logic.FloorCompletionEvidence(
+        "uncertain",
+        "Telemetry recovery was not coherent within 300s",
+        None,
+        None,
+    )
+
+    evidence = logic.build_run_evidence(room, run, completion)
+
+    assert evidence["physical_work"]["status"] == "substantial"
+    assert evidence["duration"]["status"] == "passed_lower_bound"
+    assert evidence["duration"]["lower_bound"] == 1440
+    assert evidence["area"]["lower_bound"] == 161
+    assert evidence["iterations"] == {
+        "status": "unverified",
+        "requested": 2,
+        "observed": 1,
+    }
+    assert evidence["completion"] == {
+        "status": "uncertain",
+        "reason": "Telemetry recovery was not coherent within 300s",
+    }
+    assert evidence["telemetry"] == {
+        "source_outage_count": 1,
+        "source_outage_seconds": 258,
+        "status": "unresolved",
+    }
 
 
 def test_statistics_total_alone_never_grants_floor_credit():

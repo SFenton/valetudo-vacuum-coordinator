@@ -78,6 +78,7 @@ from .const import (
     CONF_STALE_RESUME_AUTO_CLEAR,
     CONF_STALE_RESUME_CLEAR_TIMEOUT,
     CONF_STALE_RESUME_SETTLE,
+    CONF_TELEMETRY_OUTAGE_TIMEOUT,
     CONF_TRACK_MANUAL_WHEN_PAUSED,
     CONF_VACUUM_ENTITY,
     CONF_WATER_ENTITY,
@@ -107,6 +108,7 @@ from .const import (
     DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
     DEFAULT_STALE_RESUME_SETTLE,
     DEFAULT_STATUS_OUTAGE_CONFIRMATION,
+    DEFAULT_TELEMETRY_OUTAGE_TIMEOUT,
     DEFAULT_TRACK_MANUAL_WHEN_PAUSED,
     DEFAULT_WATER_MOP_OPTION,
     DOMAIN,
@@ -187,6 +189,10 @@ COORDINATOR_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_BLOCKED_SESSION_TIMEOUT,
             default=DEFAULT_BLOCKED_SESSION_TIMEOUT,
+        ): vol.All(vol.Coerce(int), vol.Range(min=1)),
+        vol.Optional(
+            CONF_TELEMETRY_OUTAGE_TIMEOUT,
+            default=DEFAULT_TELEMETRY_OUTAGE_TIMEOUT,
         ): vol.All(vol.Coerce(int), vol.Range(min=1)),
         vol.Optional(
             CONF_RESOURCE_SETTLE,

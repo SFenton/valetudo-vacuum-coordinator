@@ -56,6 +56,7 @@ from .const import (
     CONF_STALE_RESUME_AUTO_CLEAR,
     CONF_STALE_RESUME_CLEAR_TIMEOUT,
     CONF_STALE_RESUME_SETTLE,
+    CONF_TELEMETRY_OUTAGE_TIMEOUT,
     CONF_TRACK_MANUAL_WHEN_PAUSED,
     CONF_WATER_ENTITY,
     CONF_WATER_MOP_OPTION,
@@ -72,6 +73,7 @@ from .const import (
     DEFAULT_STALE_RESUME_AUTO_CLEAR,
     DEFAULT_STALE_RESUME_CLEAR_TIMEOUT,
     DEFAULT_STALE_RESUME_SETTLE,
+    DEFAULT_TELEMETRY_OUTAGE_TIMEOUT,
     DOMAIN,
     SERVICE_DOCK_ACTION,
     STATE_DEFERRED,
@@ -90,6 +92,7 @@ from .logic import (
     AutoCleanSettingsSnapshot,
     BLOCKER_RECOVERABLE,
     BlockerClassification,
+    FloorCompletionEvidence,
     NATIVE_RESUME_PENDING_PHASES,
     RECOVERABLE_MOP_ERROR_KEYWORDS,
     RUN_PHASE_CANCEL_PENDING,
@@ -99,6 +102,7 @@ from .logic import (
     RUN_PHASE_RECOVERY_STALLED,
     RUN_PHASE_RESUMED_CLEANING,
     RUN_PHASE_SUSPENDED,
+    RUN_PHASE_TELEMETRY_GAP,
     ResourceState,
     RetainedTaskGuard,
     RETAINED_TASK_OWNER_COORDINATOR,
@@ -120,6 +124,7 @@ from .logic import (
     WhileAwayOutcome,
     attempt_mode_for_run,
     build_auto_clean_summary,
+    build_run_evidence,
     build_while_away_outcome_contract,
     build_while_away_messages,
     classify_outcome_reason,
@@ -127,7 +132,6 @@ from .logic import (
     clean_water_vacuum_only_reason,
     cleaning_block_reason,
     evaluate_floor_completion_evidence,
-    evaluate_run_success,
     error_contains_any,
     allowed_error_fingerprint,
     is_clean_water_empty_error,
@@ -175,6 +179,7 @@ _ACTIVE_RETAINED_VACUUM_STATES = {
 }
 _STALE_CLEAR_DOCK_STATES = {"idle", "pause", "drying"}
 _UNKNOWN_OR_CLEAR_STATES = {None, "", "unknown", "unavailable", "none"}
+_UNAVAILABLE_TELEMETRY_STATES = {None, "", "unknown", "unavailable"}
 _UNKNOWN_PERSON_STATES = {None, "", "unknown", "unavailable"}
 _RESTORE_RECONCILE_DELAY_SECONDS = 15
 _TERMINAL_CLEANUP_RETRY_SECONDS = 30
@@ -232,6 +237,7 @@ class ValetudoVacuumCoordinator:
         self._terminal_cleanup_retry_cancel: Callable[[], None] | None = None
         self._dock_settle_cancel: Callable[[], None] | None = None
         self._native_resume_timeout_cancel: Callable[[], None] | None = None
+        self._telemetry_outage_timeout_cancel: Callable[[], None] | None = None
         self._dispatch_start_timeout_cancel: Callable[[], None] | None = None
         self._cancel_ack_timeout_cancel: Callable[[], None] | None = None
         self._blocked_session_watchdog_cancel: Callable[[], None] | None = None
@@ -339,6 +345,7 @@ class ValetudoVacuumCoordinator:
                 "cancelling_pending_command",
                 "operator_required",
                 "suspended",
+                "telemetry_gap",
                 "waiting_for_clear",
                 "waiting_for_retry",
             }
@@ -439,9 +446,32 @@ class ValetudoVacuumCoordinator:
             ),
             "resumable_latched": run.resumable_latched if run else False,
             "recovery_deadline": run.recovery_deadline if run else None,
+            "telemetry_outage_started_at": (
+                run.telemetry_outage_started_at if run else None
+            ),
+            "telemetry_outage_deadline": (
+                run.telemetry_outage_deadline if run else None
+            ),
+            "telemetry_outage_count": (
+                run.telemetry_outage_count if run else 0
+            ),
+            "telemetry_outage_seconds": (
+                run.telemetry_outage_seconds if run else 0
+            ),
+            "telemetry_outage_unresolved": (
+                run.telemetry_outage_unresolved if run else False
+            ),
+            "area_counter_reset_count": run.area_reset_count if run else 0,
+            "time_counter_reset_count": run.time_reset_count if run else 0,
+            "area_measurement_uncertain": (
+                run.area_measurement_uncertain if run else False
+            ),
+            "time_measurement_uncertain": (
+                run.time_measurement_uncertain if run else False
+            ),
             "requested_iterations": run.requested_iterations if run else None,
             "observed_iteration_count": (
-                run.observed_iteration_count if run else 0
+                run.effective_observed_iteration_count if run else 0
             ),
             "iteration_evidence_source": (
                 run.iteration_evidence_source if run else None
@@ -1231,6 +1261,16 @@ class ValetudoVacuumCoordinator:
             ledger = self.ledgers.setdefault(run.room_id, RoomLedger())
             when = utcnow_iso()
             mark_failure(ledger, when, reason)
+            completion_evidence = (
+                FloorCompletionEvidence(
+                    run.floor_completion_status,
+                    run.floor_completion_reason,
+                    run.floor_completion_duration,
+                    run.floor_completion_area,
+                )
+                if run.floor_completion_status
+                else None
+            )
             if self.session:
                 if run.cancel_continue_session and run.cancel_outcome_result == "uncertain":
                     self.session.mark_uncertain(run.room_id, reason)
@@ -1240,6 +1280,7 @@ class ValetudoVacuumCoordinator:
                         result="uncertain",
                         reason=reason,
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
                 elif run.cancel_continue_session and run.cancel_requeue_room:
                     self.session.unmark_attempted(run.room_id)
@@ -1254,6 +1295,7 @@ class ValetudoVacuumCoordinator:
                         result="interrupted",
                         reason=reason,
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
                 elif run.cancel_continue_session and run.cancel_recover_room:
                     retry_eligible = self.session.can_retry_room(run.room_id)
@@ -1272,6 +1314,7 @@ class ValetudoVacuumCoordinator:
                         result=run.cancel_outcome_result,
                         reason=reason,
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
                 elif run.fallback_vacuum:
                     self.session.mark_fallback_failed(run.room_id, reason)
@@ -1287,6 +1330,7 @@ class ValetudoVacuumCoordinator:
                         result="interrupted",
                         reason=reason,
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
         if self.session:
             self.session.native_resume_guard_latched = False
@@ -1562,6 +1606,13 @@ class ValetudoVacuumCoordinator:
             await self._async_handle_presence_change()
             return
 
+        if self.active_run and self.active_run.phase == RUN_PHASE_TELEMETRY_GAP:
+            await self._async_reconcile_telemetry_outage(now)
+            return
+        if self.active_run and self._active_run_has_correlated_telemetry_outage():
+            await self._async_enter_telemetry_outage(now)
+            return
+
         observations_changed = self._observe_active_run(entity_id, new_state, now)
         observations_changed = (
             self._observe_manual_run(entity_id, new_state, now)
@@ -1612,6 +1663,11 @@ class ValetudoVacuumCoordinator:
                 return
             self.last_error = new_state.state
             if self.active_run:
+                normalized_error = (
+                    normalize_state(new_state.state) or ""
+                ).lower()
+                if normalized_error in _UNAVAILABLE_TELEMETRY_STATES:
+                    return
                 if self._active_run_allows_current_blocker():
                     await self._async_reconcile_active_run(now)
                 else:
@@ -1973,6 +2029,9 @@ class ValetudoVacuumCoordinator:
         if not run:
             return False
 
+        if run.phase == RUN_PHASE_TELEMETRY_GAP:
+            return False
+
         changed = False
         state = normalize_state(new_state.state)
         normalized_state = state.lower() if state else None
@@ -2002,6 +2061,26 @@ class ValetudoVacuumCoordinator:
             != state
         ):
             return False
+        if (
+            entity_id == self.config.get(CONF_CURRENT_AREA_ENTITY)
+            and normalize_state(
+                self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))
+            )
+            != state
+        ):
+            return False
+        if (
+            entity_id == self.config.get(CONF_CURRENT_TIME_ENTITY)
+            and normalize_state(
+                self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))
+            )
+            != state
+        ):
+            return False
+        if entity_id == self.config.get(CONF_CURRENT_AREA_ENTITY):
+            return run.checkpoint_statistics(parse_float(state), None)
+        if entity_id == self.config.get(CONF_CURRENT_TIME_ENTITY):
+            return run.checkpoint_statistics(None, parse_float(state))
         if entity_id == self.vacuum_entity and normalized_state == "cleaning":
             if not run.observed_cleaning:
                 run.observed_cleaning = True
@@ -2114,7 +2193,7 @@ class ValetudoVacuumCoordinator:
                     reason="Valetudo reported a resumable native task",
                     require_resume=True,
                 ) or changed
-            else:
+            elif normalized_state not in {"unknown", "unavailable"}:
                 changed = run.clear_segment_iteration() or changed
 
         if (
@@ -2141,6 +2220,364 @@ class ValetudoVacuumCoordinator:
                 run.finalize_estimated_room(now)
             changed = True
         return changed
+
+    def _telemetry_state_is_unavailable(self, entity_id: str | None) -> bool:
+        """Return whether one configured telemetry source is unreadable."""
+        if not entity_id:
+            return False
+        state = normalize_state(self._state(entity_id))
+        return (state.lower() if state else None) in _UNAVAILABLE_TELEMETRY_STATES
+
+    def _active_run_telemetry_support_entities(self) -> list[str]:
+        """Return configured sources that corroborate a primary-source outage."""
+        return [
+            entity_id
+            for entity_id in (
+                self.config.get(CONF_ERROR_ENTITY),
+                self.config.get(CONF_STATUS_FLAG_ENTITY),
+                self.config.get(CONF_DOCK_STATUS_ENTITY),
+                self.config.get(CONF_CURRENT_AREA_ENTITY),
+                self.config.get(CONF_CURRENT_TIME_ENTITY),
+                self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY),
+            )
+            if entity_id
+        ]
+
+    def _active_run_has_correlated_telemetry_outage(self) -> bool:
+        """Return whether an owned run lost the correlated Valetudo surface."""
+        run = self.active_run
+        if (
+            not run
+            or not run.confirmed_room_start
+            or run.phase in {
+                RUN_PHASE_DISPATCHING,
+                RUN_PHASE_CANCEL_PENDING,
+                RUN_PHASE_TELEMETRY_GAP,
+            }
+            or not self._telemetry_state_is_unavailable(self.vacuum_entity)
+        ):
+            return False
+        support_entities = self._active_run_telemetry_support_entities()
+        if not support_entities:
+            return False
+        unavailable_count = sum(
+            self._telemetry_state_is_unavailable(entity_id)
+            for entity_id in support_entities
+        )
+        return unavailable_count >= min(3, len(support_entities))
+
+    async def _async_enter_telemetry_outage(self, now: datetime) -> None:
+        """Retain an owned run while its correlated source is unavailable."""
+        run = self.active_run
+        if not run or run.phase == RUN_PHASE_TELEMETRY_GAP:
+            return
+        previous_phase = run.phase
+        run.finalize_estimated_room(now)
+        run.phase = RUN_PHASE_TELEMETRY_GAP
+        run.telemetry_outage_previous_phase = previous_phase
+        run.telemetry_outage_started_at = now.isoformat()
+        run.telemetry_outage_count += 1
+        run.telemetry_outage_unresolved = False
+        if run.telemetry_outage_deadline is None:
+            run.telemetry_outage_deadline = (
+                now
+                + timedelta(
+                    seconds=max(
+                        1,
+                        int(
+                            self.config.get(
+                                CONF_TELEMETRY_OUTAGE_TIMEOUT,
+                                DEFAULT_TELEMETRY_OUTAGE_TIMEOUT,
+                            )
+                        ),
+                    )
+                )
+            ).isoformat()
+        guard = self._ensure_retained_task_guard(
+            now,
+            owner=RETAINED_TASK_OWNER_COORDINATOR,
+            phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+            reason="Correlated Valetudo telemetry source is unavailable",
+            run=run,
+        )
+        guard.phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+        guard.reason = "Correlated Valetudo telemetry source is unavailable"
+        self._update_retained_task_snapshot(guard, now, material=False)
+        if self.session and self.session.active:
+            self.session.enter_recovery(
+                code="telemetry.source_unavailable",
+                disposition=BLOCKER_RECOVERABLE,
+                reason="Correlated Valetudo telemetry source is unavailable",
+                phase="telemetry_gap",
+                next_retry_at=run.telemetry_outage_deadline,
+                waiting_for_physical_fix=False,
+                operator_action=(
+                    "Leave the vacuum reachable while telemetry reconnects."
+                ),
+            )
+        await self._async_save_store()
+        self._notify_listeners()
+        self._schedule_telemetry_outage_timeout()
+
+    def _telemetry_entity_recovered_after(
+        self,
+        entity_id: str | None,
+        outage_started_at: str | None,
+        *,
+        numeric: bool = False,
+    ) -> bool:
+        """Return whether one source has a fresh usable post-outage value."""
+        if not entity_id:
+            return True
+        state = self.hass.states.get(entity_id)
+        outage_started = parse_datetime(outage_started_at)
+        if (
+            state is None
+            or outage_started is None
+            or state.last_changed <= outage_started
+        ):
+            return False
+        value = normalize_state(state.state)
+        if numeric:
+            return parse_float(value) is not None
+        return (value.lower() if value else None) not in _UNAVAILABLE_TELEMETRY_STATES
+
+    def _telemetry_recovery_disposition(
+        self,
+        run: ActiveRun,
+    ) -> tuple[str, str | None]:
+        """Classify the current post-outage snapshot."""
+        outage_started_at = run.telemetry_outage_started_at
+        error_entity = self.config.get(CONF_ERROR_ENTITY)
+        if self._telemetry_entity_recovered_after(
+            error_entity,
+            outage_started_at,
+        ):
+            error = self.error_state
+            if (
+                not is_error_clear(error)
+                and not self._active_run_allows_error(error)
+            ):
+                return "fault", normalize_state(error) or "Unknown error"
+        required_entities = (
+            (self.vacuum_entity, False),
+            (error_entity, False),
+            (self.config.get(CONF_STATUS_FLAG_ENTITY), False),
+            (self.config.get(CONF_DOCK_STATUS_ENTITY), False),
+            (self.config.get(CONF_CURRENT_AREA_ENTITY), True),
+            (self.config.get(CONF_CURRENT_TIME_ENTITY), True),
+        )
+        if not all(
+            self._telemetry_entity_recovered_after(
+                entity_id,
+                outage_started_at,
+                numeric=numeric,
+            )
+            for entity_id, numeric in required_entities
+        ):
+            return "pending", None
+
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        vacuum_state = vacuum_state.lower() if vacuum_state else None
+        if vacuum_state == "cleaning":
+            if (
+                self.config.get(CONF_STATUS_FLAG_ENTITY)
+                and self._status_flag() != "segment"
+            ):
+                return "pending", None
+            estimated_entity = self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY)
+            if estimated_entity:
+                if not self._telemetry_entity_recovered_after(
+                    estimated_entity,
+                    outage_started_at,
+                ):
+                    return "pending", None
+                estimated_room_id = self._room_id_from_estimated(
+                    self._state(estimated_entity)
+                )
+                if estimated_room_id is None:
+                    return "pending", None
+                if estimated_room_id != run.room_id:
+                    return (
+                        "conflict",
+                        "Telemetry recovered with conflicting room evidence",
+                    )
+            return "coherent", None
+        if vacuum_state in _AT_DOCK_VACUUM_STATES | {"returning", "error"}:
+            return "coherent", None
+        return "pending", None
+
+    def _close_telemetry_outage(
+        self,
+        run: ActiveRun,
+        now: datetime,
+        *,
+        recovered: bool,
+    ) -> str:
+        """Close one source-loss interval and restore its prior run phase."""
+        started_at = parse_datetime(run.telemetry_outage_started_at)
+        if started_at is not None:
+            run.telemetry_outage_seconds += max(
+                0.0,
+                (now - started_at).total_seconds(),
+            )
+        previous_phase = run.telemetry_outage_previous_phase
+        if previous_phase not in {
+            RUN_PHASE_CLEANING,
+            RUN_PHASE_DOCK_INTERRUPT,
+            RUN_PHASE_RESUMED_CLEANING,
+            RUN_PHASE_SUSPENDED,
+            RUN_PHASE_RECOVERY_STALLED,
+        }:
+            previous_phase = RUN_PHASE_CLEANING
+        run.phase = previous_phase
+        run.telemetry_outage_started_at = None
+        run.telemetry_outage_previous_phase = None
+        run.telemetry_outage_unresolved = not recovered
+        self._cancel_telemetry_outage_timeout()
+        return previous_phase
+
+    async def _async_reconcile_telemetry_outage(self, now: datetime) -> None:
+        """Resume one coherently recovered task before terminal evaluation."""
+        run = self.active_run
+        if not run or run.phase != RUN_PHASE_TELEMETRY_GAP:
+            return
+
+        disposition, reason = self._telemetry_recovery_disposition(run)
+        if disposition == "coherent":
+            current_area = parse_float(
+                self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))
+            )
+            current_time = parse_float(
+                self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))
+            )
+            if current_area is not None:
+                run.mark_statistics_uncertain(area=True)
+            if current_time is not None:
+                run.mark_statistics_uncertain(time=True)
+            run.checkpoint_statistics(current_area, current_time)
+            self._close_telemetry_outage(run, now, recovered=True)
+            vacuum_state = normalize_state(self._state(self.vacuum_entity))
+            if vacuum_state == "cleaning":
+                run.observed_cleaning = True
+                if self._status_flag() == "segment":
+                    run.observe_segment_iteration(
+                        source="telemetry_recovery",
+                        count_new_iteration=False,
+                    )
+                estimated_room_id = self._room_id_from_estimated(
+                    self._state(
+                        self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY)
+                    )
+                )
+                if estimated_room_id and run.last_estimated_room_id is None:
+                    run.observe_estimated_room(estimated_room_id, now)
+            guard = self._ensure_retained_task_guard(
+                now,
+                owner=RETAINED_TASK_OWNER_COORDINATOR,
+                phase=RETAINED_TASK_PHASE_OBSERVED_ACTIVE,
+                reason=None,
+                run=run,
+            )
+            guard.phase = RETAINED_TASK_PHASE_OBSERVED_ACTIVE
+            guard.reason = None
+            self._update_retained_task_snapshot(guard, now, material=True)
+            if (
+                self.session
+                and self.session.blocker_code == "telemetry.source_unavailable"
+            ):
+                self.session.clear_recovery()
+            await self._async_save_store()
+            self._notify_listeners()
+            await self._async_reconcile_active_run(now)
+            return
+
+        if disposition == "fault":
+            self._close_telemetry_outage(run, now, recovered=False)
+            await self._async_handle_active_run_error(
+                reason or "Unknown error",
+                from_telemetry_recovery=True,
+            )
+            return
+        if disposition == "conflict":
+            await self._async_expire_telemetry_outage(
+                now,
+                reason=reason,
+            )
+            return
+
+        deadline = parse_datetime(run.telemetry_outage_deadline)
+        if deadline is not None and now >= deadline:
+            await self._async_expire_telemetry_outage(now)
+            return
+        self._schedule_telemetry_outage_timeout()
+
+    async def _async_expire_telemetry_outage(
+        self,
+        now: datetime,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Finalize unresolved source loss without permitting redispatch."""
+        run = self.active_run
+        if not run or run.phase != RUN_PHASE_TELEMETRY_GAP:
+            return
+        timeout_seconds = max(
+            1,
+            int(
+                self.config.get(
+                    CONF_TELEMETRY_OUTAGE_TIMEOUT,
+                    DEFAULT_TELEMETRY_OUTAGE_TIMEOUT,
+                )
+            ),
+        )
+        final_reason = reason or (
+            f"Telemetry recovery was not coherent within {timeout_seconds}s"
+        )
+        started_at = parse_datetime(run.telemetry_outage_started_at)
+        if started_at is not None:
+            run.telemetry_outage_seconds += max(
+                0.0,
+                (now - started_at).total_seconds(),
+            )
+        run.telemetry_outage_started_at = None
+        run.telemetry_outage_previous_phase = None
+        run.telemetry_outage_unresolved = True
+        run.mark_statistics_uncertain(
+            area=bool(self.config.get(CONF_CURRENT_AREA_ENTITY)),
+            time=bool(self.config.get(CONF_CURRENT_TIME_ENTITY)),
+        )
+        run.floor_completion_status = "uncertain"
+        run.floor_completion_reason = final_reason
+        run.floor_completion_duration = run.total_time(None)
+        run.floor_completion_area = run.total_area(None)
+        run.floor_completion_recorded_at = now.isoformat()
+        self._cancel_telemetry_outage_timeout()
+        self._mark_retained_task_abandoned(final_reason)
+        if self.session and self.session.active:
+            self.session.enter_recovery(
+                code="telemetry.source_outage_unresolved",
+                disposition=BLOCKER_RECOVERABLE,
+                reason=final_reason,
+                phase="operator_required",
+                next_retry_at=None,
+                waiting_for_physical_fix=False,
+                operator_action=(
+                    "Confirm the original vacuum task has stopped before "
+                    "starting another room."
+                ),
+            )
+        await self._async_finish_active_run(
+            completion_evidence=FloorCompletionEvidence(
+                "uncertain",
+                final_reason,
+                run.total_time(None),
+                run.total_area(None),
+            ),
+            continue_session=False,
+            send_summary=False,
+            retain_task_guard=True,
+        )
 
     def _mark_active_run_interrupted(
         self,
@@ -2353,6 +2790,9 @@ class ValetudoVacuumCoordinator:
         run = self.active_run
         if not run:
             return False
+        if run.phase == RUN_PHASE_TELEMETRY_GAP:
+            await self._async_reconcile_telemetry_outage(now)
+            return True
         if run.phase == RUN_PHASE_CANCEL_PENDING:
             continue_session = run.cancel_continue_session
             completed = await self._async_execute_cancel_pending()
@@ -2862,6 +3302,8 @@ class ValetudoVacuumCoordinator:
             return
         if self.active_run.native_resume_pending:
             self._schedule_native_resume_timeout()
+        if self.active_run.phase == RUN_PHASE_TELEMETRY_GAP:
+            self._schedule_telemetry_outage_timeout()
         if (
             self.active_run.phase == RUN_PHASE_DISPATCHING
             and self.active_run.command_published
@@ -2938,6 +3380,36 @@ class ValetudoVacuumCoordinator:
             )
 
         self._native_resume_timeout_cancel = async_call_later(
+            self.hass,
+            remaining,
+            timer_finished,
+        )
+
+    def _schedule_telemetry_outage_timeout(self) -> None:
+        """Schedule reconciliation at the persisted source-outage deadline."""
+        run = self.active_run
+        if (
+            not run
+            or run.phase != RUN_PHASE_TELEMETRY_GAP
+            or self._telemetry_outage_timeout_cancel is not None
+        ):
+            return
+        deadline = parse_datetime(run.telemetry_outage_deadline)
+        if deadline is None:
+            return
+        remaining = (deadline - dt_util.utcnow()).total_seconds()
+
+        def timer_finished(_now: datetime) -> None:
+            self._telemetry_outage_timeout_cancel = None
+            schedule_hass_task(
+                self.hass,
+                self._async_reconcile_active_run_timers_serialized(),
+            )
+
+        if remaining <= 0:
+            timer_finished(dt_util.utcnow())
+            return
+        self._telemetry_outage_timeout_cancel = async_call_later(
             self.hass,
             remaining,
             timer_finished,
@@ -3032,6 +3504,9 @@ class ValetudoVacuumCoordinator:
         """Reconcile active-run timers without racing entity events."""
         async with self._event_lock:
             run = self.active_run
+            if run and run.phase == RUN_PHASE_TELEMETRY_GAP:
+                await self._async_reconcile_telemetry_outage(dt_util.utcnow())
+                return
             if run and run.phase == RUN_PHASE_CANCEL_PENDING:
                 continue_session = run.cancel_continue_session
                 deadline = parse_datetime(run.cancel_ack_deadline)
@@ -3160,6 +3635,12 @@ class ValetudoVacuumCoordinator:
             self._native_resume_timeout_cancel()
             self._native_resume_timeout_cancel = None
 
+    def _cancel_telemetry_outage_timeout(self) -> None:
+        """Cancel the source-outage reconciliation timer."""
+        if self._telemetry_outage_timeout_cancel is not None:
+            self._telemetry_outage_timeout_cancel()
+            self._telemetry_outage_timeout_cancel = None
+
     def _cancel_dispatch_start_timeout(self) -> None:
         """Cancel the current dispatch-start watchdog."""
         if getattr(self, "_dispatch_start_timeout_cancel", None) is not None:
@@ -3176,6 +3657,7 @@ class ValetudoVacuumCoordinator:
         """Cancel all timers owned by the active run."""
         self._cancel_dock_settle_timer()
         self._cancel_native_resume_timeout()
+        self._cancel_telemetry_outage_timeout()
         self._cancel_dispatch_start_timeout()
         self._cancel_cancel_ack_timeout()
 
@@ -4330,7 +4812,7 @@ class ValetudoVacuumCoordinator:
             status_flag=(
                 self._status_flag()
                 if self.config.get(CONF_STATUS_FLAG_ENTITY)
-                else None
+                else "none"
             ),
             battery=(
                 parse_float(self._state(battery_entity))
@@ -6097,8 +6579,7 @@ class ValetudoVacuumCoordinator:
     async def _async_finish_active_run(
         self,
         *,
-        success_override: bool | None = None,
-        failure_reason: str | None = None,
+        completion_evidence: FloorCompletionEvidence | None = None,
         continue_session: bool = True,
         send_summary: bool = True,
         retain_task_guard: bool = False,
@@ -6107,35 +6588,50 @@ class ValetudoVacuumCoordinator:
         run = self.active_run
         if not run or not run.room_id:
             return
-        if success_override is None and run.resume_required:
+        if completion_evidence is None and run.resume_required:
             return
 
         room = self.room_by_id[run.room_id]
+        run.checkpoint_statistics(
+            parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+            parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+        )
         run.finalize_estimated_room(dt_util.utcnow())
         ledger = self.ledgers.setdefault(room.room_id, RoomLedger())
         if self.session and run.observed_cleaning:
             self.session.clear_dispatch_failure(room.room_id)
 
-        if success_override is None:
+        if completion_evidence is None:
             if not self.config.get(CONF_STATUS_FLAG_ENTITY):
                 run.observed_segment_cleaning = True
-            success, reason = evaluate_run_success(
+            completion_evidence = evaluate_floor_completion_evidence(
                 room,
                 run,
-                parse_float(
+                end_area=parse_float(
                     self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))
                 ),
-                parse_float(
+                end_time=parse_float(
                     self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))
                 ),
-                self.error_state,
+                vacuum_state=self._state(self.vacuum_entity),
+                status_flag=(
+                    self._status_flag()
+                    if self.config.get(CONF_STATUS_FLAG_ENTITY)
+                    else "none"
+                ),
+                dock_status=self._state(
+                    self.config.get(CONF_DOCK_STATUS_ENTITY)
+                ),
             )
-        else:
-            success = success_override
-            reason = failure_reason
+        run.floor_completion_status = completion_evidence.status
+        run.floor_completion_reason = completion_evidence.reason
+        run.floor_completion_duration = completion_evidence.duration
+        run.floor_completion_area = completion_evidence.area
+        run.floor_completion_recorded_at = utcnow_iso()
 
+        reason = completion_evidence.reason
         wrong_room_failure = is_wrong_room_failure(reason)
-        if success:
+        if completion_evidence.status == "completed":
             when = utcnow_iso()
             if run.fallback_vacuum:
                 mark_fallback_vacuum_success(ledger, when)
@@ -6153,6 +6649,7 @@ class ValetudoVacuumCoordinator:
                         result="completed",
                         legacy_reason=deferred_reason,
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
             else:
                 mark_success(
@@ -6169,7 +6666,21 @@ class ValetudoVacuumCoordinator:
                         run=run,
                         result="completed",
                         occurred_at=when,
+                        completion_evidence=completion_evidence,
                     )
+        elif completion_evidence.status == "uncertain":
+            when = utcnow_iso()
+            mark_failure(ledger, when, reason)
+            if self.session:
+                self.session.mark_uncertain(room.room_id, reason)
+                self._record_attempt_outcome(
+                    kind="failed",
+                    run=run,
+                    result="uncertain",
+                    reason=reason,
+                    occurred_at=when,
+                    completion_evidence=completion_evidence,
+                )
         else:
             when = utcnow_iso()
             mark_failure(ledger, when, reason)
@@ -6184,6 +6695,7 @@ class ValetudoVacuumCoordinator:
                     result="failed",
                     reason=reason,
                     occurred_at=when,
+                    completion_evidence=completion_evidence,
                 )
                 if (
                     wrong_room_failure
@@ -6200,11 +6712,29 @@ class ValetudoVacuumCoordinator:
         elif send_summary:
             await self._async_maybe_send_auto_clean_summary()
 
-    async def _async_handle_active_run_error(self, error: str) -> None:
+    async def _async_handle_active_run_error(
+        self,
+        error: str,
+        *,
+        from_telemetry_recovery: bool = False,
+    ) -> None:
         """Protect floor credit, cancel pending work, and preserve recovery."""
         run = self.active_run
         if not run:
             return
+        if run.phase == RUN_PHASE_TELEMETRY_GAP:
+            await self._async_reconcile_telemetry_outage(dt_util.utcnow())
+            return
+        if (
+            not from_telemetry_recovery
+            and self._active_run_has_correlated_telemetry_outage()
+        ):
+            await self._async_enter_telemetry_outage(dt_util.utcnow())
+            return
+        run.checkpoint_statistics(
+            parse_float(self._state(self.config.get(CONF_CURRENT_AREA_ENTITY))),
+            parse_float(self._state(self.config.get(CONF_CURRENT_TIME_ENTITY))),
+        )
         resources = self._resource_state()
         blocker = self._current_blocker(resources)
         if blocker is None:
@@ -6241,6 +6771,12 @@ class ValetudoVacuumCoordinator:
             self._activate_vacuum_only_degraded(degraded_reason)
 
         room = self.active_room
+        if (
+            room
+            and not self.config.get(CONF_STATUS_FLAG_ENTITY)
+            and run.observed_cleaning
+        ):
+            run.observed_segment_cleaning = True
         evidence = (
             evaluate_floor_completion_evidence(
                 room,
@@ -6267,11 +6803,13 @@ class ValetudoVacuumCoordinator:
         if evidence:
             run.floor_completion_status = evidence.status
             run.floor_completion_reason = evidence.reason
+            run.floor_completion_duration = evidence.duration
+            run.floor_completion_area = evidence.area
             run.floor_completion_recorded_at = utcnow_iso()
 
         if evidence and evidence.status == "completed" and blocker.recoverable:
             await self._async_finish_active_run(
-                success_override=True,
+                completion_evidence=evidence,
                 continue_session=False,
                 send_summary=False,
             )
@@ -6549,6 +7087,9 @@ class ValetudoVacuumCoordinator:
         if self.active_run.phase == RUN_PHASE_CANCEL_PENDING:
             await self._async_reconcile_active_run(dt_util.utcnow())
             return True
+        if self.active_run.phase == RUN_PHASE_TELEMETRY_GAP:
+            await self._async_reconcile_telemetry_outage(dt_util.utcnow())
+            return True
         if self.active_run.native_resume_pending:
             await self._async_reconcile_active_run(dt_util.utcnow())
             if not self.active_run:
@@ -6663,6 +7204,8 @@ class ValetudoVacuumCoordinator:
 
         changed = False
         run = self.active_run
+        if run.phase == RUN_PHASE_TELEMETRY_GAP:
+            return False
         if (
             self._active_run_restored
             and run.last_estimated_changed_at is not None
@@ -7215,6 +7758,7 @@ class ValetudoVacuumCoordinator:
         reason: str | None = None,
         legacy_reason: str | None = None,
         occurred_at: str | None = None,
+        completion_evidence: FloorCompletionEvidence | None = None,
     ) -> WhileAwayOutcome | None:
         """Record one immutable terminal result for a room command attempt."""
         if not run.room_id or not run.session_id:
@@ -7226,10 +7770,13 @@ class ValetudoVacuumCoordinator:
         outcome_id = (
             f"{run.session_id}:{room.room_id}:attempt:{run.started_at}"
         )
-        reason_descriptor = (
-            None
-            if result == "completed"
-            else classify_outcome_reason(reason)
+        reason_descriptor = None
+        if result != "completed":
+            reason_descriptor = classify_outcome_reason(reason)
+        evidence = (
+            build_run_evidence(room, run, completion_evidence)
+            if completion_evidence
+            else {}
         )
         existing = next(
             (
@@ -7255,6 +7802,7 @@ class ValetudoVacuumCoordinator:
                 or existing.attempt_mode != attempt_mode_for_run(run)
                 or existing.attempt_result != result
                 or existing_reason != incoming_reason
+                or existing.evidence != evidence
             ):
                 _LOGGER.warning(
                     "Ignoring conflicting terminal outcome for run %s; "
@@ -7278,6 +7826,7 @@ class ValetudoVacuumCoordinator:
                 attempt_mode=attempt_mode_for_run(run),
                 attempt_result=result,
                 reason_descriptor=reason_descriptor,
+                evidence=evidence,
             )
         )
 
