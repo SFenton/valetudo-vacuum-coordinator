@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
@@ -27,8 +28,11 @@ def _install_homeassistant_stubs() -> None:
     core_module = types.ModuleType("homeassistant.core")
 
     class Event:
-        def __init__(self, entity_id: str, state: str) -> None:
-            self.data = {"entity_id": entity_id, "new_state": State(state)}
+        def __init__(self, entity_id: str, state: str | State) -> None:
+            self.data = {
+                "entity_id": entity_id,
+                "new_state": state if isinstance(state, State) else State(state),
+            }
 
     class HomeAssistant:
         pass
@@ -186,6 +190,13 @@ class _EventHandlingCoordinator(coordinator_module.ValetudoVacuumCoordinator):
         self._retained_task_timer_cancel = None
         self._retained_task_timer_deadline = None
         self._retained_task_reconcile_scheduled = False
+        self._event_queue = deque()
+        self._event_drain_scheduled = False
+        self._state_event_sequence = 0
+        self._processing_state_event_sequence = None
+        self._event_state_snapshot = {}
+        self._event_state_sequences = {}
+        self._telemetry_outage_started_sequence = None
 
     def _observe_active_run(self, entity_id, new_state, now) -> bool:
         return False
@@ -217,8 +228,10 @@ class _FakeStates:
         self._state_cls = state_cls
         self._states = {}
 
-    def set(self, entity_id: str, state: str) -> None:
-        self._states[entity_id] = self._state_cls(state)
+    def set(self, entity_id: str, state: str) -> State:
+        value = self._state_cls(state)
+        self._states[entity_id] = value
+        return value
 
     def get(self, entity_id: str):
         return self._states.get(entity_id)
@@ -334,6 +347,13 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
         self._retained_task_timer_cancel = None
         self._retained_task_timer_deadline = None
         self._retained_task_reconcile_scheduled = False
+        self._event_queue = deque()
+        self._event_drain_scheduled = False
+        self._state_event_sequence = 0
+        self._processing_state_event_sequence = None
+        self._event_state_snapshot = {}
+        self._event_state_sequences = {}
+        self._telemetry_outage_started_sequence = None
         self._terminal_cleanup_retry_attempts = 0
         self._terminal_settings_restore_deferred = False
         self._event_lock = asyncio.Lock()
@@ -348,8 +368,12 @@ class _RecoverableFailureCoordinator(coordinator_module.ValetudoVacuumCoordinato
         self.set_state("sensor.robot_battery", "100")
         self.set_state("sensor.robot_estimated_segment", "unknown")
 
-    def set_state(self, entity_id: str, state: str) -> None:
-        self.hass.states.set(entity_id, state)
+    def set_state(self, entity_id: str, state: str) -> State:
+        observed = self.hass.states.set(entity_id, state)
+        self._state_event_sequence += 1
+        self._event_state_snapshot[entity_id] = observed
+        self._event_state_sequences[entity_id] = self._state_event_sequence
+        return observed
 
     async def _async_save_store(self) -> None:
         return None
@@ -403,9 +427,13 @@ def _handle_event(
     entity_id: str,
     state: str,
 ) -> None:
-    coordinator.set_state(entity_id, state)
+    observed = coordinator.set_state(entity_id, state)
     event_cls = sys.modules["homeassistant.core"].Event
-    asyncio.run(coordinator._async_handle_state_change_event(event_cls(entity_id, state)))
+    asyncio.run(
+        coordinator._async_handle_state_change_event(
+            event_cls(entity_id, observed)
+        )
+    )
 
 
 def _confirm_active_room_started(
@@ -2877,15 +2905,15 @@ def test_arrival_stops_suspended_task_exactly_once() -> None:
     )
 
 
-def test_cancel_returns_to_base_only_when_robot_is_moving_by_default() -> None:
-    for vacuum_state in ("idle", "returning"):
+def test_cancel_returns_to_base_when_robot_is_not_confirmed_docked() -> None:
+    for vacuum_state in ("idle", "returning", "docked"):
         coordinator = _RecoverableFailureCoordinator()
         _trigger_low_battery(coordinator)
         coordinator.set_state(coordinator.vacuum_entity, vacuum_state)
 
         asyncio.run(coordinator.async_cancel_session("test cancel"))
 
-        if vacuum_state == "returning":
+        if vacuum_state in {"idle", "returning"}:
             assert _service_names(coordinator)[-2:] == [
                 "stop",
                 "return_to_base",
@@ -3129,7 +3157,7 @@ def test_startup_cancels_restored_native_task_when_person_is_home() -> None:
     assert coordinator.active_run is None
     assert coordinator.session is not None
     assert coordinator.session.active is False
-    assert _service_names(coordinator)[-1:] == ["stop"]
+    assert _service_names(coordinator)[-2:] == ["stop", "return_to_base"]
 
 
 def test_startup_honors_arrival_cancellation_opt_out() -> None:
@@ -3537,7 +3565,7 @@ def test_arrival_clears_timed_out_native_resume_guard() -> None:
     coordinator.set_state("person.owner", "home")
     asyncio.run(coordinator.async_cancel_session("Tracked person arrived home"))
 
-    assert _service_names(coordinator)[-1:] == ["stop"]
+    assert _service_names(coordinator)[-2:] == ["stop", "return_to_base"]
     assert coordinator.session is not None
     assert coordinator.session.native_resume_guard_latched is False
     assert coordinator.native_resume_pending is False
@@ -6594,7 +6622,7 @@ def test_task_ack_then_dock_pause_uses_one_persisted_dock_stop(
     assert _service_names(coordinator).count("dock_action") == 1
 
     current[0] += timedelta(seconds=2)
-    coordinator.set_state(coordinator.vacuum_entity, "idle")
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
     coordinator.set_state("sensor.robot_dock_status", "idle")
     assert (
         asyncio.run(
@@ -6737,7 +6765,7 @@ def test_stop_ack_waits_for_coherent_flag_and_dock_then_continues_session(
         else:
             coordinator.set_state("sensor.robot_dock_status", "idle")
         if index == 2:
-            coordinator.set_state(coordinator.vacuum_entity, "idle")
+            coordinator.set_state(coordinator.vacuum_entity, "docked")
         ready = asyncio.run(
             coordinator._async_reconcile_retained_task(
                 current[0],
@@ -7173,6 +7201,44 @@ def test_arrival_does_not_repeat_consumed_retained_stop() -> None:
     assert coordinator.session.terminal_reason == "returned_home"
     assert "stop" not in _service_names(coordinator)
     assert "return_to_base" not in _service_names(coordinator)
+
+
+def test_arrival_returns_idle_robot_when_cleared_guard_is_not_dock_evidence() -> None:
+    now = datetime(2026, 9, 18, 18, 32, 40, tzinfo=UTC)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=False,
+        owner=logic.RETAINED_TASK_OWNER_UNKNOWN,
+        phase=logic.RETAINED_TASK_PHASE_CLEARED,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "idle")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("person.owner", "home")
+
+    asyncio.run(
+        coordinator.async_cancel_session("Tracked person arrived home")
+    )
+
+    assert coordinator.session is not None
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert _service_names(coordinator).count("stop") == 0
+    assert _service_names(coordinator).count("return_to_base") == 1
+
+
+def test_idle_robot_is_not_positive_dock_evidence() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, "idle")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+
+    assert coordinator._vacuum_successfully_docked() is False
+
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+
+    assert coordinator._vacuum_successfully_docked() is True
 
 
 def test_incident_event_order_retains_manual_ownership_and_blocks_preflight(
@@ -7979,6 +8045,87 @@ def test_staggered_outage_onset_never_cancels_the_owned_run(outage_order):
     assert run.phase == logic.RUN_PHASE_TELEMETRY_GAP
     assert coordinator.session is not None
     assert coordinator.session.recovery_phase == "telemetry_gap"
+
+
+@pytest.mark.parametrize(
+    "telemetry_entities",
+    [
+        (
+            "sensor.robot_battery",
+            "sensor.robot_status_flag",
+            "sensor.robot_error",
+            "sensor.robot_dock_status",
+            "sensor.robot_area",
+            "sensor.robot_time",
+            "sensor.robot_estimated_segment",
+            "vacuum.robot",
+        ),
+        (
+            "vacuum.robot",
+            "sensor.robot_error",
+            "sensor.robot_status_flag",
+            "sensor.robot_area",
+            "sensor.robot_battery",
+            "sensor.robot_dock_status",
+            "sensor.robot_time",
+            "sensor.robot_estimated_segment",
+        ),
+    ],
+)
+@pytest.mark.parametrize("drain_after_loss", [False, True])
+def test_registry_ahead_reconnect_burst_preserves_same_owned_run(
+    telemetry_entities: tuple[str, ...],
+    drain_after_loss: bool,
+) -> None:
+    coordinator = _prepare_telemetry_outage_run()
+    coordinator.config[const.CONF_MIN_BATTERY] = 55
+    run = coordinator.active_run
+    assert run is not None
+    created_tasks = []
+    coordinator.hass.async_create_task = created_tasks.append
+    event_cls = sys.modules["homeassistant.core"].Event
+    burst_observed_at = datetime.now(UTC)
+
+    def queue_state(entity_id: str, state: str) -> None:
+        observed = coordinator.hass.states.set(entity_id, state)
+        observed.last_changed = burst_observed_at
+        coordinator._handle_state_change_event(event_cls(entity_id, observed))
+
+    for state in ("unavailable", "unknown"):
+        for entity_id in telemetry_entities:
+            queue_state(entity_id, state)
+
+    assert len(created_tasks) == 1
+    if drain_after_loss:
+        asyncio.run(created_tasks.pop())
+        assert coordinator.active_run is run
+        assert run.phase == logic.RUN_PHASE_TELEMETRY_GAP
+        assert coordinator.hass.services.calls == []
+
+    for entity_id, state in (
+        ("sensor.robot_error", "No error"),
+        ("sensor.robot_status_flag", "segment"),
+        ("sensor.robot_dock_status", "idle"),
+        ("sensor.robot_battery", "46"),
+        (coordinator.vacuum_entity, "cleaning"),
+        ("sensor.robot_area", "180"),
+        ("sensor.robot_time", "1500"),
+        ("sensor.robot_estimated_segment", "1"),
+    ):
+        queue_state(entity_id, state)
+
+    assert len(created_tasks) == 1
+    asyncio.run(created_tasks.pop())
+
+    assert coordinator.active_run is run
+    assert run.phase == logic.RUN_PHASE_CLEANING
+    assert run.telemetry_outage_count == 1
+    assert coordinator.session is not None
+    assert coordinator.session.blocker_code is None
+    assert coordinator.hass.services.calls == []
+    assert coordinator.started_rooms == []
+    assert list(coordinator._event_queue) == []
+    assert coordinator._event_drain_scheduled is False
 
 
 def test_office_recovery_keeps_one_of_two_passes_uncertain():
