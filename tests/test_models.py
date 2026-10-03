@@ -882,6 +882,96 @@ def test_manual_rooms_to_credit_respects_selected_room_snapshot():
     assert [room.room_id for room in credited] == ["room_two"]
 
 
+def test_manual_rooms_to_credit_rejects_missing_estimated_segment_source():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_estimated_dwell=30,
+    )
+    run = logic.ActiveRun(
+        room_id=None,
+        segment_id=None,
+        session_id=None,
+        started_at=logic.utcnow_iso(),
+        manual=True,
+        estimated_segment_source_missing=True,
+        estimated_segment_source_entity="sensor.robot_estimated_segment",
+        estimated_dwell_seconds={"room_one": 60},
+    )
+
+    assert logic.manual_rooms_to_credit([room], run) == []
+
+
+def test_active_run_missing_estimated_segment_source_round_trips_and_migrates():
+    run = logic.ActiveRun(
+        room_id="room_one",
+        segment_id="1",
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        estimated_segment_source_missing=True,
+        estimated_segment_source_entity="sensor.robot_estimated_segment",
+    )
+
+    restored = logic.ActiveRun.from_dict(run.to_dict())
+    legacy = run.to_dict()
+    legacy.pop("estimated_segment_source_missing")
+    legacy.pop("estimated_segment_source_entity")
+    restored_legacy = logic.ActiveRun.from_dict(legacy)
+
+    assert restored == run
+    assert restored_legacy is not None
+    assert restored_legacy.estimated_segment_source_missing is False
+    assert restored_legacy.estimated_segment_source_entity is None
+
+
+def test_missing_estimated_segment_source_blocks_dwell_credit_and_evidence():
+    room = logic.RoomConfig(
+        room_id="room_one",
+        name="Room One",
+        segment_id="1",
+        min_estimated_dwell=30,
+        require_estimated_segment=True,
+    )
+    run = logic.ActiveRun(
+        room_id=room.room_id,
+        segment_id=room.segment_id,
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        observed_cleaning=True,
+        observed_segment_cleaning=True,
+        estimated_segment_source_missing=True,
+        estimated_segment_source_entity="sensor.robot_estimated_segment",
+        estimated_dwell_seconds={room.room_id: 3960},
+    )
+
+    success, reason = logic.evaluate_run_success(
+        room,
+        run,
+        end_area=None,
+        end_time=None,
+        error=None,
+    )
+    evidence = logic.build_run_evidence(
+        room,
+        run,
+        logic.FloorCompletionEvidence("incomplete", reason),
+    )
+
+    assert success is False
+    assert reason == (
+        "Estimated segment entity sensor.robot_estimated_segment is unavailable; "
+        "in-room dwell cannot be verified"
+    )
+    assert evidence["physical_work"] == {
+        "status": "observed",
+        "cleaning_observed": True,
+        "segment_cleaning_observed": True,
+        "target_room_dwell_seconds": None,
+        "dwell_status": "source_missing",
+    }
+
+
 def test_v012_active_run_migrates_with_passive_resume_defaults():
     pending = logic.ActiveRun(
         room_id="room_one",
@@ -1433,6 +1523,223 @@ def test_projection_interruption_is_not_suppressed():
         "occupancy.person_arrived"
     )
     assert projection["outstanding"]["operation"] == "vacuum"
+
+
+def test_projection_later_unresolved_reason_replaces_prior_outstanding_reason():
+    room = logic.RoomConfig(
+        room_id="hallway",
+        name="Hallway",
+        segment_id="1",
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_attempt(
+                sequence=1,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="interrupted",
+                reason="Tracked person arrived home",
+                session_id="morning",
+            ),
+            typed_attempt(
+                sequence=2,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="uncertain",
+                reason="Observed 1 of 2 requested iterations",
+                session_id="afternoon",
+            ),
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "uncertain"
+    assert projection["outstanding"]["reason"]["raw"] == (
+        "Observed 1 of 2 requested iterations"
+    )
+    assert projection["reasons_coincide"] is True
+
+
+def test_projection_failure_supersedes_deferral_and_keeps_reason_when_null():
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_deferral(sequence=1, room_id=room.room_id),
+            typed_attempt(
+                sequence=2,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="failed",
+                reason="Cannot reach target",
+            ),
+            typed_attempt(
+                sequence=3,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="interrupted",
+            ),
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "interrupted"
+    assert projection["outstanding"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
+    assert projection["reasons_coincide"] is False
+
+
+def test_projection_partial_credit_preserves_mop_and_uses_latest_reason():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        mop_required=True,
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_attempt(
+                sequence=1,
+                room_id=room.room_id,
+                mode="vacuum",
+                result="partial",
+                reason="Cleaned for 60s, below 120s threshold",
+            ),
+            typed_attempt(
+                sequence=2,
+                room_id=room.room_id,
+                mode="vacuum_mop",
+                result="interrupted",
+                reason="Tracked person arrived home",
+            ),
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["credit"] == {"status": "partial", "operation": "vacuum"}
+    assert projection["outstanding"]["operation"] == "mop"
+    assert projection["outstanding"]["reason"]["code"] == "occupancy.person_arrived"
+    assert projection["reasons_coincide"] is True
+
+
+def test_projection_fallback_completion_then_failure_keeps_mop_due_reason_current():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        mop_required=True,
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_deferral(sequence=1, room_id=room.room_id),
+            typed_attempt(
+                sequence=2,
+                room_id=room.room_id,
+                mode="fallback_vacuum",
+                result="completed",
+            ),
+            typed_attempt(
+                sequence=3,
+                room_id=room.room_id,
+                mode="vacuum_mop",
+                result="failed",
+                reason="Cannot reach target",
+            ),
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["credit"] == {"status": "partial", "operation": "vacuum"}
+    assert projection["outstanding"]["operation"] == "mop"
+    assert projection["outstanding"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
+    assert projection["reasons_coincide"] is True
+
+
+def test_projection_fallback_failure_keeps_mop_blocker_reason():
+    room = logic.RoomConfig(
+        room_id="dining",
+        name="Dining",
+        segment_id="1",
+        mop_required=True,
+    )
+    projection = logic.build_while_away_outcome_contract(
+        [
+            typed_attempt(
+                sequence=1,
+                room_id=room.room_id,
+                mode="vacuum_mop",
+                result="interrupted",
+                reason="Tracked person arrived home",
+            ),
+            typed_attempt(
+                sequence=2,
+                room_id=room.room_id,
+                mode="fallback_vacuum",
+                result="failed",
+                reason="Cannot reach target",
+            ),
+        ],
+        {room.room_id: room},
+        "2026-08-19",
+    )["rooms"][0]
+
+    assert projection["status"] == "failed"
+    assert projection["latest_attempt"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
+    assert projection["outstanding"]["operation"] == "vacuum_mop"
+    assert projection["outstanding"]["reason"]["code"] == "occupancy.person_arrived"
+    assert projection["reasons_coincide"] is False
+
+
+def test_projection_orders_events_by_sequence_across_sessions():
+    room = logic.RoomConfig(
+        room_id="office",
+        name="Office",
+        segment_id="1",
+    )
+    first = typed_attempt(
+        sequence=1,
+        room_id=room.room_id,
+        mode="vacuum",
+        result="interrupted",
+        reason="Tracked person arrived home",
+        session_id="morning",
+    )
+    later = typed_attempt(
+        sequence=2,
+        room_id=room.room_id,
+        mode="vacuum",
+        result="failed",
+        reason="Cannot reach target",
+        session_id="afternoon",
+    )
+
+    contract = logic.build_while_away_outcome_contract(
+        [later, first],
+        {room.room_id: room},
+        "2026-08-19",
+    )
+    projection = contract["rooms"][0]
+
+    assert [event["id"] for event in contract["events"]] == [
+        first.outcome_id,
+        later.outcome_id,
+    ]
+    assert projection["latest_attempt"]["event_id"] == later.outcome_id
+    assert projection["outstanding"]["reason"]["code"] == (
+        "navigation.room_unreachable"
+    )
 
 
 def test_projection_later_success_resolves_primary_but_retains_repeated_history():

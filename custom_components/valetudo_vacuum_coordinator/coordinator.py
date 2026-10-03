@@ -271,6 +271,7 @@ class ValetudoVacuumCoordinator:
         self._telemetry_outage_started_sequence: int | None = None
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline: datetime | None = None
+        self._estimated_segment_source_missing_warned_entity: str | None = None
         self._store = Store(hass, STORE_VERSION, f"{STORE_KEY}.{self.coordinator_id}")
 
     async def async_setup(self) -> None:
@@ -919,6 +920,36 @@ class ValetudoVacuumCoordinator:
     def error_state(self) -> str | None:
         """Return the current Valetudo error sensor state."""
         return self._state(self.config.get(CONF_ERROR_ENTITY))
+
+    @property
+    def estimated_segment_source(self) -> str:
+        """Return configured estimated-segment source availability."""
+        entity_id = self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY)
+        if not entity_id:
+            return "not_configured"
+        return "ok" if self.hass.states.get(entity_id) is not None else "missing"
+
+    def _mark_estimated_segment_source_for_run(self, run: ActiveRun) -> None:
+        """Record a missing configured source once per unavailable entity."""
+        entity_id = self.config.get(CONF_ESTIMATED_SEGMENT_ENTITY)
+        if not entity_id:
+            return
+        if self.hass.states.get(entity_id) is not None:
+            self._estimated_segment_source_missing_warned_entity = None
+            return
+        run.estimated_segment_source_missing = True
+        run.estimated_segment_source_entity = entity_id
+        if (
+            getattr(self, "_estimated_segment_source_missing_warned_entity", None)
+            != entity_id
+        ):
+            _LOGGER.warning(
+                "%s estimated segment entity %s is unavailable; "
+                "in-room dwell cannot be verified",
+                self.name,
+                entity_id,
+            )
+            self._estimated_segment_source_missing_warned_entity = entity_id
 
     async def async_start_session(self, reason: str = "auto") -> None:
         """Start a new away cleaning session if possible."""
@@ -6477,6 +6508,7 @@ class ValetudoVacuumCoordinator:
             requested_iterations=requested_iterations,
         )
         self.active_run = run
+        self._mark_estimated_segment_source_for_run(run)
         self._set_retained_task_guard_for_run(run)
         self._active_run_restored = False
         self._restored_dispatch_intent_deadline = None
@@ -7751,6 +7783,7 @@ class ValetudoVacuumCoordinator:
             manual=True,
             manual_credit_room_ids=self._manual_credit_room_ids(),
         )
+        self._mark_estimated_segment_source_for_run(self.manual_run)
         if self._status_flag() == "segment":
             self.manual_run.observed_segment_cleaning = True
         self._ensure_retained_task_guard(
