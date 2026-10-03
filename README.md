@@ -212,7 +212,9 @@ threshold-backed floor work is not mislabeled as a generic failure when dock
 servicing faults race completion. Requested iterations are tracked from
 distinct segment cycles; if Valetudo does not expose enough evidence to prove
 all requested passes, the result remains `uncertain` rather than receiving full
-credit. Uncertain work is not blindly repeated.
+credit. When the firmware performs all requested passes within one segment job,
+only one segment cycle is observable, so the result is `uncertain` by design.
+Uncertain work is not blindly repeated.
 Outcome retention is bounded to the current Home Assistant local day and is
 also cleared when manual cleaning starts.
 
@@ -237,6 +239,11 @@ use `resource_settle` and retain their existing degraded vacuum-only behavior.
 Valetudo robot errors, including clean-water faults, remain authoritative.
 Correlated whole-robot outages continue to use the bounded telemetry-outage
 recovery policy below.
+
+Version 0.3.6 keeps an outstanding room reason aligned with the latest
+unresolved attempt. A configured estimated-segment entity that is missing is
+reported through `estimated_segment_source`, a warning, and evidence
+`dwell_status: source_missing`, instead of silently recording zero dwell.
 
 Version 0.3.4 processes correlated Valetudo entity loss during a confirmed room
 run as a

@@ -297,6 +297,7 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
             ATTR_WHILE_AWAY_ISSUES: self.coordinator.while_away_issue_messages,
             ATTR_WHILE_AWAY_OUTCOMES: self.coordinator.while_away_outcome_contract,
+            "estimated_segment_source": self.coordinator.estimated_segment_source,
             **self.coordinator.native_resume_attributes,
         }
 

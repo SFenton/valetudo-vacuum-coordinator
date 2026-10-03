@@ -1139,6 +1139,51 @@ def test_session_sensor_exposes_additive_typed_outcome_contract() -> None:
     assert attributes[const.ATTR_PRESERVED_ROOMS] == ["dining"]
 
 
+def test_missing_estimated_segment_source_warns_once_and_is_exposed(caplog) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.hass.states._states.pop("sensor.robot_estimated_segment")
+
+    with caplog.at_level("WARNING", logger=coordinator_module.__name__):
+        assert coordinator._start_manual_run(datetime.now(UTC)) is True
+        first_run = coordinator.manual_run
+        assert first_run is not None
+        coordinator.manual_run = None
+        assert coordinator._start_manual_run(datetime.now(UTC)) is True
+
+    assert first_run.estimated_segment_source_missing is True
+    assert first_run.estimated_segment_source_entity == "sensor.robot_estimated_segment"
+    assert coordinator.estimated_segment_source == "missing"
+    assert len(
+        [
+            record
+            for record in caplog.records
+            if "estimated segment entity sensor.robot_estimated_segment"
+            in record.getMessage()
+        ]
+    ) == 1
+    sensor = sensor_module.ValetudoSessionStateSensor(coordinator)
+    assert sensor.extra_state_attributes["estimated_segment_source"] == "missing"
+
+
+def test_unconfigured_estimated_segment_source_is_reported_without_warning(caplog) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config.pop(const.CONF_ESTIMATED_SEGMENT_ENTITY)
+
+    with caplog.at_level("WARNING", logger=coordinator_module.__name__):
+        assert coordinator._start_manual_run(datetime.now(UTC)) is True
+
+    assert coordinator.manual_run is not None
+    assert coordinator.manual_run.estimated_segment_source_missing is False
+    assert coordinator.estimated_segment_source == "not_configured"
+    assert not [
+        record
+        for record in caplog.records
+        if "estimated segment entity" in record.getMessage()
+    ]
+
+
 def test_recovery_sensors_expose_queue_and_cadence_instrumentation() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.active_run = None
@@ -1681,7 +1726,7 @@ def test_two_2026_08_19_sessions_build_authoritative_day_projection() -> None:
             "mop.clean_water_empty"
         )
         assert dining["occurrence_count"] == 2
-        assert dining["reasons_coincide"] is False
+        assert dining["reasons_coincide"] is True
 
         hallway = projections["hallway"]
         assert hallway["status"] == "interrupted"
@@ -3969,6 +4014,74 @@ def test_dominant_wrong_room_estimated_dwell_is_never_credited() -> None:
     assert coordinator.ledgers["room_one"].successful_count == 0
     assert coordinator.started_rooms == ["room_one"]
     assert coordinator.hass.services.calls == []
+
+
+def test_estimated_segment_dwell_tracks_named_room_and_finalizes() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    hallway = logic.RoomConfig(
+        room_id="hallway",
+        name="Hallway",
+        segment_id="1",
+    )
+    master_bedroom = logic.RoomConfig(
+        room_id="master_bedroom",
+        name="Master Bedroom",
+        segment_id="2",
+        min_estimated_dwell=30,
+    )
+    _set_rooms(coordinator, [hallway, master_bedroom])
+    assert coordinator.active_run is not None
+    run = coordinator.active_run
+    run.room_id = master_bedroom.room_id
+    run.segment_id = master_bedroom.segment_id
+    run.observed_cleaning = True
+    run.observed_segment_cleaning = True
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    started_at = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
+
+    hallway_state = coordinator.set_state(
+        "sensor.robot_estimated_segment",
+        "Hallway",
+    )
+    coordinator._observe_active_run(
+        "sensor.robot_estimated_segment",
+        hallway_state,
+        started_at,
+    )
+    bedroom_state = coordinator.set_state(
+        "sensor.robot_estimated_segment",
+        "Master Bedroom",
+    )
+    coordinator._observe_active_run(
+        "sensor.robot_estimated_segment",
+        bedroom_state,
+        started_at + timedelta(seconds=10),
+    )
+    hallway_state = coordinator.set_state(
+        "sensor.robot_estimated_segment",
+        "Hallway",
+    )
+    coordinator._observe_active_run(
+        "sensor.robot_estimated_segment",
+        hallway_state,
+        started_at + timedelta(seconds=3970),
+    )
+    coordinator._finalize_estimated_room_at_dock(
+        run,
+        started_at + timedelta(seconds=3980),
+    )
+
+    evidence = logic.build_run_evidence(
+        master_bedroom,
+        run,
+        logic.FloorCompletionEvidence("completed", duration=3980),
+    )
+
+    assert run.estimated_dwell_seconds["master_bedroom"] == pytest.approx(3960)
+    assert evidence["physical_work"]["target_room_dwell_seconds"] == pytest.approx(
+        3960
+    )
+    assert evidence["physical_work"]["dwell_status"] == "observed"
 
 
 def test_unresolvable_room_does_not_trigger_wrong_room_needs_help() -> None:

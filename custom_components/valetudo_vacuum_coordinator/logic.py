@@ -344,6 +344,8 @@ class ActiveRun:
     last_estimated_room_id: str | None = None
     last_estimated_changed_at: str | None = None
     estimated_dwell_seconds: dict[str, float] = field(default_factory=dict)
+    estimated_segment_source_missing: bool = False
+    estimated_segment_source_entity: str | None = None
     manual_credit_room_ids: list[str] | None = None
 
     @property
@@ -743,6 +745,12 @@ class ActiveRun:
                 str(room_id): float(seconds)
                 for room_id, seconds in (data.get("estimated_dwell_seconds") or {}).items()
             },
+            estimated_segment_source_missing=bool(
+                data.get("estimated_segment_source_missing", False)
+            ),
+            estimated_segment_source_entity=data.get(
+                "estimated_segment_source_entity"
+            ),
             manual_credit_room_ids=(
                 [str(room_id) for room_id in data["manual_credit_room_ids"]]
                 if isinstance(data.get("manual_credit_room_ids"), list)
@@ -841,6 +849,12 @@ class ActiveRun:
             "last_estimated_room_id": self.last_estimated_room_id,
             "last_estimated_changed_at": self.last_estimated_changed_at,
             "estimated_dwell_seconds": self.estimated_dwell_seconds,
+            "estimated_segment_source_missing": (
+                self.estimated_segment_source_missing
+            ),
+            "estimated_segment_source_entity": (
+                self.estimated_segment_source_entity
+            ),
             "manual_credit_room_ids": self.manual_credit_room_ids,
         }
 
@@ -1396,8 +1410,16 @@ def build_while_away_outcome_contract(
                     "operation": outstanding_operation,
                     "reason": reason,
                 }
-            elif projection["credit"]["status"] == "partial":
-                projection["outstanding"]["operation"] = "mop"
+            else:
+                # A vacuum-only fallback does not attempt the owed mop, so it
+                # must not replace the mop blocker reason.
+                if (
+                    reason is not None
+                    and outcome.attempt_mode != "fallback_vacuum"
+                ):
+                    projection["outstanding"]["reason"] = reason
+                if projection["credit"]["status"] == "partial":
+                    projection["outstanding"]["operation"] = "mop"
 
     for projection in projections.values():
         result_reason = (
@@ -3054,6 +3076,16 @@ def evaluate_run_success(
         return False, "Vacuum never reported segment cleaning"
 
     if room.require_estimated_segment:
+        if run.estimated_segment_source_missing:
+            entity_id = (
+                run.estimated_segment_source_entity
+                or "configured estimated segment source"
+            )
+            return (
+                False,
+                f"Estimated segment entity {entity_id} is unavailable; "
+                "in-room dwell cannot be verified",
+            )
         wrong_room = dominant_wrong_room(run, room)
         if wrong_room is not None:
             wrong_room_id, wrong_dwell, commanded_dwell = wrong_room
@@ -3250,7 +3282,11 @@ def build_run_evidence(
         attribution_uncertain=run.area_measurement_uncertain,
         lower_bound=run.accumulated_area,
     )
-    target_dwell = run.estimated_dwell_seconds.get(room.room_id, 0.0)
+    target_dwell = (
+        None
+        if run.estimated_segment_source_missing
+        else run.estimated_dwell_seconds.get(room.room_id, 0.0)
+    )
     physical_status = "not_observed"
     if run.observed_cleaning or run.observed_segment_cleaning:
         physical_status = "observed"
@@ -3272,7 +3308,10 @@ def build_run_evidence(
                 and room.min_area > 0
                 and run.accumulated_area >= room.min_area
             )
-            or target_dwell >= float(room.min_estimated_dwell)
+            or (
+                target_dwell is not None
+                and target_dwell >= float(room.min_estimated_dwell)
+            )
         )
     ):
         physical_status = "substantial"
@@ -3284,6 +3323,11 @@ def build_run_evidence(
             "cleaning_observed": run.observed_cleaning,
             "segment_cleaning_observed": run.observed_segment_cleaning,
             "target_room_dwell_seconds": target_dwell,
+            "dwell_status": (
+                "source_missing"
+                if run.estimated_segment_source_missing
+                else "observed"
+            ),
         },
         "duration": duration,
         "area": area,
@@ -3361,6 +3405,8 @@ def manual_rooms_to_credit(
     run: ActiveRun,
 ) -> list[RoomConfig]:
     """Determine which rooms from a manual run should receive credit."""
+    if run.estimated_segment_source_missing:
+        return []
     credited: list[RoomConfig] = []
     room_by_id = {room.room_id: room for room in rooms}
     allowed_room_ids = (
