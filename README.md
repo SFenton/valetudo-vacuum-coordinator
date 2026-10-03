@@ -230,6 +230,14 @@ failure terminalize the session. Unknown firmware errors default to
 recoverable waiting so a newly introduced error cannot silently discard the
 queue.
 
+Version 0.3.5 ignores `unknown` and `unavailable` dock-component readings:
+they carry no actionable resource state and do not hold, defer, or degrade an
+away session. Confirmed `empty`, `full`, and `missing` component states still
+use `resource_settle` and retain their existing degraded vacuum-only behavior.
+Valetudo robot errors, including clean-water faults, remain authoritative.
+Correlated whole-robot outages continue to use the bounded telemetry-outage
+recovery policy below.
+
 Version 0.3.4 processes correlated Valetudo entity loss during a confirmed room
 run as a
 `telemetry_gap` instead of cancelling the task or dispatching another room.

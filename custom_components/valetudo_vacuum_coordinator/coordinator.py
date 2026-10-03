@@ -1849,11 +1849,14 @@ class ValetudoVacuumCoordinator:
             await self._async_maybe_send_auto_clean_summary()
             return
         if entity_id in self._resource_sensor_entities():
-            if self.active_run and self._resource_sample_is_blocking(
-                entity_id,
-                new_state.state,
-            ):
-                if not self._run_waiting_for_start_ack(self.active_run):
+            if self._resource_sample_is_unreadable(new_state.state):
+                return
+            if self._resource_sample_is_blocking(entity_id, new_state.state):
+                pending_start_fault = bool(
+                    self.active_run
+                    and self._run_waiting_for_start_ack(self.active_run)
+                )
+                if not pending_start_fault:
                     if not await self._async_resource_fault_confirmed(
                         entity_id,
                         now,
@@ -8431,14 +8434,19 @@ class ValetudoVacuumCoordinator:
         """Return whether one raw dock component sample is adverse."""
         normalized = (normalize_state(value) or "").lower()
         if entity_id == self.config.get(CONF_FRESH_WATER_ENTITY):
-            return normalized in {"empty", "missing", "unknown", "unavailable"}
+            return normalized in {"empty", "missing"}
         if entity_id == self.config.get(CONF_DIRTY_WATER_ENTITY):
-            return normalized in {"full", "missing", "unknown", "unavailable"}
+            return normalized in {"full", "missing"}
         if entity_id == self.config.get(CONF_DETERGENT_ENTITY):
-            return normalized in {"empty", "missing", "unknown", "unavailable"}
+            return normalized in {"empty", "missing"}
         if entity_id == self.config.get(CONF_DUSTBAG_ENTITY):
-            return normalized in {"full", "missing", "unknown", "unavailable"}
+            return normalized in {"full", "missing"}
         return False
+
+    def _resource_sample_is_unreadable(self, value: str | None) -> bool:
+        """Return whether a resource reading has no actionable component state."""
+        normalized = (normalize_state(value) or "").lower()
+        return normalized in {"unknown", "unavailable"}
 
     async def _async_resource_fault_confirmed(
         self,

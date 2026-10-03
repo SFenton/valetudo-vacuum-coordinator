@@ -211,6 +211,88 @@ def test_mop_resource_blocks_mop_room():
     assert reason == "dirty water is full"
 
 
+@pytest.mark.parametrize("state", ["unknown", "unavailable"])
+def test_unreadable_resource_telemetry_does_not_block_room_selection(state):
+    rooms = [
+        logic.RoomConfig(
+            room_id="mop_room",
+            name="Mop Room",
+            segment_id="1",
+            mop_required=True,
+        ),
+        logic.RoomConfig(room_id="vacuum_room", name="Vacuum Room", segment_id="2"),
+    ]
+    resources = logic.ResourceState(fresh_water=state)
+
+    blocker = logic.classify_blocker(resources)
+    selection, skipped = logic.select_next_room(
+        rooms,
+        {},
+        set(),
+        resources,
+        allow_vacuum_only_when_mop_blocked=True,
+    )
+
+    assert blocker is None
+    assert selection is not None
+    assert selection.room.room_id == "mop_room"
+    assert selection.vacuum_only is False
+    assert skipped == []
+
+
+@pytest.mark.parametrize("state", ["empty", "missing"])
+def test_readable_clean_water_fault_still_blocks_mop_room(state):
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    resources = logic.ResourceState(fresh_water=state)
+
+    blocker = logic.classify_blocker(resources)
+    selection, skipped = logic.select_next_room(
+        [room],
+        {},
+        set(),
+        resources,
+        allow_vacuum_only_when_mop_blocked=False,
+    )
+
+    assert blocker is not None
+    assert blocker.code == "mop.clean_water_unavailable"
+    assert blocker.vacuum_only_safe is True
+    assert selection is None
+    assert skipped == [(room, f"fresh water is {state}")]
+
+
+def test_clean_water_robot_error_still_enables_vacuum_only_fallback():
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    resources = logic.ResourceState(error="Mop Dock Clean Water Tank empty")
+
+    blocker = logic.classify_blocker(resources)
+    selection, skipped = logic.select_next_room(
+        [room],
+        {},
+        set(),
+        resources,
+        allow_vacuum_only_when_mop_blocked=True,
+    )
+
+    assert blocker is not None
+    assert blocker.code == "mop.clean_water_empty"
+    assert blocker.vacuum_only_safe is True
+    assert selection is not None
+    assert selection.vacuum_only is True
+    assert selection.fallback_vacuum is True
+    assert skipped == []
+
+
 def test_unknown_error_120_blocks_mop_room_but_allows_vacuum():
     """Dreame X40 error 120 is a recoverable mop-pad mounting issue.
 
