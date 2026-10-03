@@ -2440,7 +2440,7 @@ def classify_blocker(
         (
             "fresh water",
             resources.fresh_water,
-            {"empty", "missing", "unknown", "unavailable"},
+            {"empty", "missing"},
             "mop.clean_water_unavailable",
             "Refill or reseat the clean-water tank; vacuum-only rooms can continue.",
             True,
@@ -2448,7 +2448,7 @@ def classify_blocker(
         (
             "dirty water",
             resources.dirty_water,
-            {"full", "missing", "unknown", "unavailable"},
+            {"full", "missing"},
             "mop.dirty_water_unavailable",
             "Empty and reseat the wastewater tank.",
             True,
@@ -2456,7 +2456,7 @@ def classify_blocker(
         (
             "detergent",
             resources.detergent,
-            {"empty", "missing", "unknown", "unavailable"},
+            {"empty", "missing"},
             "mop.detergent_unavailable",
             "Refill or reseat the detergent container.",
             True,
@@ -2464,7 +2464,7 @@ def classify_blocker(
         (
             "dustbag",
             resources.dustbag,
-            {"full", "missing", "unknown", "unavailable"},
+            {"full", "missing"},
             "dock.dustbag_full_or_duct_blocked",
             "Replace the dustbag or clear the dust duct.",
             True,
@@ -2866,8 +2866,6 @@ def clean_water_vacuum_only_reason(resources: ResourceState) -> str | None:
     fresh_water = normalize_state(resources.fresh_water)
     if fresh_water and fresh_water.lower() in {
         "missing",
-        "unknown",
-        "unavailable",
     }:
         return f"fresh water is {fresh_water}"
     error = normalize_state(resources.error)
@@ -2907,9 +2905,9 @@ def mop_block_reason(room: RoomConfig, resources: ResourceState) -> str | None:
         return None
 
     component_checks = [
-        ("fresh water", resources.fresh_water, {"empty", "missing", "unknown", "unavailable"}),
-        ("dirty water", resources.dirty_water, {"full", "missing", "unknown", "unavailable"}),
-        ("detergent", resources.detergent, {"empty", "missing", "unknown", "unavailable"}),
+        ("fresh water", resources.fresh_water, {"empty", "missing"}),
+        ("dirty water", resources.dirty_water, {"full", "missing"}),
+        ("detergent", resources.detergent, {"empty", "missing"}),
     ]
     for label, state, bad_values in component_checks:
         if state is not None and normalize_state(state).lower() in bad_values:
@@ -3024,7 +3022,7 @@ def select_next_room(
 def cleaning_block_reason(resources: ResourceState) -> str | None:
     """Return a reason no cleaning should start at all."""
     dustbag = normalize_state(resources.dustbag)
-    if dustbag is not None and dustbag.lower() in {"full", "missing", "unknown", "unavailable"}:
+    if dustbag is not None and dustbag.lower() in {"full", "missing"}:
         return f"dustbag is {dustbag}"
 
     normalized_error = normalize_state(resources.error)

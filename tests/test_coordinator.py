@@ -2118,7 +2118,7 @@ def test_degraded_navigation_retry_follows_unattempted_rooms() -> None:
     coordinator.active_run = None
     coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
     coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
-    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.set_state("sensor.robot_fresh_water", "missing")
     coordinator.session = logic.SessionState(
         session_id="session",
         started_at=logic.utcnow_iso(),
@@ -2167,7 +2167,7 @@ def test_degraded_candidate_order_is_native_fallback_then_retry() -> None:
     coordinator.active_run = None
     coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
     coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = True
-    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.set_state("sensor.robot_fresh_water", "missing")
     coordinator.session = logic.SessionState(
         session_id="session",
         started_at=logic.utcnow_iso(),
@@ -2210,7 +2210,7 @@ def test_degraded_navigation_retry_starts_after_unattempted_room() -> None:
     coordinator.active_run = None
     coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
     coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
-    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.set_state("sensor.robot_fresh_water", "missing")
     coordinator.session = logic.SessionState(
         session_id="session",
         started_at=logic.utcnow_iso(),
@@ -2271,7 +2271,7 @@ def test_degraded_navigation_incident_advances_before_one_tail_retry() -> None:
     )
     coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
     coordinator.config[const.CONF_ALLOW_VACUUM_ONLY_WHEN_MOP_BLOCKED] = False
-    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+    coordinator.set_state("sensor.robot_fresh_water", "missing")
     coordinator.session = logic.SessionState(
         session_id="session",
         started_at=logic.utcnow_iso(),
@@ -8503,6 +8503,160 @@ def test_clean_water_flapping_does_not_preempt_pending_floor_command():
     assert coordinator.session.active is True
     assert coordinator.session.terminal_reason is None
     assert coordinator.session.deferred_full_clean_room_ids == ["room_one"]
+
+
+@pytest.mark.parametrize("telemetry_state", ["unavailable", "unknown"])
+def test_unreadable_resource_telemetry_at_session_start_dispatches_mop(
+    telemetry_state: str,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_fresh_water", telemetry_state)
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["mop_room"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.vacuum_only is False
+    assert coordinator.session.degraded_reason is None
+    assert coordinator.session.deferred_full_clean_room_ids == []
+    assert getattr(coordinator, "_resource_candidates", {}) == {}
+
+
+def test_unreadable_resource_telemetry_between_rooms_dispatches_mop():
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_RESOURCE_SETTLE] = 3
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_fresh_water", "ok")
+
+    _handle_event(coordinator, "sensor.robot_fresh_water", "unavailable")
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["mop_room"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.vacuum_only is False
+    assert coordinator.session.degraded_reason is None
+    assert coordinator.session.deferred_full_clean_room_ids == []
+    assert getattr(coordinator, "_resource_candidates", {}) == {}
+
+
+def test_pending_start_unreadable_resource_telemetry_is_ignored():
+    coordinator = _RecoverableFailureCoordinator()
+    run = coordinator.active_run
+    assert run is not None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_RESOURCE_SETTLE] = 3
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_fresh_water", "ok")
+
+    _handle_event(coordinator, "sensor.robot_fresh_water", "unavailable")
+
+    assert coordinator.active_run is run
+    assert run.start_confirmed_at is None
+    assert coordinator.session.degraded_reason is None
+    assert _service_names(coordinator).count("stop") == 0
+    assert getattr(coordinator, "_resource_candidates", {}) == {}
+
+    _handle_event(coordinator, "sensor.robot_fresh_water", "ok")
+    _handle_event(coordinator, coordinator.vacuum_entity, "cleaning")
+
+    assert coordinator.active_run is run
+    assert run.observed_cleaning is True
+    assert coordinator.session.degraded_reason is None
+    assert _service_names(coordinator).count("stop") == 0
+    assert getattr(coordinator, "_resource_candidates", {}) == {}
+
+
+def test_resource_telemetry_recovery_clears_legacy_vacuum_only_lane():
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.session.degraded_reason = "fresh water is unavailable"
+    coordinator.session.deferred_full_clean_room_ids = ["mop_room"]
+    coordinator.session.deferred_full_clean_reasons = {
+        "mop_room": "fresh water is unavailable"
+    }
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_fresh_water", "unavailable")
+
+    _handle_event(coordinator, "sensor.robot_fresh_water", "ok")
+
+    assert coordinator.session.degraded_reason is None
+    assert coordinator.started_rooms == ["mop_room"]
+    assert coordinator.active_run is not None
+    assert coordinator.active_run.vacuum_only is False
+
+    _finish_active_room_successfully(coordinator)
+
+    assert coordinator.session.deferred_full_clean_room_ids == []
+    assert coordinator.session.completed_room_ids == ["mop_room"]
+
+
+def test_real_empty_fresh_water_still_degrades_after_resource_settle():
+    coordinator = _RecoverableFailureCoordinator()
+    room = logic.RoomConfig(
+        room_id="mop_room",
+        name="Mop Room",
+        segment_id="1",
+        mop_required=True,
+    )
+    _set_rooms(coordinator, [room])
+    coordinator.active_run = None
+    coordinator.config[const.CONF_FRESH_WATER_ENTITY] = "sensor.robot_fresh_water"
+    coordinator.config[const.CONF_RESOURCE_SETTLE] = 3
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    coordinator.set_state("sensor.robot_fresh_water", "ok")
+
+    _handle_event(coordinator, "sensor.robot_fresh_water", "empty")
+
+    assert coordinator.session.degraded_reason is None
+    coordinator._resource_candidates["sensor.robot_fresh_water"]["deadline"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    asyncio.run(coordinator._async_confirm_resource_faults_serialized())
+
+    assert coordinator.session.degraded_reason == "fresh water is empty"
+    assert coordinator.session.deferred_full_clean_room_ids == ["mop_room"]
 
 
 def test_explicit_unrecoverable_error_terminalizes_without_auto_resume():
