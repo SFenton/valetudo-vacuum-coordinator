@@ -140,6 +140,9 @@ from .logic import (
     is_unrecoverable_error,
     is_wrong_room_failure,
     is_error_clear,
+    is_latched_dock_pause,
+    MOP_DOCK_TRAY_FULL_ACTION,
+    MOP_DOCK_TRAY_FULL_CODE,
     manual_rooms_to_credit,
     mark_failure,
     mark_fallback_vacuum_success,
@@ -859,7 +862,7 @@ class ValetudoVacuumCoordinator:
             and self.session.pending_recovery_room_id
         ):
             resources = replace(resources, error="No error")
-        resource_blocker = classify_blocker(resources)
+        resource_blocker = classify_blocker(resources) or self._mop_hold_blocker()
         if (
             self.session.degraded_reason
             and resource_blocker
@@ -1819,7 +1822,10 @@ class ValetudoVacuumCoordinator:
                         else None
                     )
                     if degraded_reason:
-                        self._activate_vacuum_only_degraded(degraded_reason)
+                        self._activate_vacuum_only_degraded(
+                            degraded_reason,
+                            blocker_code=blocker.code if blocker else None,
+                        )
                         await self._async_maybe_start_next_room()
                     elif blocker and not blocker.recoverable:
                         await self._async_terminalize_unrecoverable(blocker)
@@ -4660,7 +4666,21 @@ class ValetudoVacuumCoordinator:
             guard.phase = RETAINED_TASK_PHASE_DOCK_VERIFYING
 
         vacuum_ack_safe = vacuum_state in _AT_DOCK_VACUUM_STATES
-        dock_idle = not dock_configured or dock_status in _READY_DOCK_STATES
+        dock_clear_deadline = parse_datetime(guard.dock_clear_deadline)
+        # A stale dock pause survives the bounded dock stop, so accept it once
+        # that stop has had its full window or an operator wait is pending.
+        latched_pause_accepted = self._dock_pause_latched() and (
+            guard.phase == RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+            or (
+                guard.phase == RETAINED_TASK_PHASE_DOCK_VERIFYING
+                and (dock_clear_deadline is None or now >= dock_clear_deadline)
+            )
+        )
+        dock_idle = (
+            not dock_configured
+            or dock_status in _READY_DOCK_STATES
+            or latched_pause_accepted
+        )
         if guard.phase in {
             RETAINED_TASK_PHASE_VERIFYING,
             RETAINED_TASK_PHASE_DOCK_VERIFYING,
@@ -5385,7 +5405,7 @@ class ValetudoVacuumCoordinator:
         session = self.session
         if not session or not session.active or self.active_run:
             return
-        blocker = blocker or self._current_blocker()
+        blocker = blocker or self._degraded_lane_blocker()
         if blocker is None:
             blocker = BlockerClassification(
                 "session.waiting",
@@ -5736,7 +5756,10 @@ class ValetudoVacuumCoordinator:
             )
         )
         if degraded_reason:
-            self._activate_vacuum_only_degraded(degraded_reason)
+            self._activate_vacuum_only_degraded(
+                degraded_reason,
+                blocker_code=blocker.code if blocker else None,
+            )
         if self.session.degraded_reason:
             await self._async_maybe_start_degraded_room(resources)
             return
@@ -5849,7 +5872,7 @@ class ValetudoVacuumCoordinator:
         session = self.session
         if not session or not session.active or self.active_run:
             return
-        blocker = self._current_blocker(resources)
+        blocker = self._degraded_lane_blocker(resources)
         if blocker is None:
             await self._async_resume_degraded_after_refill(resources)
             return
@@ -5892,7 +5915,7 @@ class ValetudoVacuumCoordinator:
             return
 
         resources = self._resource_state()
-        blocker = self._current_blocker(resources)
+        blocker = self._degraded_lane_blocker(resources)
         if blocker is None:
             await self._async_resume_degraded_after_refill(resources)
             return
@@ -6020,11 +6043,24 @@ class ValetudoVacuumCoordinator:
         self.session.degraded_mode_last_error = None
         self.session.degraded_mode_state_fingerprint = None
 
-    def _activate_vacuum_only_degraded(self, reason: str) -> None:
+    def _activate_vacuum_only_degraded(
+        self,
+        reason: str,
+        *,
+        blocker_code: str | None = None,
+    ) -> None:
         """Latch a safe vacuum-only lane and defer outstanding mop work."""
         session = self.session
         if not session or not session.active:
             return
+        if (
+            blocker_code == MOP_DOCK_TRAY_FULL_CODE
+            and session.mop_hold_reason is None
+        ):
+            # Valetudo clears this error as soon as the robot stops, so the
+            # clear state is not evidence of a fix. Retrying would wash into
+            # the same flooded tray.
+            session.mop_hold_reason = reason
         if session.degraded_reason is None:
             session.degraded_reason = reason
             session.degraded_at = utcnow_iso()
@@ -6041,6 +6077,28 @@ class ValetudoVacuumCoordinator:
             ):
                 session.defer_full_clean(room.room_id, reason)
                 self._record_deferral_outcome(room, reason)
+
+    def _mop_hold_blocker(self) -> BlockerClassification | None:
+        """Return the session-scoped hold that keeps mop rooms deferred."""
+        session = self.session
+        if not session or not session.active or not session.mop_hold_reason:
+            return None
+        return BlockerClassification(
+            MOP_DOCK_TRAY_FULL_CODE,
+            BLOCKER_RECOVERABLE,
+            "mop_resource",
+            session.mop_hold_reason,
+            MOP_DOCK_TRAY_FULL_ACTION,
+            waiting_for_physical_fix=True,
+            vacuum_only_safe=True,
+        )
+
+    def _degraded_lane_blocker(
+        self,
+        resources: ResourceState | None = None,
+    ) -> BlockerClassification | None:
+        """Return the live blocker, or the mop hold once the live error clears."""
+        return self._current_blocker(resources) or self._mop_hold_blocker()
 
     def _activate_clean_water_degraded(self, reason: str) -> None:
         """Compatibility helper for the original clean-water degraded lane."""
@@ -6139,7 +6197,7 @@ class ValetudoVacuumCoordinator:
                 auto_clean_day,
             )
         )
-        blocker = self._current_blocker()
+        blocker = self._degraded_lane_blocker()
         if blocker is None:
             pending_ids = {room.room_id for room in rooms}
             for room_id in self.session.priority_retry_room_ids:
@@ -6258,6 +6316,7 @@ class ValetudoVacuumCoordinator:
             identifier
             and dock_status is not None
             and dock_status.lower() in _BUSY_DOCK_STATES
+            and not self._dock_pause_latched()
         )
 
         if dock_stop_needed and not session.degraded_dock_stop_acknowledged_at:
@@ -6460,7 +6519,10 @@ class ValetudoVacuumCoordinator:
                 "unavailable",
             }:
                 return f"dock status is {dock_status or 'unknown'}"
-            if dock_status.lower() in _BUSY_DOCK_STATES:
+            if (
+                dock_status.lower() in _BUSY_DOCK_STATES
+                and not self._dock_pause_latched()
+            ):
                 return f"dock status is {dock_status}"
         battery_entity = self.config.get(CONF_BATTERY_ENTITY)
         if battery_entity:
@@ -6901,7 +6963,10 @@ class ValetudoVacuumCoordinator:
 
         if blocker.vacuum_only_safe and run.vacuum_only:
             run.allowed_error_fingerprint = blocker.code
-            self._activate_vacuum_only_degraded(blocker.reason)
+            self._activate_vacuum_only_degraded(
+                blocker.reason,
+                blocker_code=blocker.code,
+            )
             await self._async_save_store()
             await self._async_reconcile_active_run(dt_util.utcnow())
             return
@@ -6918,7 +6983,10 @@ class ValetudoVacuumCoordinator:
             or (blocker.reason if blocker.vacuum_only_safe else None)
         )
         if degraded_reason:
-            self._activate_vacuum_only_degraded(degraded_reason)
+            self._activate_vacuum_only_degraded(
+                degraded_reason,
+                blocker_code=blocker.code,
+            )
 
         room = self.active_room
         if (
@@ -7756,6 +7824,7 @@ class ValetudoVacuumCoordinator:
         if (
             dock_entity
             and (dock_status or "").lower() not in _READY_DOCK_STATES
+            and not self._dock_pause_latched()
         ):
             return False
         if not self.config.get(CONF_STATUS_FLAG_ENTITY):
@@ -8245,6 +8314,7 @@ class ValetudoVacuumCoordinator:
             if (
                 dock_status.lower() in _BUSY_DOCK_STATES
                 and not (degraded_ready and dock_status.lower() == "pause")
+                and not self._dock_pause_latched()
             ):
                 return False
 
@@ -8295,6 +8365,25 @@ class ValetudoVacuumCoordinator:
     def _configured_error_is_clear(self) -> bool:
         """Return whether the configured error sensor is available and clear."""
         return self._configured_error_is_available() and is_error_clear(self.error_state)
+
+    def _dock_pause_latched(self) -> bool:
+        """Return whether dock ``pause`` is a stale latch at a healthy, idle dock."""
+        dock_entity = self.config.get(CONF_DOCK_STATUS_ENTITY)
+        if not dock_entity:
+            return False
+        return bool(
+            self._configured_error_is_clear()
+            and is_latched_dock_pause(
+                vacuum_state=self._state(self.vacuum_entity),
+                dock_status=self._state(dock_entity),
+                status_flag=(
+                    self._status_flag()
+                    if self.config.get(CONF_STATUS_FLAG_ENTITY)
+                    else "none"
+                ),
+                error=self.error_state,
+            )
+        )
 
     def _configured_status_is_available(self) -> bool:
         """Return whether a configured status sensor has a definitive state."""

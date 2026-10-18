@@ -240,6 +240,25 @@ Valetudo robot errors, including clean-water faults, remain authoritative.
 Correlated whole-robot outages continue to use the bounded telemetry-outage
 recovery policy below.
 
+Version 0.3.7 treats a dock `pause` as a stale latch, not a busy dock, when
+the robot is docked, charging, or idle, the status flag is `none`, and the
+error sensor is clear. Some docks keep reporting `pause` after a paused task
+ends, and neither Empty Bin nor a dock clean stop clears it. Under those
+conditions the latch no longer blocks dispatch or degraded preparation, or
+keeps a retained task in `operator_required`. A coordinator-published dock
+clean stop still gets its full `stale_resume_clear_timeout` before the latch
+is accepted. Dock `cleaning` and `emptying` still block. A `pause` while the
+robot is away from the dock, with a retained task, or with an error still
+blocks. The `command_policy` contract no longer restricts commands for dock
+`drying`, `pause`, or `paused`; dock `cleaning`, `emptying`, and `error` still
+restrict.
+
+Version 0.3.7 also classifies a `Mop Dock Tray full of water` error as
+`mop.dock_tray_full`. Valetudo clears this error as soon as the robot stops,
+so the clear state is not evidence of a fix. The session therefore keeps mop
+rooms deferred for the rest of that away session. Vacuum-only rooms continue,
+and the next session starts without the hold.
+
 Version 0.3.6 keeps an outstanding room reason aligned with the latest
 unresolved attempt. A configured estimated-segment entity that is missing is
 reported through `estimated_segment_source`, a warning, and evidence

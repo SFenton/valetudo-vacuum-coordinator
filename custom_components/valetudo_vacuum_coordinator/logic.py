@@ -1485,6 +1485,7 @@ class SessionState:
     notification_sent: bool = False
     degraded_reason: str | None = None
     degraded_at: str | None = None
+    mop_hold_reason: str | None = None
     degraded_preparation_attempted: bool = False
     degraded_preparation_completed: bool = False
     degraded_dock_stop_attempts: int = 0
@@ -1804,6 +1805,7 @@ class SessionState:
             notification_sent=bool(data.get("notification_sent", False)),
             degraded_reason=data.get("degraded_reason"),
             degraded_at=data.get("degraded_at"),
+            mop_hold_reason=data.get("mop_hold_reason"),
             degraded_preparation_attempted=bool(
                 data.get("degraded_preparation_attempted", False)
             ),
@@ -1949,6 +1951,7 @@ class SessionState:
             "notification_sent": self.notification_sent,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
+            "mop_hold_reason": self.mop_hold_reason,
             "degraded_preparation_attempted": self.degraded_preparation_attempted,
             "degraded_preparation_completed": self.degraded_preparation_completed,
             "degraded_dock_stop_attempts": self.degraded_dock_stop_attempts,
@@ -2304,6 +2307,14 @@ def normalize_state(value: Any) -> str | None:
     return str(value).strip()
 
 
+MOP_DOCK_TRAY_FULL_CODE = "mop.dock_tray_full"
+MOP_DOCK_TRAY_FULL_ACTION = (
+    "Remove the washboard, clear the sewage outlet and filter, wipe the "
+    "overflow sensors, and reseat the dirty-water tank. Mop rooms stay "
+    "deferred for the rest of this session."
+)
+
+
 def is_error_clear(error: str | None) -> bool:
     """Return True if the Valetudo error sensor is clear."""
     return normalize_state(error) in NO_ERROR_VALUES
@@ -2344,6 +2355,37 @@ def is_clean_water_empty_error(error: str | None) -> bool:
 def is_unrecoverable_error(error: str | None) -> bool:
     """Return whether an error explicitly declares permanent failure."""
     return error_contains_any(error, UNRECOVERABLE_ERROR_KEYWORDS)
+
+
+def is_mop_dock_tray_full_error(error: str | None) -> bool:
+    """Return whether the dock reports standing water in its wash tray."""
+    normalized = normalize_state(error)
+    if not normalized or is_error_clear(normalized):
+        return False
+    lowered = normalized.lower()
+    return "tray" in lowered and "full" in lowered
+
+
+def is_latched_dock_pause(
+    *,
+    vacuum_state: str | None,
+    dock_status: str | None,
+    status_flag: str | None,
+    error: str | None,
+) -> bool:
+    """Return whether a dock ``pause`` is a stale latch at an idle, healthy dock.
+
+    Some docks keep reporting ``pause`` after a paused task ends or the robot
+    is sent home. No dock action clears it, so it must not block dispatch once
+    the robot is parked, has no retained task, and reports no error.
+    """
+    return bool(
+        (normalize_state(dock_status) or "").lower() == "pause"
+        and (normalize_state(vacuum_state) or "").lower()
+        in {"docked", "charging", "idle"}
+        and (normalize_state(status_flag) or "").lower() == "none"
+        and is_error_clear(error)
+    )
 
 
 def classify_blocker(
@@ -2401,6 +2443,16 @@ def classify_blocker(
                 "dock",
                 error,
                 "Replace the dustbag or clear the dust duct.",
+                waiting_for_physical_fix=True,
+                vacuum_only_safe=True,
+            )
+        if is_mop_dock_tray_full_error(error):
+            return BlockerClassification(
+                MOP_DOCK_TRAY_FULL_CODE,
+                BLOCKER_RECOVERABLE,
+                "mop_resource",
+                error,
+                MOP_DOCK_TRAY_FULL_ACTION,
                 waiting_for_physical_fix=True,
                 vacuum_only_safe=True,
             )
@@ -2548,7 +2600,10 @@ def classify_blocker(
             f"dock status is {normalized_dock}",
             "Wait for the dock status entity to recover.",
         )
-    if normalized_dock in {"cleaning", "emptying", "pause"}:
+    if normalized_dock in {"cleaning", "emptying"} or (
+        normalized_dock == "pause"
+        and normalized_vacuum not in {"docked", "charging", "idle"}
+    ):
         return BlockerClassification(
             "dock.busy",
             BLOCKER_RECOVERABLE,

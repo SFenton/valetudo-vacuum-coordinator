@@ -6669,6 +6669,228 @@ def test_flag_clear_with_latched_dock_pause_requires_operator(
     assert "dock_action" not in _service_names(coordinator)
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_clear"),
+    [
+        ("No error", True),
+        ("Mop Dock Clean Water Tank empty", False),
+    ],
+)
+def test_latched_dock_pause_clears_operator_wait_only_when_healthy(
+    monkeypatch,
+    error,
+    expected_clear,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            now + timedelta(seconds=31),
+            allow_clear=True,
+        )
+    )
+    guard = coordinator.retained_task_guard
+    assert guard is not None
+    assert guard.phase == logic.RETAINED_TASK_PHASE_OPERATOR_REQUIRED
+
+    coordinator.set_state("sensor.robot_error", error)
+    cleared = asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            now + timedelta(seconds=32),
+            allow_clear=True,
+        )
+    )
+
+    assert cleared is expected_clear
+    assert (
+        guard.phase == logic.RETAINED_TASK_PHASE_CLEARED
+    ) is expected_clear
+    assert "dock_action" not in _service_names(coordinator)
+
+
+def test_dock_stop_that_leaves_latched_pause_clears_after_its_deadline(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 25, 16, 29, 11, tzinfo=UTC)
+    current = [now]
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: current[0],
+    )
+    coordinator = _prepare_preflight_coordinator(
+        now=now,
+        auto_clear=True,
+        stale=True,
+    )
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    current[0] += timedelta(seconds=1)
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    asyncio.run(
+        coordinator._async_reconcile_retained_task(
+            current[0],
+            allow_clear=True,
+        )
+    )
+    guard = coordinator.retained_task_guard
+    assert guard is not None
+    assert guard.phase == logic.RETAINED_TASK_PHASE_DOCK_VERIFYING
+    deadline = logic.parse_datetime(guard.dock_clear_deadline)
+    assert deadline is not None
+
+    current[0] = deadline - timedelta(seconds=1)
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is False
+    )
+    assert guard.phase == logic.RETAINED_TASK_PHASE_DOCK_VERIFYING
+
+    current[0] = deadline
+    assert (
+        asyncio.run(
+            coordinator._async_reconcile_retained_task(
+                current[0],
+                allow_clear=True,
+            )
+        )
+        is True
+    )
+    assert guard.phase == logic.RETAINED_TASK_PHASE_CLEARED
+    assert guard.operator_required_reason is None
+    assert _service_names(coordinator).count("dock_action") == 1
+
+
+@pytest.mark.parametrize(
+    ("vacuum_state", "status_flag", "error", "expected_started"),
+    [
+        ("docked", "none", "No error", ["room_one"]),
+        ("charging", "none", "No error", ["room_one"]),
+        ("returning", "none", "No error", []),
+        ("docked", "resumable", "No error", []),
+        ("docked", "none", "Main brush jammed", []),
+    ],
+)
+def test_latched_dock_pause_only_allows_dispatch_at_a_healthy_idle_dock(
+    vacuum_state,
+    status_flag,
+    error,
+    expected_started,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, vacuum_state)
+    coordinator.set_state("sensor.robot_status_flag", status_flag)
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("sensor.robot_error", error)
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == expected_started
+    if not expected_started:
+        assert coordinator.session.blocked_reason
+
+
+def test_dock_still_cleaning_blocks_dispatch_at_idle_robot() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_dock_status", "cleaning")
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.blocked_reason == "dock status is cleaning"
+
+
+def test_degraded_preparation_skips_dock_stop_for_latched_pause() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Tray full of water",
+        degraded_at=logic.utcnow_iso(),
+        mop_hold_reason="Mop Dock Tray full of water",
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+
+    assert asyncio.run(coordinator._async_prepare_degraded_vacuuming()) is True
+    assert "dock_action" not in _service_names(coordinator)
+
+
+def test_tray_full_error_holds_mop_rooms_after_valetudo_clears_it() -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    _set_rooms(
+        coordinator,
+        [
+            logic.RoomConfig(room_id="native", name="Office", segment_id="1"),
+            logic.RoomConfig(
+                room_id="dual",
+                name="Kitchen",
+                segment_id="2",
+                mop_required=True,
+            ),
+            logic.RoomConfig(room_id="den", name="Den", segment_id="3"),
+        ],
+    )
+    coordinator.active_run = None
+    tray_error = "Mop Dock Tray full of water"
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    coordinator.set_state("sensor.robot_dock_status", "pause")
+    coordinator.set_state("sensor.robot_error", tray_error)
+    blocker = coordinator._current_blocker()
+    assert blocker is not None
+    assert blocker.code == "mop.dock_tray_full"
+
+    coordinator._activate_vacuum_only_degraded(
+        blocker.reason,
+        blocker_code=blocker.code,
+    )
+    assert coordinator.session.mop_hold_reason == tray_error
+    assert coordinator.session.deferred_full_clean_room_ids == ["dual"]
+
+    # Valetudo clears the error right after the stop; nothing was fixed.
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    assert {room.room_id for room in coordinator.pending_rooms} == {
+        "native",
+        "den",
+    }
+
+    asyncio.run(coordinator._async_maybe_start_next_room())
+    assert len(coordinator.started_rooms) == 1
+    assert coordinator.active_run.vacuum_only is True
+    _finish_active_room_successfully(coordinator)
+    assert len(coordinator.started_rooms) == 2
+    assert coordinator.active_run.vacuum_only is True
+    _finish_active_room_successfully(coordinator)
+
+    assert sorted(coordinator.started_rooms) == ["den", "native"]
+    assert coordinator.active_run is None
+    assert coordinator.session.active is True
+    assert coordinator.session.blocker_code == "mop.dock_tray_full"
+    assert coordinator.session.recovery_phase == "operator_required"
+    assert "washboard" in (coordinator.session.blocker_operator_action or "")
+
+    restored = logic.SessionState.from_dict(coordinator.session.to_dict())
+    assert restored.mop_hold_reason == tray_error
+
+
 def test_task_ack_then_dock_pause_uses_one_persisted_dock_stop(
     monkeypatch,
 ) -> None:
