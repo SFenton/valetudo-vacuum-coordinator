@@ -361,7 +361,7 @@ def test_manifest_and_runtime_versions_match() -> None:
     manifest = json.loads(
         (PACKAGE / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["version"] == const.VERSION == "0.3.6"
+    assert manifest["version"] == const.VERSION == "0.3.7"
 
 
 def test_legacy_and_structured_configs_split_without_changing_legacy_shape() -> None:
@@ -1319,7 +1319,12 @@ def test_optional_music_fallback_condition_is_source_labelled(monkeypatch) -> No
         ("cleaning", "idle", {"mode": "restricted", "reason": "vacuum_cleaning"}),
         ("paused", "idle", {"mode": "restricted", "reason": "vacuum_paused"}),
         ("returning", "idle", {"mode": "restricted", "reason": "vacuum_returning"}),
-        ("docked", "drying", {"mode": "restricted", "reason": "dock_drying"}),
+        ("docked", "drying", {"mode": "normal", "reason": None}),
+        ("docked", "pause", {"mode": "normal", "reason": None}),
+        ("idle", "paused", {"mode": "normal", "reason": None}),
+        ("docked", "cleaning", {"mode": "restricted", "reason": "dock_cleaning"}),
+        ("docked", "emptying", {"mode": "restricted", "reason": "dock_emptying"}),
+        ("docked", "error", {"mode": "restricted", "reason": "dock_error"}),
     ],
 )
 def test_command_policy_modes(monkeypatch, vacuum_state, dock_state, expected) -> None:

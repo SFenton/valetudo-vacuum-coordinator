@@ -2,7 +2,7 @@
 
 DOMAIN = "valetudo_vacuum_coordinator"
 NAME = "Valetudo Vacuum Coordinator"
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 
 PLATFORM_BINARY_SENSOR = "binary_sensor"
 PLATFORM_SENSOR = "sensor"

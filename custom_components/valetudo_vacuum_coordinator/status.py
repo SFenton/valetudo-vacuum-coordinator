@@ -32,7 +32,9 @@ _LOGGER = logging.getLogger(__name__)
 _CLEAR_ERROR_STATES = {"", "no error", "none", "ok"}
 _UNREADABLE_STATES = {"unknown", "unavailable"}
 _NORMAL_COMMAND_STATES = {"docked", "idle"}
-_BUSY_DOCK_STATES = {"cleaning", "drying", "emptying", "error", "pause", "paused"}
+# Drying and a latched pause leave the dock ready for a new command; retained
+# tasks and errors restrict commands through their own policy checks first.
+_BUSY_DOCK_STATES = {"cleaning", "emptying", "error"}
 _SOURCE_PRIORITY = {"derived": 0, "automation": 1, "coordinator": 2}
 
 _KNOWN_ISSUE_CODES = {

@@ -2325,6 +2325,46 @@ def test_resource_blockers_classify_safe_native_vacuum_continuation():
     assert real_error.vacuum_only_safe is False
 
 
+def test_dock_tray_full_is_a_vacuum_only_safe_physical_fix():
+    blocker = logic.classify_blocker(
+        logic.ResourceState(error="Mop Dock Tray full of water")
+    )
+
+    assert blocker is not None
+    assert blocker.code == "mop.dock_tray_full"
+    assert blocker.vacuum_only_safe is True
+    assert blocker.waiting_for_physical_fix is True
+    assert "washboard" in blocker.operator_action
+
+
+@pytest.mark.parametrize(
+    ("vacuum_state", "dock_status", "expected_code"),
+    [
+        ("docked", "pause", None),
+        ("charging", "pause", None),
+        ("idle", "pause", None),
+        ("returning", "pause", "dock.busy"),
+        ("cleaning", "pause", "dock.busy"),
+        ("docked", "cleaning", "dock.busy"),
+        ("docked", "emptying", "dock.busy"),
+        ("docked", "drying", None),
+    ],
+)
+def test_dock_pause_blocks_only_while_the_robot_is_away_from_an_idle_dock(
+    vacuum_state,
+    dock_status,
+    expected_code,
+):
+    blocker = logic.classify_blocker(
+        logic.ResourceState(error="No error"),
+        vacuum_state=vacuum_state,
+        dock_status=dock_status,
+        status_flag="none",
+    )
+
+    assert (blocker.code if blocker else None) == expected_code
+
+
 def test_floor_completion_evidence_separates_dock_fault_from_floor_work():
     room = logic.RoomConfig(
         room_id="dining",
