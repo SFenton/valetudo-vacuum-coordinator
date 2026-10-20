@@ -240,6 +240,31 @@ Valetudo robot errors, including clean-water faults, remain authoritative.
 Correlated whole-robot outages continue to use the bounded telemetry-outage
 recovery policy below.
 
+Version 0.3.8 fixes three away-session problems:
+
+- **Stranded after an unreachable room.** When a `Cannot reach target` stop
+  leaves the robot in `error` off the dock, the return request sent with the
+  stop can be dropped while the firmware raises the error. On each recheck the
+  coordinator now re-sends `return_to_base` at least 60 seconds apart, up to
+  two extra times. Once the robot docks with the error clear, the queue
+  continues with the next room and retries the unreachable room once at the
+  end. If the robot is still stranded after the retries, or the robot-validated
+  return is disabled, one "Needs Help" notification asks someone to dock it.
+- **False telemetry warnings.** The telemetry-outage deadline now clears when
+  coherent telemetry returns, so a later, unrelated gap gets its own recovery
+  window instead of inheriting an expired one.
+- **False iteration warnings.** With a status flag configured, a multi-pass
+  room is credited when Valetudo's native task finishes coherently at the dock
+  (flag `none`, nothing resumable), even if the robot did not report every pass.
+
+Version 0.3.8 also protects the mop dock from early departures. After the dock
+finishes washing or emptying, or the robot arrives at the dock, the
+coordinator waits `dock_settle` before sending the robot to the next room.
+In degraded (vacuum-only) preparation, it no longer stops an active dock mop
+wash. It only stops one that has run longer than 10 minutes. Valetudo has no
+setting that turns automatic mop washing off, so the coordinator lets each
+wash finish.
+
 Version 0.3.7 treats a dock `pause` as a stale latch, not a busy dock, when
 the robot is docked, charging, or idle, the status flag is `none`, and the
 error sensor is clear. Some docks keep reporting `pause` after a paused task
@@ -273,7 +298,8 @@ erased by the live entity registry advancing before handlers run. The
 coordinator retains ownership for `telemetry_outage_timeout`, requires a fresh
 coherent vacuum/error/status/dock/counter snapshot, and additionally requires
 the estimated segment to match before adopting a recovered cleaning task.
-Repeated gaps do not renew the original deadline. If recovery remains
+Repeated gaps within one outage do not renew the original deadline; after
+coherent recovery, a later independent outage gets a fresh window. If recovery remains
 unresolved or identifies a different room, the run is recorded as uncertain,
 its proven lower-bound work remains in structured outcome evidence, and a
 retained-task guard blocks duplicate dispatch until the robot task is
@@ -340,8 +366,13 @@ The session sensor exposes:
 - degraded dock-stop/mode attempts and acknowledgements;
 - `uncertain_rooms` and `uncertain_reasons`.
 
-Waiting and recovery notifications are deduplicated per blocker. A recovery
-notification is sent once when an alerted blocker clears.
+Notifications are reserved for problems someone has to fix, such as an
+empty clean-water tank, a full wastewater tank, a stranded robot, or a stuck
+task. Routine waits stay on the session sensor and are not sent. These include
+charging, dock servicing, telemetry gaps, mode-service retries, native resumes,
+and unreachable-room rechecks while return retries are pending. A help
+notification is sent once per blocker. A "Cleaning Resumed" notification
+follows only an alert that was sent.
 
 ## Dock Actions
 

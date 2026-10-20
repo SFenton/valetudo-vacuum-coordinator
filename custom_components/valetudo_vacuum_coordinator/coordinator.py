@@ -191,6 +191,18 @@ _MAX_TERMINAL_CLEANUP_RETRIES = 3
 _MAX_AUTOMATIC_DISPATCH_FAILURES = 3
 _VALIDATED_NAVIGATION_RETURN_ERRORS = {"cannot reach target"}
 _NAVIGATION_RETRY_LATER_POLICY = "navigation_retry_later"
+_DOCK_SERVICE_OVERRUN_SECONDS = 600
+_MAX_STRANDED_RETURN_RETRIES = 2
+_STRANDED_RETURN_MIN_INTERVAL_SECONDS = 60
+_ROUTINE_SILENT_BLOCKER_CODES = {"navigation.recoverable"}
+
+
+def _sentence(text: str) -> str:
+    """Return text as one capitalized sentence ending in a period."""
+    text = (text or "").strip().rstrip(".")
+    if not text:
+        return ""
+    return f"{text[0].upper()}{text[1:]}."
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +269,7 @@ class ValetudoVacuumCoordinator:
         self._blocked_session_watchdog_cancel: Callable[[], None] | None = None
         self._resource_settle_cancel: Callable[[], None] | None = None
         self._resource_settle_deadline: datetime | None = None
+        self._dock_service_activity_at: datetime | None = None
         self._resource_candidates: dict[str, dict[str, str]] = {}
         self._retained_task_timer_cancel: Callable[[], None] | None = None
         self._retained_task_timer_deadline: datetime | None = None
@@ -280,6 +293,10 @@ class ValetudoVacuumCoordinator:
     async def async_setup(self) -> None:
         """Load persisted state and attach listeners."""
         await self._async_load_store()
+        if self.session and self.session.active and not self.active_run:
+            # A dock wash may have been in progress while Home Assistant was
+            # down; give it one settle window before the next departure.
+            self._dock_service_activity_at = dt_util.utcnow()
         entities_to_watch = set(self.people_entities)
         for entity_id in self._configured_sensor_entities():
             if entity_id:
@@ -1693,6 +1710,7 @@ class ValetudoVacuumCoordinator:
         observation: _StateEventObservation,
     ) -> None:
         """Process one monitored state change while event handling is serialized."""
+        self._observe_dock_service_activity(observation)
         self._apply_state_event(observation)
         entity_id = observation.entity_id
         new_state = observation.new_state
@@ -2587,6 +2605,10 @@ class ValetudoVacuumCoordinator:
         run.telemetry_outage_previous_phase = None
         self._telemetry_outage_started_sequence = None
         run.telemetry_outage_unresolved = not recovered
+        if recovered:
+            # A coherent recovery closes this outage's budget; a later,
+            # independent MQTT drop gets its own full window.
+            run.telemetry_outage_deadline = None
         self._cancel_telemetry_outage_timeout()
         return previous_phase
 
@@ -4282,18 +4304,11 @@ class ValetudoVacuumCoordinator:
         if guard.operator_notification_sent:
             return
         try:
-            preserved = self.preserved_room_ids
             await self._async_send_notification(
-                f"{self.name.replace(' Coordinator', '')} · Action Needed",
+                f"{self._floor_name} · Needs Help",
                 (
-                    f"Automatic cleaning is waiting because {reason}. "
-                    "Clear the retained task or dock condition; the same "
-                    "away session will resume. "
-                    "No room command was sent. Recovery phase: "
-                    f"operator_required. Next check: {retry_at.isoformat()}. "
-                    f"Preserved rooms: {', '.join(preserved) or 'none'}. "
-                    f"Stop attempts: {guard.clear_attempts}; "
-                    f"dock-stop attempts: {guard.dock_clear_attempts}."
+                    f"Cleaning is paused because {reason}. Clear the stuck "
+                    "task or dock condition and cleaning will continue."
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -5297,8 +5312,19 @@ class ValetudoVacuumCoordinator:
                     blocker.operator_action,
                 )
             )
-        should_notify = (
-            session.last_recovery_notification_fingerprint != fingerprint
+        # Only interrupt people for problems they must fix.  Routine waits
+        # (charging, dock servicing, telemetry gaps, native resumes) resolve
+        # on their own and stay visible on the dashboard instead.
+        alert_worthy = bool(
+            (
+                blocker.waiting_for_physical_fix
+                or blocker.code == "dispatch.operator_required"
+            )
+            and blocker.code not in _ROUTINE_SILENT_BLOCKER_CODES
+        )
+        should_notify = bool(
+            alert_worthy
+            and session.last_recovery_notification_fingerprint != fingerprint
         )
         session.recovery_notification_fingerprint = fingerprint
         if should_notify:
@@ -5310,24 +5336,10 @@ class ValetudoVacuumCoordinator:
         if not should_notify:
             return
 
-        preserved = self.preserved_room_ids
-        retry_text = (
-            f" Next check: {session.next_retry_at}."
-            if session.next_retry_at
-            else ""
-        )
-        rooms_text = (
-            f" Preserved rooms: {', '.join(preserved)}."
-            if preserved
-            else ""
-        )
         try:
             await self._async_send_notification(
-                f"{self.name.replace(' Coordinator', '')} · Waiting",
-                (
-                    f"{blocker.reason}. {blocker.operator_action}"
-                    f" Recovery phase: {phase}.{retry_text}{rooms_text}"
-                ),
+                f"{self._floor_name} · Needs Help",
+                f"{_sentence(blocker.reason)} {blocker.operator_action}",
             )
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
@@ -5360,10 +5372,10 @@ class ValetudoVacuumCoordinator:
             return
         try:
             await self._async_send_notification(
-                f"{self.name.replace(' Coordinator', '')} · Resuming",
+                f"{self._floor_name} · Cleaning Resumed",
                 (
-                    f"Recovered from {recovered_reason or 'the prior blocker'}. "
-                    "Automatic cleaning is resuming the preserved away session."
+                    f"{_sentence(recovered_reason or 'The problem')[:-1]} is "
+                    "resolved, so cleaning is continuing."
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -5602,6 +5614,115 @@ class ValetudoVacuumCoordinator:
                 )
             )
 
+    async def _async_retry_stranded_navigation_return(self) -> None:
+        """Re-send return-to-base while an unreachable-room stop strands the robot.
+
+        The single return sent alongside the stop can be dropped while the
+        firmware is still raising the navigation error.  Without another
+        attempt the robot sits off the dock and the rest of the queue never
+        runs, so retry a bounded number of times before asking for help.
+        """
+        session = self.session
+        if (
+            not session
+            or not session.active
+            or self.active_run
+            or session.pending_recovery_policy != _NAVIGATION_RETRY_LATER_POLICY
+        ):
+            return
+        recovery = session.last_command_recovery
+        if (
+            recovery.get("room_id") != session.pending_recovery_room_id
+            or (normalize_state(recovery.get("reason")) or "").lower()
+            not in _VALIDATED_NAVIGATION_RETURN_ERRORS
+        ):
+            return
+        vacuum_state = normalize_state(self._state(self.vacuum_entity))
+        if vacuum_state not in {"error", "idle"}:
+            return
+        error = (normalize_state(self.error_state) or "").lower()
+        if vacuum_state == "error" and (
+            error not in _VALIDATED_NAVIGATION_RETURN_ERRORS
+        ):
+            return
+        if self.config.get(CONF_STATUS_FLAG_ENTITY) and (
+            normalize_state(self._status_flag())
+            in {"segment", "resumable", "unknown", "unavailable"}
+        ):
+            return
+        now = dt_util.utcnow()
+        retries = int(parse_float(recovery.get("stranded_return_retries")) or 0)
+        if (
+            not self.navigation_error_return_enabled
+            or retries >= _MAX_STRANDED_RETURN_RETRIES
+        ):
+            last_return = parse_datetime(
+                recovery.get("stranded_return_requested_at")
+            )
+            if recovery.get("stranded_notified_at") or (
+                last_return is not None
+                and (now - last_return).total_seconds()
+                < _STRANDED_RETURN_MIN_INTERVAL_SECONDS
+            ):
+                return
+            recovery["stranded_notified_at"] = now.isoformat()
+            await self._async_save_store()
+            room = self.room_by_id.get(session.pending_recovery_room_id)
+            room_name = room.name if room else "a room"
+            try:
+                await self._async_send_notification(
+                    f"{self._floor_name} · Needs Help",
+                    (
+                        f"The vacuum couldn't reach {room_name} and didn't "
+                        "make it back to the dock. Move it to the dock and "
+                        "cleaning will continue with the next room."
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Could not send stranded-robot notification for %s",
+                    self.name,
+                )
+            return
+        last_return = parse_datetime(
+            recovery.get("stranded_return_requested_at")
+            or recovery.get("return_requested_at")
+        )
+        if (
+            last_return is not None
+            and (now - last_return).total_seconds()
+            < _STRANDED_RETURN_MIN_INTERVAL_SECONDS
+        ):
+            return
+        recovery["stranded_return_retries"] = retries + 1
+        recovery["stranded_return_requested_at"] = now.isoformat()
+        await self._async_save_store()
+        _LOGGER.info(
+            "%s is still off the dock after an unreachable room; return "
+            "attempt %s of %s",
+            self.name,
+            retries + 1,
+            _MAX_STRANDED_RETURN_RETRIES,
+        )
+        try:
+            await self.hass.services.async_call(
+                "vacuum",
+                "return_to_base",
+                {ATTR_ENTITY_ID: self.vacuum_entity},
+                blocking=True,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Return-to-base retry for %s was not accepted",
+                self.vacuum_entity,
+                exc_info=True,
+            )
+
+    @property
+    def _floor_name(self) -> str:
+        """Return the household-facing name used in notifications."""
+        return self.name.replace(" Coordinator", "")
+
     def _navigation_error_return_allowed(
         self,
         run: ActiveRun,
@@ -5728,6 +5849,7 @@ class ValetudoVacuumCoordinator:
             self.session.pending_recovery_room_id
             and not await self._async_recover_pending_room_failure_if_ready()
         ):
+            await self._async_retry_stranded_navigation_return()
             await self._async_arm_blocked_session_watchdog(
                 self.session.pending_recovery_reason
                 or "waiting for recoverable room failure to clear"
@@ -5745,6 +5867,20 @@ class ValetudoVacuumCoordinator:
             return
 
         dispatch_held_room_ids = await self._async_reconcile_dispatch_failures()
+        if quiet_at := self._dock_quiet_deadline():
+            await self._async_arm_blocked_session_watchdog(
+                "the dock just finished servicing the robot",
+                blocker=BlockerClassification(
+                    "dock.settling",
+                    BLOCKER_RECOVERABLE,
+                    "dock",
+                    "the dock just finished servicing the robot",
+                    "No action is required.",
+                ),
+                retry_at=quiet_at,
+            )
+            self._notify_listeners()
+            return
         resources = self._resource_state()
         blocker = self._current_blocker(resources)
         degraded_reason = (
@@ -6312,6 +6448,15 @@ class ValetudoVacuumCoordinator:
         dock_status = normalize_state(
             self._state(self.config.get(CONF_DOCK_STATUS_ENTITY))
         )
+        if (
+            dock_status is not None
+            and dock_status.lower() in {"cleaning", "emptying"}
+            and not session.degraded_dock_stop_attempts
+            and not self._dock_service_overrun()
+        ):
+            # Let an active wash or empty finish; stopping it mid-cycle
+            # strands water in the tray.
+            return False
         dock_stop_needed = bool(
             identifier
             and dock_status is not None
@@ -6834,6 +6979,9 @@ class ValetudoVacuumCoordinator:
                 dock_status=self._state(
                     self.config.get(CONF_DOCK_STATUS_ENTITY)
                 ),
+                task_clear_confirms_iterations=bool(
+                    self.config.get(CONF_STATUS_FLAG_ENTITY)
+                ),
             )
         run.floor_completion_status = completion_evidence.status
         run.floor_completion_reason = completion_evidence.reason
@@ -7013,6 +7161,9 @@ class ValetudoVacuumCoordinator:
                 ),
                 dock_status=self._state(
                     self.config.get(CONF_DOCK_STATUS_ENTITY)
+                ),
+                task_clear_confirms_iterations=bool(
+                    self.config.get(CONF_STATUS_FLAG_ENTITY)
                 ),
             )
             if room
@@ -8261,6 +8412,66 @@ class ValetudoVacuumCoordinator:
     def _vacuum_ready_for_next_room(self) -> bool:
         """Return whether dispatching another segment is safe."""
         return self._vacuum_ready_for_selection(vacuum_only=False)
+
+    def _observe_dock_service_activity(
+        self,
+        observation: _StateEventObservation,
+    ) -> None:
+        """Remember when the dock last finished servicing or the robot docked.
+
+        Firmware washes the mop right after emptying, separated by a brief
+        ``idle`` blip.  Dispatching inside that window pulls the robot off a
+        wash in progress, which leaves water in the tray.
+        """
+        entity_id = observation.entity_id
+        new_state = observation.new_state
+        if (
+            new_state is None
+            or observation.superseded_at_receipt
+            or entity_id not in {
+                self.config.get(CONF_DOCK_STATUS_ENTITY),
+                self.vacuum_entity,
+            }
+        ):
+            return
+        previous = (normalize_state(self._state(entity_id)) or "").lower()
+        current = (normalize_state(new_state.state) or "").lower()
+        if previous == current:
+            return
+        if entity_id == self.vacuum_entity:
+            serviced = bool(
+                current in _AT_DOCK_VACUUM_STATES
+                and previous not in _AT_DOCK_VACUUM_STATES
+                and previous not in _UNAVAILABLE_TELEMETRY_STATES
+            )
+        else:
+            serviced = previous in {"cleaning", "emptying"} or (
+                current in {"cleaning", "emptying"}
+            )
+        if serviced:
+            self._dock_service_activity_at = dt_util.utcnow()
+
+    def _dock_quiet_deadline(self) -> datetime | None:
+        """Return when recent dock servicing will have settled, if pending."""
+        activity_at = getattr(self, "_dock_service_activity_at", None)
+        if activity_at is None:
+            return None
+        settle = max(
+            0,
+            int(self.config.get(CONF_DOCK_SETTLE, DEFAULT_DOCK_SETTLE)),
+        )
+        deadline = activity_at + timedelta(seconds=settle)
+        return deadline if dt_util.utcnow() < deadline else None
+
+    def _dock_service_overrun(self) -> bool:
+        """Return whether dock servicing has run far longer than a wash."""
+        state = self._state_object(self.config.get(CONF_DOCK_STATUS_ENTITY))
+        changed = getattr(state, "last_changed", None)
+        return bool(
+            isinstance(changed, datetime)
+            and (dt_util.utcnow() - changed).total_seconds()
+            >= _DOCK_SERVICE_OVERRUN_SECONDS
+        )
 
     def _vacuum_ready_for_selection(self, *, vacuum_only: bool) -> bool:
         """Return whether the current snapshot safely permits this mode."""
