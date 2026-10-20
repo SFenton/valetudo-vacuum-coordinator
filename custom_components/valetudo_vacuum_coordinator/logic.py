@@ -2165,7 +2165,7 @@ def build_auto_clean_summary(
             title=f"{vacuum_name} · Check Results",
             message=(
                 f"{completed_text} Completion could not be confirmed for "
-                f"{uncertain_text or 'one room'}; it was not blindly repeated."
+                f"{uncertain_text or 'one room'}; check whether it needs another pass."
             ),
         )
 
@@ -3177,8 +3177,14 @@ def evaluate_floor_completion_evidence(
     vacuum_state: str | None,
     status_flag: str | None,
     dock_status: str | None,
+    task_clear_confirms_iterations: bool = False,
 ) -> FloorCompletionEvidence:
-    """Evaluate floor work without letting later dock faults erase it."""
+    """Evaluate floor work without letting later dock faults erase it.
+
+    Firmware runs every requested pass inside one native task, so pass
+    transitions are often invisible.  When the caller has an authoritative
+    task flag, a coherent post-clean ``none`` proves the task ran to the end.
+    """
     success, reason = evaluate_run_success(
         room,
         run,
@@ -3237,18 +3243,6 @@ def evaluate_floor_completion_evidence(
             duration,
             area,
         )
-    observed_iterations = run.effective_observed_iteration_count
-    if observed_iterations < run.requested_iterations:
-        return FloorCompletionEvidence(
-            "uncertain",
-            (
-                f"Observed {observed_iterations} of "
-                f"{run.requested_iterations} requested iterations"
-            ),
-            duration,
-            area,
-        )
-
     normalized_vacuum = (normalize_state(vacuum_state) or "").lower()
     normalized_status = (normalize_state(status_flag) or "").lower()
     normalized_dock = (normalize_state(dock_status) or "").lower()
@@ -3261,11 +3255,29 @@ def evaluate_floor_completion_evidence(
         )
     )
     task_coherently_clear = normalized_status == "none"
-    if (
+    task_finished_coherently = bool(
         at_post_clean_surface
         and task_coherently_clear
         and not run.resume_required
+    )
+
+    observed_iterations = run.effective_observed_iteration_count
+    if observed_iterations < run.requested_iterations and not (
+        task_clear_confirms_iterations
+        and task_finished_coherently
+        and normalized_vacuum in {"docked", "charging", "idle"}
     ):
+        return FloorCompletionEvidence(
+            "uncertain",
+            (
+                f"Observed {observed_iterations} of "
+                f"{run.requested_iterations} requested iterations"
+            ),
+            duration,
+            area,
+        )
+
+    if task_finished_coherently:
         return FloorCompletionEvidence("completed", None, duration, area)
 
     return FloorCompletionEvidence(

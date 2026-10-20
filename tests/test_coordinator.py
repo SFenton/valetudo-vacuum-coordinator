@@ -1833,6 +1833,89 @@ def test_target_unreachable_recovery_preserves_and_retries_room_after_clear() ->
     )
 
 
+def _strand_after_unreachable_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_RecoverableFailureCoordinator, dict[str, datetime]]:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock["now"])
+    _confirm_active_room_started(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+    assert _service_names(coordinator).count("return_to_base") == 1
+    assert coordinator.session is not None
+    assert coordinator.session.pending_recovery_room_id == "room_one"
+    return coordinator, clock
+
+
+def _recheck_after(
+    coordinator: _RecoverableFailureCoordinator,
+    clock: dict[str, datetime],
+    seconds: int,
+) -> None:
+    clock["now"] += timedelta(seconds=seconds)
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+
+def test_stranded_robot_gets_bounded_return_retries_then_one_help_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock = _strand_after_unreachable_room(monkeypatch)
+
+    _recheck_after(coordinator, clock, 10)
+    assert _service_names(coordinator).count("return_to_base") == 1
+
+    _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 2
+    _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 3
+    assert "household" not in _service_names(coordinator)
+
+    for _ in range(3):
+        _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 3
+    notices = [
+        call["data"]
+        for call in coordinator.hass.services.calls
+        if call["service"] == "household"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["title"].endswith("Needs Help")
+    assert "Room One" in notices[0]["message"]
+    assert coordinator.started_rooms == []
+
+
+def test_stranded_return_retry_lets_queue_continue_once_docked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock = _strand_after_unreachable_room(monkeypatch)
+
+    _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 2
+
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+
+    assert coordinator.session.pending_recovery_room_id is None
+    assert coordinator.session.retry_room_ids == ["room_one"]
+    assert coordinator.started_rooms == ["room_two"]
+    assert _service_names(coordinator).count("return_to_base") == 2
+    assert "household" not in _service_names(coordinator)
+
+
+def test_stranded_return_retry_ignores_a_robot_that_is_moving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock = _strand_after_unreachable_room(monkeypatch)
+    coordinator.set_state(coordinator.vacuum_entity, "returning")
+
+    _recheck_after(coordinator, clock, 300)
+
+    assert _service_names(coordinator).count("return_to_base") == 1
+
+
 def test_navigation_recovery_return_is_shadow_safe_by_default() -> None:
     coordinator = _RecoverableFailureCoordinator()
     _confirm_active_room_started(coordinator)
@@ -1848,22 +1931,25 @@ def test_navigation_recovery_return_is_shadow_safe_by_default() -> None:
     assert "return_to_base" not in _service_names(coordinator)
 
 
-def test_navigation_recovery_notification_includes_retained_room() -> None:
+def test_stranded_navigation_notification_is_one_plain_help_request() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
     _confirm_active_room_started(coordinator)
 
     _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target ")
 
-    notification = next(
+    notifications = [
         call
         for call in coordinator.hass.services.calls
         if call["service"] == "household"
-    )
-    message = notification["data"]["message"]
-    assert "Preserved rooms:" in message
-    assert "room_one" in message
-    assert "room_two" in message
+    ]
+    assert len(notifications) == 1
+    assert notifications[0]["data"]["title"].endswith("Needs Help")
+    message = notifications[0]["data"]["message"]
+    assert "Room One" in message
+    for debug_text in ("Preserved rooms", "Recovery phase", "Next check", "telemetry"):
+        assert debug_text not in message
 
 
 @pytest.mark.parametrize(
@@ -3226,6 +3312,40 @@ def test_startup_honors_arrival_cancellation_opt_out() -> None:
     assert coordinator.hass.services.calls == []
 
 
+def test_restart_between_rooms_waits_one_dock_settle_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_DOCK_SETTLE] = const.DEFAULT_DOCK_SETTLE
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=True,
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock["now"])
+
+    async def keep_loaded_state() -> None:
+        return None
+
+    coordinator._async_load_store = keep_loaded_state
+    coordinator._unsubscribers = []
+    coordinator._listeners = []
+
+    asyncio.run(coordinator.async_setup())
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.blocker_code == "dock.settling"
+    assert "household" not in _service_names(coordinator)
+
+    clock["now"] += timedelta(seconds=const.DEFAULT_DOCK_SETTLE + 1)
+    asyncio.run(coordinator._async_maybe_start_next_room())
+
+    assert coordinator.started_rooms == ["room_one"]
+
+
 def test_startup_between_rooms_honors_arrival_cancellation_opt_out() -> None:
     coordinator = _RecoverableFailureCoordinator()
     coordinator.active_run = None
@@ -4245,6 +4365,92 @@ def test_normal_dispatch_works_without_status_flag_sensor() -> None:
     _handle_event(coordinator, "sensor.robot_battery", "100")
 
     assert coordinator.started_rooms == ["room_one"]
+
+
+def _emit_live_event(
+    coordinator: _RecoverableFailureCoordinator,
+    entity_id: str,
+    state: str,
+) -> None:
+    """Deliver an HA callback without pre-seeding the coordinator snapshot."""
+    observed = coordinator.hass.states.set(entity_id, state)
+    event_cls = sys.modules["homeassistant.core"].Event
+    asyncio.run(
+        coordinator._async_handle_state_change_event(
+            event_cls(entity_id, observed)
+        )
+    )
+
+
+@pytest.mark.parametrize("finished_service", ["cleaning", "emptying"])
+def test_dispatch_waits_for_dock_to_settle_after_mop_wash(
+    monkeypatch,
+    finished_service: str,
+) -> None:
+    clock = {"now": datetime(2026, 10, 19, 18, 0, tzinfo=UTC)}
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: clock["now"],
+    )
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_DOCK_SETTLE] = const.DEFAULT_DOCK_SETTLE
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_error", "No error")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_dock_status", finished_service)
+
+    _emit_live_event(coordinator, "sensor.robot_dock_status", "idle")
+
+    assert coordinator.started_rooms == []
+    assert coordinator.session.blocker_code == "dock.settling"
+    assert logic.parse_datetime(coordinator.session.next_retry_at) == (
+        clock["now"] + timedelta(seconds=const.DEFAULT_DOCK_SETTLE)
+    )
+
+    clock["now"] += timedelta(seconds=const.DEFAULT_DOCK_SETTLE - 1)
+    _emit_live_event(coordinator, "sensor.robot_battery", "99")
+    assert coordinator.started_rooms == []
+
+    clock["now"] += timedelta(seconds=1)
+    _emit_live_event(coordinator, "sensor.robot_battery", "98")
+    assert coordinator.started_rooms == ["room_one"]
+
+
+def test_degraded_preparation_lets_active_mop_wash_finish(monkeypatch) -> None:
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "utcnow",
+        lambda: clock["now"],
+    )
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_IDENTIFIER] = "robot"
+    coordinator.active_run = None
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        degraded_reason="Mop Dock Clean Water Tank empty",
+        degraded_at=logic.utcnow_iso(),
+    )
+    coordinator.set_state("sensor.robot_dock_status", "cleaning")
+
+    assert asyncio.run(coordinator._async_prepare_degraded_vacuuming()) is False
+    assert "dock_action" not in _service_names(coordinator)
+    assert coordinator.session.degraded_dock_stop_attempts == 0
+
+    clock["now"] += timedelta(
+        seconds=coordinator_module._DOCK_SERVICE_OVERRUN_SECONDS + 1
+    )
+    asyncio.run(coordinator._async_prepare_degraded_vacuuming())
+
+    assert _service_names(coordinator).count("dock_action") == 1
+    assert coordinator.session.degraded_dock_stop_attempts == 1
 
 
 def test_completion_works_without_optional_status_flag_sensor() -> None:
@@ -8295,15 +8501,13 @@ def test_gym_counter_reset_then_surpass_preserves_observed_work():
     coordinator.set_state("sensor.robot_dock_status", "idle")
     asyncio.run(coordinator._async_finish_active_run())
 
-    assert coordinator.ledgers["gym"].successful_count == 0
-    assert coordinator.session.completed_room_ids == []
-    assert coordinator.session.uncertain_room_ids == ["gym"]
+    # The native two-pass task cleared at the dock, so the single observed
+    # segment transition no longer withholds credit.
+    assert coordinator.ledgers["gym"].successful_count == 1
+    assert coordinator.session.completed_room_ids == ["gym"]
+    assert coordinator.session.uncertain_room_ids == []
     projection = coordinator.while_away_outcome_contract["rooms"][0]
-    assert projection["status"] == "uncertain"
-    assert projection["credit"]["status"] == "none"
-    assert projection["latest_attempt"]["reason"]["code"] == (
-        "verification.iterations_incomplete"
-    )
+    assert projection["status"] == "completed"
     assert projection["latest_attempt"]["evidence"]["duration"] == {
         "status": "passed",
         "observed": 1500,
@@ -8341,8 +8545,9 @@ def test_office_outage_recovers_same_task_without_duplicate_dispatch():
 
     assert coordinator.active_run is run
     assert run.phase == logic.RUN_PHASE_CLEANING
+    assert deadline is not None
     assert run.telemetry_outage_count == 1
-    assert run.telemetry_outage_deadline == deadline
+    assert run.telemetry_outage_deadline is None
     assert run.time_measurement_uncertain is True
     assert run.area_measurement_uncertain is True
     assert coordinator.session.blocker_code is None
@@ -8463,7 +8668,7 @@ def test_registry_ahead_reconnect_burst_preserves_same_owned_run(
     assert coordinator._event_drain_scheduled is False
 
 
-def test_office_recovery_keeps_one_of_two_passes_uncertain():
+def test_office_recovery_credits_native_two_pass_task_cleared_at_dock():
     coordinator = _prepare_telemetry_outage_run()
     _enter_correlated_telemetry_outage(coordinator)
     _recover_telemetry_outage(coordinator)
@@ -8475,20 +8680,35 @@ def test_office_recovery_keeps_one_of_two_passes_uncertain():
     coordinator.set_state("sensor.robot_dock_status", "idle")
     asyncio.run(coordinator._async_finish_active_run())
 
-    assert coordinator.ledgers["room_one"].successful_count == 0
-    assert coordinator.session.completed_room_ids == []
-    assert coordinator.session.uncertain_room_ids == ["room_one"]
+    assert coordinator.ledgers["room_one"].successful_count == 1
+    assert coordinator.session.completed_room_ids == ["room_one"]
+    assert coordinator.session.uncertain_room_ids == []
     projection = coordinator.while_away_outcome_contract["rooms"][0]
-    attempt = projection["latest_attempt"]
-    assert attempt["reason"]["code"] == "verification.iterations_incomplete"
-    assert attempt["evidence"]["physical_work"]["status"] == "substantial"
-    assert attempt["evidence"]["duration"]["status"] == "passed_lower_bound"
-    assert attempt["evidence"]["iterations"] == {
-        "status": "unverified",
-        "requested": 2,
-        "observed": 1,
-    }
-    assert projection["credit"]["status"] == "none"
+    assert projection["status"] == "completed"
+
+
+def test_office_two_pass_task_still_resumable_at_dock_stays_uncertain():
+    coordinator = _prepare_telemetry_outage_run()
+    _enter_correlated_telemetry_outage(coordinator)
+    _recover_telemetry_outage(coordinator)
+    assert coordinator.active_run is not None
+
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "resumable")
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    evidence = logic.evaluate_floor_completion_evidence(
+        coordinator.active_room,
+        coordinator.active_run,
+        end_area=180,
+        end_time=1500,
+        vacuum_state="docked",
+        status_flag="resumable",
+        dock_status="idle",
+        task_clear_confirms_iterations=True,
+    )
+
+    assert evidence.status == "uncertain"
+    assert evidence.reason == "Observed 1 of 2 requested iterations"
 
 
 def test_office_recovery_credits_only_after_second_pass_is_observed():
@@ -8670,17 +8890,24 @@ def test_operator_cancellation_takes_precedence_during_telemetry_gap():
     assert coordinator.started_rooms == []
 
 
-def test_repeated_telemetry_gap_does_not_renew_recovery_budget():
+def test_later_independent_telemetry_gap_gets_fresh_recovery_window():
     coordinator = _prepare_telemetry_outage_run()
     run = _enter_correlated_telemetry_outage(coordinator)
-    first_deadline = run.telemetry_outage_deadline
+    # Leave only a sliver of the first outage's budget before it recovers.
+    run.telemetry_outage_deadline = (
+        datetime.now(UTC) + timedelta(seconds=2)
+    ).isoformat()
     _recover_telemetry_outage(coordinator)
+    assert run.phase == logic.RUN_PHASE_CLEANING
+    assert run.telemetry_outage_deadline is None
 
     _enter_correlated_telemetry_outage(coordinator)
 
     assert coordinator.active_run is run
     assert run.telemetry_outage_count == 2
-    assert run.telemetry_outage_deadline == first_deadline
+    assert logic.parse_datetime(run.telemetry_outage_deadline) > (
+        datetime.now(UTC) + timedelta(seconds=200)
+    )
 
 
 def test_restored_telemetry_gap_keeps_run_ownership_until_recovery():
@@ -9025,7 +9252,7 @@ def test_explicit_unrecoverable_error_terminalizes_without_auto_resume():
     assert _service_names(coordinator).count("stop") == 1
 
 
-def test_battery_ticks_send_one_waiting_and_one_recovery_notice():
+def test_battery_charging_wait_stays_silent_and_resumes_quietly():
     coordinator = _RecoverableFailureCoordinator()
     coordinator.active_run = None
     coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
@@ -9041,13 +9268,13 @@ def test_battery_ticks_send_one_waiting_and_one_recovery_notice():
     for battery in ("20", "21", "22", "23"):
         _handle_event(coordinator, "sensor.robot_battery", battery)
 
-    assert _service_names(coordinator).count("household") == 1
+    assert _service_names(coordinator).count("household") == 0
     assert coordinator.session.blocker_code == "power.charging"
     assert coordinator.session.blocked_reason == "battery is 23%, below 40%"
 
     _handle_event(coordinator, "sensor.robot_battery", "100")
 
-    assert _service_names(coordinator).count("household") == 2
+    assert _service_names(coordinator).count("household") == 0
     assert coordinator.started_rooms == ["room_one"]
     assert coordinator.session.blocker_code is None
 
@@ -9061,15 +9288,15 @@ def test_same_blocker_notifies_again_after_a_genuine_clear():
         started_at=logic.utcnow_iso(),
     )
 
-    for battery in (20, 21):
+    for level in ("full", "Full"):
         blocker = logic.classify_blocker(
-            logic.ResourceState(),
+            logic.ResourceState(dirty_water=level),
             vacuum_state="docked",
             dock_status="idle",
             status_flag="none",
-            battery=battery,
-            minimum_battery=40,
         )
+        assert blocker is not None
+        assert blocker.waiting_for_physical_fix
         assert blocker is not None
         asyncio.run(
             coordinator._async_enter_recoverable_wait(
@@ -9083,14 +9310,12 @@ def test_same_blocker_notifies_again_after_a_genuine_clear():
     asyncio.run(coordinator._async_clear_recoverable_wait())
     assert _service_names(coordinator).count("household") == 2
 
-    for battery in (22, 23):
+    for level in ("full", "Full"):
         blocker = logic.classify_blocker(
-            logic.ResourceState(),
+            logic.ResourceState(dirty_water=level),
             vacuum_state="docked",
             dock_status="idle",
             status_flag="none",
-            battery=battery,
-            minimum_battery=40,
         )
         assert blocker is not None
         asyncio.run(
@@ -9172,12 +9397,13 @@ def test_v020_terminal_migration_resets_notice_and_settings_lifecycle():
     assert coordinator.settings_snapshot is not None
     assert coordinator.settings_snapshot.mode == "vacuum_and_mop"
     assert coordinator.started_rooms == []
-    assert _service_names(coordinator).count("household") == 1
+    assert coordinator.session.blocker_code == "power.charging"
+    assert _service_names(coordinator).count("household") == 0
 
     _handle_event(coordinator, "sensor.robot_battery", "100")
 
     assert coordinator.started_rooms == ["room_one"]
-    assert _service_names(coordinator).count("household") == 2
+    assert _service_names(coordinator).count("household") == 0
 
     _finish_active_room_successfully(coordinator)
 
@@ -9362,7 +9588,13 @@ def test_degraded_mode_retries_after_more_than_three_failures():
     assert coordinator.active_run is not None
     assert coordinator.active_run.room_id == "native"
     assert coordinator.session.degraded_mode_attempts == 5
-    assert _service_names(coordinator).count("household") == 2
+    notices = [
+        call["data"]["message"]
+        for call in coordinator.hass.services.calls
+        if call["service"] == "household"
+    ]
+    assert len(notices) == 1
+    assert notices[0].startswith("Mop Dock Clean Water Tank empty.")
 
 
 @pytest.mark.parametrize(
