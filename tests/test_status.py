@@ -361,7 +361,7 @@ def test_manifest_and_runtime_versions_match() -> None:
     manifest = json.loads(
         (PACKAGE / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["version"] == const.VERSION == "0.3.8"
+    assert manifest["version"] == const.VERSION == "0.3.9"
 
 
 def test_legacy_and_structured_configs_split_without_changing_legacy_shape() -> None:
@@ -1384,3 +1384,55 @@ def test_typed_recorder_backfill_can_be_loaded_only_as_history(monkeypatch) -> N
         "provenance": "recorder_backfill",
         "cleared_at": None,
     }
+
+
+def test_stranded_condition_projects_and_restricts_then_clears(monkeypatch) -> None:
+    stranded_entity = "binary_sensor.main_floor_vacuum_coordinator_stranded"
+    config = observer_mapping(
+        "main_floor",
+        conditions=[
+            {
+                "entity_id": stranded_entity,
+                "code": "navigation.stranded",
+                "source": "coordinator",
+                "active_states": ["on"],
+            }
+        ],
+    )
+    harness = _Harness(monkeypatch, config=config)
+    harness.set_healthy("idle")
+    run(harness.setup())
+    assert harness.observer.contract["active_conditions"] == []
+    assert harness.observer.contract["command_policy"]["mode"] == "normal"
+
+    run(harness.update(stranded_entity, "on"))
+    contract = harness.observer.contract
+    assert [c["code"] for c in contract["active_conditions"]] == ["navigation.stranded"]
+    assert contract["active_conditions"][0]["source"] == "coordinator"
+    assert contract["command_policy"] == {
+        "mode": "restricted",
+        "reason": "navigation.stranded",
+    }
+
+    run(harness.update(stranded_entity, "off"))
+    contract = harness.observer.contract
+    assert contract["active_conditions"] == []
+    assert contract["command_policy"] == {"mode": "normal", "reason": None}
+
+
+def test_last_issue_is_latched_only_by_a_confirmed_outage(monkeypatch) -> None:
+    """A present issue that merely clears stays out of last_issue by design.
+
+    ``last_issue`` is documented as the issue latched by a confirmed outage; the
+    observer never copies a cleared current issue into it.
+    """
+    harness = _Harness(monkeypatch)
+    harness.set_healthy("idle")
+    run(harness.setup())
+    harness.hass.states.set(harness.config.vacuum_entity, "error")
+    run(harness.update(harness.config.error_entity, "Cannot reach target"))
+    assert harness.observer.contract["current_issue"]["status"] == "present"
+    run(harness.update(harness.config.error_entity, "No error"))
+    contract = harness.observer.contract
+    assert contract["current_issue"] == {"status": "clear"}
+    assert contract["last_issue"] is None

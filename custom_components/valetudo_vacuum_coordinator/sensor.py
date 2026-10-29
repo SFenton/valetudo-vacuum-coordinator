@@ -294,6 +294,8 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             "last_command_recovery": (
                 session.last_command_recovery if session else {}
             ),
+            "stranded": self.coordinator.is_stranded,
+            "stranded_details": self.coordinator.stranded_attributes,
             ATTR_WHILE_AWAY_CLEANED: self.coordinator.while_away_cleaned_messages,
             ATTR_WHILE_AWAY_ISSUES: self.coordinator.while_away_issue_messages,
             ATTR_WHILE_AWAY_OUTCOMES: self.coordinator.while_away_outcome_contract,

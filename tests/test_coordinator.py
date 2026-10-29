@@ -9899,3 +9899,166 @@ def test_auto_clean_binary_sensor_exposes_public_preserved_rooms():
         "room_one",
         "room_two",
     ]
+
+
+def _strand_after_uncertain_unreachable_room(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    store: _MemoryStore | None = None,
+) -> tuple[_RecoverableFailureCoordinator, dict[str, datetime]]:
+    """Replay the 2026-10-28 incident: 1 of 2 passes seen, then unreachable."""
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    coordinator.config[const.CONF_AUTO_CLEAN_ITERATIONS] = 2
+    if store is not None:
+        coordinator._store = store
+
+        async def save() -> None:
+            await store.async_save(
+                {"stranded": dict(coordinator.stranded) if coordinator.stranded else None}
+            )
+
+        coordinator._async_save_store = save
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock["now"])
+    _confirm_active_room_started(coordinator)
+    coordinator.active_run.requested_iterations = 2
+    coordinator.active_run.observed_iteration_count = 1
+    coordinator.active_run.observed_segment_cleaning = True
+    for room in coordinator.rooms:
+        room.min_duration = 0
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    _handle_event(coordinator, "sensor.robot_error", "Cannot reach target")
+    return coordinator, clock
+
+
+def test_uncertain_evidence_navigation_failure_still_returns_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _clock = _strand_after_uncertain_unreachable_room(monkeypatch)
+
+    session = coordinator.session
+    assert session is not None
+    assert _service_names(coordinator).count("stop") == 1
+    assert _service_names(coordinator).count("return_to_base") == 1
+    recovery = session.last_command_recovery
+    assert recovery["outcome"] == "uncertain"
+    assert recovery["reason"].startswith("Observed 1 of 2 requested iterations")
+    assert recovery["error"] == "Cannot reach target"
+    assert recovery["return_attempts"] == 1
+    assert session.pending_recovery_room_id == "room_one"
+    assert session.pending_recovery_policy == "navigation_retry_later"
+    assert "room_one" in session.uncertain_room_ids
+    assert coordinator.is_stranded is True
+    details = coordinator.stranded_attributes
+    assert details["room_id"] == "room_one"
+    assert details["room_name"] == "Room One"
+    assert details["error"] == "Cannot reach target"
+    assert details["return_attempts"] == 1
+    assert details["since"]
+
+    # The stop turns the robot idle and the error clears; no second return.
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "idle")
+    assert _service_names(coordinator).count("return_to_base") == 1
+    assert coordinator.is_stranded is True
+
+
+def test_uncertain_stranded_robot_gets_bounded_retries_then_help(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock = _strand_after_uncertain_unreachable_room(monkeypatch)
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "idle")
+
+    _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 2
+    _recheck_after(coordinator, clock, 300)
+    assert _service_names(coordinator).count("return_to_base") == 3
+    for _ in range(3):
+        _recheck_after(coordinator, clock, 300)
+
+    assert _service_names(coordinator).count("return_to_base") == 3
+    notices = [
+        call["data"]
+        for call in coordinator.hass.services.calls
+        if call["service"] == "household"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["title"].endswith("Needs Help")
+    assert coordinator.is_stranded is True
+    assert coordinator.stranded_attributes["return_attempts"] == 3
+
+
+def test_stranded_flag_survives_session_end_and_clears_only_when_docked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _clock = _strand_after_uncertain_unreachable_room(monkeypatch)
+    coordinator.set_state("sensor.robot_error", "No error")
+    _handle_event(coordinator, coordinator.vacuum_entity, "idle")
+
+    coordinator.session.active = False
+    coordinator.session.pending_recovery_room_id = None
+    coordinator.session.pending_recovery_policy = None
+    _handle_event(coordinator, coordinator.vacuum_entity, "returning")
+    assert coordinator.is_stranded is True
+
+    _handle_event(coordinator, coordinator.vacuum_entity, "docked")
+    assert coordinator.is_stranded is False
+    assert coordinator.stranded_attributes["room_id"] is None
+
+
+def test_stranded_flag_clears_when_a_new_run_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _clock = _strand_after_uncertain_unreachable_room(monkeypatch)
+    assert coordinator.is_stranded is True
+    coordinator._clear_stranded()
+    assert coordinator.is_stranded is False
+    coordinator.active_run = None
+    assert coordinator._start_manual_run(datetime.now(UTC)) is True
+    assert coordinator.is_stranded is False
+
+
+def test_stranded_flag_survives_store_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _MemoryStore()
+    coordinator, _clock = _strand_after_uncertain_unreachable_room(
+        monkeypatch, store=store
+    )
+    asyncio.run(coordinator._async_save_store())
+    assert store.data["stranded"]["room_id"] == "room_one"
+
+    restored = _RecoverableFailureCoordinator()
+    restored._store = _MemoryStore({"stranded": store.data["stranded"]})
+    restored.set_state(restored.vacuum_entity, "idle")
+    asyncio.run(restored._async_load_store())
+    assert restored.is_stranded is True
+    assert restored.stranded_attributes["error"] == "Cannot reach target"
+
+    docked = _RecoverableFailureCoordinator()
+    docked._store = _MemoryStore({"stranded": store.data["stranded"]})
+    docked.set_state(docked.vacuum_entity, "docked")
+    asyncio.run(docked._async_load_store())
+    assert docked.is_stranded is False
+
+
+def test_uncertain_evidence_without_validated_error_is_not_navigation_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_NAVIGATION_ERROR_RETURN_ENABLED] = True
+    coordinator.config[const.CONF_AUTO_CLEAN_ITERATIONS] = 2
+    _confirm_active_room_started(coordinator)
+    coordinator.active_run.requested_iterations = 2
+    coordinator.active_run.observed_iteration_count = 1
+    coordinator.active_run.observed_segment_cleaning = True
+    for room in coordinator.rooms:
+        room.min_duration = 0
+    coordinator.set_state(coordinator.vacuum_entity, "error")
+    _handle_event(coordinator, "sensor.robot_error", "Robot stuck or trapped")
+
+    assert coordinator.session.pending_recovery_policy is None
+    assert coordinator.is_stranded is False

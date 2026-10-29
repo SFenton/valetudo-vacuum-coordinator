@@ -14,6 +14,13 @@ valetudo_vacuum_coordinator:
           source: coordinator
           active_states:
             - "on"
+        # On while the coordinator left the robot off the dock after a
+        # navigation failure; clears only when the robot docks.
+        - entity_id: binary_sensor.main_floor_vacuum_coordinator_stranded
+          code: navigation.stranded
+          source: coordinator
+          active_states:
+            - "on"
 
     - id: music_room
       name: Music Room Vacuum

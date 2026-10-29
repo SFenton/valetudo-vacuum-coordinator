@@ -27,6 +27,7 @@ async def async_setup_platform(
         ValetudoPauseBinarySensor(coordinator),
         ValetudoAutoCleaningBinarySensor(coordinator),
         ValetudoNativeResumePendingBinarySensor(coordinator),
+        ValetudoStrandedBinarySensor(coordinator),
     ])
 
 
@@ -111,3 +112,23 @@ class ValetudoNativeResumePendingBinarySensor(
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return retained-task recovery details."""
         return self.coordinator.native_resume_attributes
+
+
+class ValetudoStrandedBinarySensor(ValetudoCoordinatorEntity, BinarySensorEntity):
+    """On while the robot was left off the dock after a navigation failure."""
+
+    _attr_icon = "mdi:robot-vacuum-alert"
+
+    def __init__(self, coordinator) -> None:
+        """Initialize the stranded-robot sensor."""
+        super().__init__(coordinator, "stranded", "Stranded")
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether the robot is stranded off the dock."""
+        return self.coordinator.is_stranded
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the stranded room, error and return attempts."""
+        return self.coordinator.stranded_attributes

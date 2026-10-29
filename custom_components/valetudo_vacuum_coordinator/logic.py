@@ -320,6 +320,7 @@ class ActiveRun:
     telemetry_outage_unresolved: bool = False
     cancel_requested_at: str | None = None
     cancel_reason: str | None = None
+    cancel_raw_error: str | None = None
     cancel_stop_attempted: bool = False
     cancel_stop_attempts: int = 0
     cancel_stop_requested_at: str | None = None
@@ -728,6 +729,7 @@ class ActiveRun:
             cancel_requeue_room=cancel_requeue_room,
             cancel_recover_room=cancel_recover_room,
             cancel_outcome_result=data.get("cancel_outcome_result"),
+            cancel_raw_error=data.get("cancel_raw_error"),
             floor_completion_status=data.get("floor_completion_status"),
             floor_completion_reason=data.get("floor_completion_reason"),
             floor_completion_duration=parse_float(
@@ -841,6 +843,7 @@ class ActiveRun:
             "cancel_requeue_room": self.cancel_requeue_room,
             "cancel_recover_room": self.cancel_recover_room,
             "cancel_outcome_result": self.cancel_outcome_result,
+            "cancel_raw_error": self.cancel_raw_error,
             "floor_completion_status": self.floor_completion_status,
             "floor_completion_reason": self.floor_completion_reason,
             "floor_completion_duration": self.floor_completion_duration,
