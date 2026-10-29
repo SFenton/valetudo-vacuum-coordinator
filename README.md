@@ -126,7 +126,15 @@ valetudo_vacuum_coordinator:
           source: coordinator
           active_states:
             - "on"
+        - entity_id: binary_sensor.downstairs_vacuum_stranded
+          code: navigation.stranded
+          source: coordinator
+          active_states:
+            - "on"
 ```
+
+The `stranded` binary sensor (see Entities) projects into the contract as the
+`navigation.stranded` active condition, which also restricts `command_policy`.
 
 Do not mix legacy coordinator keys such as `vacuum_entity`, `people`,
 `segment_command_topic`, or `rooms` beside `status_observers`. Move the
@@ -194,6 +202,7 @@ field or status-observer service.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
 - Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
 - Native-resume-pending binary sensor: read-only guard that stays on while a retained Valetudo task is interrupted or suspended. Use it to block manual/startup command loops.
+- Stranded binary sensor: on from the moment the coordinator stops the robot off the dock after a navigation failure (for example `Cannot reach target`) until the robot is observed docked or a new cleaning run starts. It survives the session ending and Home Assistant restarts, and exposes `room_id`, `room_name`, `since`, `error` and `return_attempts`. The session sensor repeats these as `stranded` and `stranded_details`.
 - Session sensors: state, current room, actionable queue, fallback-vacuumed rooms, deferred full-clean rooms, typed blocker disposition, recovery phase/deadline, preserved rooms, command acknowledgements, and uncertain floor outcomes.
 - Per-room sensors: last successful clean, last vacuumed, last fallback-vacuumed, last mopped, and successful clean count.
 
@@ -239,6 +248,17 @@ use `resource_settle` and retain their existing degraded vacuum-only behavior.
 Valetudo robot errors, including clean-water faults, remain authoritative.
 Correlated whole-robot outages continue to use the bounded telemetry-outage
 recovery policy below.
+
+Version 0.3.9 fixes a stranded robot that went unnoticed. When a room was
+only partly observed (for example 1 of 2 passes) and then hit `Cannot reach
+target`, the evidence was `uncertain`, so the coordinator stopped the robot but
+never sent `return_to_base` or armed the stranded retries, and the robot sat
+off the dock. A validated navigation error now starts the navigation recovery
+for `uncertain` evidence too (the attempt is still recorded as uncertain), the
+return gate checks the robot's raw error rather than the composite reason, and
+the new `stranded` binary sensor stays on until the robot docks. `last_issue`
+is unchanged: by design it latches an issue only across a confirmed
+unavailability, not when an issue merely clears.
 
 Version 0.3.8 fixes three away-session problems:
 

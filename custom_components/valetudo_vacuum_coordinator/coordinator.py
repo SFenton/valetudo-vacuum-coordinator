@@ -218,6 +218,10 @@ class _StateEventObservation:
 class ValetudoVacuumCoordinator:
     """Coordinate away-only room cleaning for one Valetudo vacuum."""
 
+    # Coordinator-owned "robot left off the dock after a navigation failure"
+    # latch.  It outlives the session and clears only on docking or a new run.
+    stranded: dict[str, Any] | None = None
+
     def __init__(
         self,
         *,
@@ -1352,6 +1356,14 @@ class ValetudoVacuumCoordinator:
             if self.session:
                 if run.cancel_continue_session and run.cancel_outcome_result == "uncertain":
                     self.session.mark_uncertain(run.room_id, reason)
+                    if run.cancel_recover_room:
+                        # A navigation failure strands the robot even when the
+                        # floor evidence is ambiguous; keep the recovery.
+                        self.session.begin_recovering(
+                            run.room_id,
+                            reason,
+                            policy=_NAVIGATION_RETRY_LATER_POLICY,
+                        )
                     self._record_attempt_outcome(
                         kind="failed",
                         run=run,
@@ -1415,6 +1427,7 @@ class ValetudoVacuumCoordinator:
             self.session.last_command_recovery = {
                 "room_id": run.room_id,
                 "reason": reason,
+                "error": run.cancel_raw_error,
                 "command_publish_requested_at": (
                     run.command_publish_requested_at
                 ),
@@ -1465,6 +1478,16 @@ class ValetudoVacuumCoordinator:
                     )
                 ),
             }
+        if (
+            run.cancel_recover_room
+            and run.room_id
+            and vacuum_state not in _AT_DOCK_VACUUM_STATES
+        ):
+            self._latch_stranded(
+                run.room_id,
+                run.cancel_raw_error or reason,
+                run.cancel_return_attempts,
+            )
         self._clear_active_run()
         if self.session and self.session.last_command_recovery:
             self.session.last_command_recovery["next_candidate_room"] = (
@@ -1716,6 +1739,15 @@ class ValetudoVacuumCoordinator:
         new_state = observation.new_state
         if new_state is None or observation.superseded_at_receipt:
             return
+        if (
+            self.stranded
+            and entity_id == self.vacuum_entity
+            and (normalize_state(new_state.state) or "").lower()
+            in _AT_DOCK_VACUUM_STATES
+        ):
+            self._clear_stranded()
+            await self._async_save_store()
+            self._notify_listeners()
 
         if self.session and self.session.native_guard_cancel_pending:
             completed = await self._async_execute_native_guard_cancel_pending()
@@ -5633,7 +5665,10 @@ class ValetudoVacuumCoordinator:
         recovery = session.last_command_recovery
         if (
             recovery.get("room_id") != session.pending_recovery_room_id
-            or (normalize_state(recovery.get("reason")) or "").lower()
+            or (
+                normalize_state(recovery.get("error") or recovery.get("reason"))
+                or ""
+            ).lower()
             not in _VALIDATED_NAVIGATION_RETURN_ERRORS
         ):
             return
@@ -5652,6 +5687,12 @@ class ValetudoVacuumCoordinator:
             return
         now = dt_util.utcnow()
         retries = int(parse_float(recovery.get("stranded_return_retries")) or 0)
+        if self._latch_stranded(
+            session.pending_recovery_room_id,
+            recovery.get("error") or recovery.get("reason"),
+            int(recovery.get("return_attempts") or 0) + retries,
+        ):
+            await self._async_save_store()
         if (
             not self.navigation_error_return_enabled
             or retries >= _MAX_STRANDED_RETURN_RETRIES
@@ -5696,6 +5737,11 @@ class ValetudoVacuumCoordinator:
             return
         recovery["stranded_return_retries"] = retries + 1
         recovery["stranded_return_requested_at"] = now.isoformat()
+        self._latch_stranded(
+            session.pending_recovery_room_id,
+            None,
+            int(recovery.get("return_attempts") or 0) + retries + 1,
+        )
         await self._async_save_store()
         _LOGGER.info(
             "%s is still off the dock after an unreachable room; return "
@@ -5723,6 +5769,55 @@ class ValetudoVacuumCoordinator:
         """Return the household-facing name used in notifications."""
         return self.name.replace(" Coordinator", "")
 
+    @property
+    def stranded_attributes(self) -> dict[str, Any]:
+        """Return the stranded-robot details exposed to entities."""
+        stranded = self.stranded or {}
+        room_id = stranded.get("room_id")
+        room = self.room_by_id.get(room_id) if room_id else None
+        return {
+            "room_id": room_id,
+            "room_name": room.name if room else stranded.get("room_name"),
+            "since": stranded.get("since"),
+            "error": stranded.get("error"),
+            "return_attempts": int(stranded.get("return_attempts") or 0),
+        }
+
+    @property
+    def is_stranded(self) -> bool:
+        """Return whether the robot was left off the dock after a navigation failure."""
+        return bool(self.stranded)
+
+    def _latch_stranded(
+        self,
+        room_id: str | None,
+        error: str | None,
+        return_attempts: int,
+    ) -> bool:
+        """Latch (or refresh) the stranded flag; return whether it changed."""
+        previous = dict(self.stranded) if self.stranded else None
+        current = dict(previous or {})
+        if not current:
+            current["since"] = utcnow_iso()
+        if room_id:
+            current["room_id"] = room_id
+            room = self.room_by_id.get(room_id)
+            current["room_name"] = room.name if room else None
+        if error:
+            current["error"] = error
+        current["return_attempts"] = max(
+            int(current.get("return_attempts") or 0), return_attempts
+        )
+        self.stranded = current
+        return current != previous
+
+    def _clear_stranded(self) -> bool:
+        """Clear the stranded flag; return whether it was set."""
+        if not self.stranded:
+            return False
+        self.stranded = None
+        return True
+
     def _navigation_error_return_allowed(
         self,
         run: ActiveRun,
@@ -5741,7 +5836,10 @@ class ValetudoVacuumCoordinator:
             and run.cancel_return_attempts == 0
             and run.cancel_stop_acknowledged_at
             and vacuum_state == "error"
-            and (normalize_state(run.cancel_reason) or "").lower()
+            and (
+                normalize_state(run.cancel_raw_error or run.cancel_reason)
+                or ""
+            ).lower()
             in _VALIDATED_NAVIGATION_RETURN_ERRORS
             and (normalize_state(self.error_state) or "").lower()
             in _VALIDATED_NAVIGATION_RETURN_ERRORS
@@ -6697,6 +6795,7 @@ class ValetudoVacuumCoordinator:
             self.config.get(CONF_AUTO_CLEAN_ITERATIONS, 2)
         )
         session.active_room_id = room.room_id
+        self._clear_stranded()
         run = ActiveRun(
             room_id=room.room_id,
             segment_id=room.segment_id,
@@ -7211,6 +7310,10 @@ class ValetudoVacuumCoordinator:
             else blocker.reason
         )
         run.cancel_continue_session = blocker.recoverable
+        run.cancel_raw_error = error
+        raw_error_validated = (
+            normalize_state(error) or ""
+        ).lower() in _VALIDATED_NAVIGATION_RETURN_ERRORS
         navigation_room_failure = bool(
             blocker.code == "navigation.recoverable"
             and run.room_id
@@ -7219,7 +7322,11 @@ class ValetudoVacuumCoordinator:
             and not run.fallback_vacuum
             and not run.dispatch_failure_code
             and run.confirmed_room_start
-            and (evidence is None or evidence.status == "incomplete")
+            and (
+                evidence is None
+                or evidence.status == "incomplete"
+                or (evidence.status == "uncertain" and raw_error_validated)
+            )
         )
         if (
             blocker.code == "navigation.recoverable"
@@ -7993,6 +8100,7 @@ class ValetudoVacuumCoordinator:
         """Begin observing a manual segment run."""
         if self.manual_run:
             return False
+        self._clear_stranded()
         self.manual_run = ActiveRun(
             room_id=None,
             segment_id=None,
@@ -8931,6 +9039,18 @@ class ValetudoVacuumCoordinator:
         self.pause_reason = stored.get("pause_reason")
         self.away_since = stored.get("away_since")
         self.session = SessionState.from_dict(stored.get("session"))
+        stored_stranded = stored.get("stranded")
+        self.stranded = (
+            dict(stored_stranded)
+            if isinstance(stored_stranded, dict) and stored_stranded
+            else None
+        )
+        if (
+            self.stranded
+            and (normalize_state(self._state(self.vacuum_entity)) or "").lower()
+            in _AT_DOCK_VACUUM_STATES
+        ):
+            self.stranded = None
         self.settings_snapshot = AutoCleanSettingsSnapshot.from_dict(
             stored.get("settings_snapshot")
         )
@@ -9048,6 +9168,7 @@ class ValetudoVacuumCoordinator:
                 "pause_reason": self.pause_reason,
                 "away_since": self.away_since,
                 "session": self.session.to_dict() if self.session else None,
+                "stranded": dict(self.stranded) if self.stranded else None,
                 "active_run": self.active_run.to_dict() if self.active_run else None,
                 "manual_run": self.manual_run.to_dict() if self.manual_run else None,
                 "retained_task_guard": (
