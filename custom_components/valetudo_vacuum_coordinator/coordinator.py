@@ -192,6 +192,16 @@ _MAX_AUTOMATIC_DISPATCH_FAILURES = 3
 _VALIDATED_NAVIGATION_RETURN_ERRORS = {"cannot reach target"}
 _NAVIGATION_RETRY_LATER_POLICY = "navigation_retry_later"
 _DOCK_SERVICE_OVERRUN_SECONDS = 600
+# Restoring robot-facing settings (operation mode in particular) while the
+# dock is emptying, washing, or between the two makes the robot act on the
+# new setting mid-cycle; a mode switch to vacuum-only asks an X40 to drop its
+# mop pads while the wash is running, which overflowed the wash tray.
+_SETTINGS_RESTORE_MIN_QUIET_SECONDS = 60
+_SETTINGS_RESTORE_SAFE_DOCK_STATES = {"idle", "drying"}
+_SETTINGS_RESTORE_LATCHED_PAUSE_SECONDS = _DOCK_SERVICE_OVERRUN_SECONDS
+# An error-sensor change this close to (or after) a dock pause ties the pause
+# to a dock fault rather than a stale latch.
+_SETTINGS_RESTORE_PAUSE_ERROR_WINDOW_SECONDS = 5
 _MAX_STRANDED_RETURN_RETRIES = 2
 _STRANDED_RETURN_MIN_INTERVAL_SECONDS = 60
 _ROUTINE_SILENT_BLOCKER_CODES = {"navigation.recoverable"}
@@ -281,6 +291,9 @@ class ValetudoVacuumCoordinator:
         self._blocked_watchdog_expiring = False
         self._terminal_cleanup_retry_attempts = 0
         self._terminal_settings_restore_deferred = False
+        self._settings_restore_check_cancel: Callable[[], None] | None = None
+        self._settings_restore_check_deadline: datetime | None = None
+        self.settings_restore_wait_reason: str | None = None
         self._event_lock = asyncio.Lock()
         self._event_queue: deque[_StateEventObservation] = deque()
         self._event_drain_scheduled = False
@@ -297,9 +310,12 @@ class ValetudoVacuumCoordinator:
     async def async_setup(self) -> None:
         """Load persisted state and attach listeners."""
         await self._async_load_store()
-        if self.session and self.session.active and not self.active_run:
+        if (
+            self.session and self.session.active and not self.active_run
+        ) or self.settings_snapshot is not None:
             # A dock wash may have been in progress while Home Assistant was
-            # down; give it one settle window before the next departure.
+            # down; give it one settle window before the next departure or a
+            # pending settings restore.
             self._dock_service_activity_at = dt_util.utcnow()
         entities_to_watch = set(self.people_entities)
         for entity_id in self._configured_sensor_entities():
@@ -439,7 +455,12 @@ class ValetudoVacuumCoordinator:
             return False
         if self.session.active or self.active_run:
             return True
-        if self.session.notification_sent and self.settings_snapshot is None:
+        if self.session.notification_sent and (
+            self.settings_snapshot is None or self._robot_parked_for_restore()
+        ):
+            # Once the robot is parked the session is over for automations,
+            # even while a settings restore waits for the dock to go quiet;
+            # that wait must not keep dock-error notifications muted.
             return False
         return bool(self.session.terminal_reason)
 
@@ -1017,6 +1038,8 @@ class ValetudoVacuumCoordinator:
             return
 
         self._cancel_terminal_cleanup_retry()
+        self._cancel_settings_restore_check()
+        self.settings_restore_wait_reason = None
         self._cancel_away_timer()
         self._clear_blocked_session_watchdog()
         self._terminal_cleanup_retry_attempts = 0
@@ -7867,12 +7890,29 @@ class ValetudoVacuumCoordinator:
                 self._cancel_terminal_cleanup_retry()
             return
 
-        restoration_deferred = bool(
-            self.settings_snapshot is not None
-            and not self._settings_restoration_safe()
+        restoration_wait = (
+            self._settings_restoration_wait()
+            if self.settings_snapshot is not None
+            else None
         )
-        if restoration_deferred:
+        restoration_deferred = restoration_wait is not None
+        if restoration_wait is not None:
+            wait_reason, recheck_at = restoration_wait
+            if wait_reason != getattr(self, "settings_restore_wait_reason", None):
+                _LOGGER.debug(
+                    "Deferring settings restore for %s: %s",
+                    self.name,
+                    wait_reason,
+                )
+            self.settings_restore_wait_reason = wait_reason
             self._terminal_settings_restore_deferred = True
+            if recheck_at is not None:
+                self._schedule_settings_restore_check(recheck_at)
+            else:
+                self._cancel_settings_restore_check()
+        else:
+            self.settings_restore_wait_reason = None
+            self._cancel_settings_restore_check()
         restoration_failed = False
         if self.settings_snapshot is not None and not restoration_deferred:
             deferred_allowance = self._terminal_settings_restore_deferred
@@ -7965,16 +8005,16 @@ class ValetudoVacuumCoordinator:
         snapshot = self.settings_snapshot
         restored = all(
             [
-                await self._async_select_option(
+                await self._async_restore_select_option(
                     self.config.get(CONF_MODE_ENTITY), snapshot.mode
                 ),
-                await self._async_select_option(
+                await self._async_restore_select_option(
                     self.config.get(CONF_FAN_ENTITY), snapshot.fan
                 ),
-                await self._async_select_option(
+                await self._async_restore_select_option(
                     self.config.get(CONF_WATER_ENTITY), snapshot.water
                 ),
-                await self._async_select_option(
+                await self._async_restore_select_option(
                     self.config.get(CONF_PASSES_ENTITY), snapshot.passes
                 ),
             ]
@@ -8005,6 +8045,37 @@ class ValetudoVacuumCoordinator:
             _LOGGER.warning("Could not select %s on %s", option, entity_id, exc_info=True)
             return False
         return True
+
+    async def _async_restore_select_option(
+        self,
+        entity_id: str | None,
+        option: str | None,
+    ) -> bool:
+        """Restore one setting, sending no command when it already matches."""
+        if (
+            entity_id
+            and option not in _UNKNOWN_OR_CLEAR_STATES
+            and self._restorable_state(entity_id) == option
+        ):
+            return True
+        return await self._async_select_option(entity_id, option)
+
+    def _robot_settings_restore_pending(self) -> bool:
+        """Return whether restoring the snapshot would command the robot."""
+        snapshot = self.settings_snapshot
+        if snapshot is None:
+            return False
+        for conf_key, option in (
+            (CONF_MODE_ENTITY, snapshot.mode),
+            (CONF_FAN_ENTITY, snapshot.fan),
+            (CONF_WATER_ENTITY, snapshot.water),
+        ):
+            entity_id = self.config.get(conf_key)
+            if not entity_id or option in _UNKNOWN_OR_CLEAR_STATES:
+                continue
+            if self._restorable_state(entity_id) != option:
+                return True
+        return False
 
     def _restorable_state(self, entity_id: str | None) -> str | None:
         """Return a setting value safe to restore later."""
@@ -8064,13 +8135,118 @@ class ValetudoVacuumCoordinator:
                 return reason
         return None
 
-    def _settings_restoration_safe(self) -> bool:
-        """Return whether terminal cleanup may mutate cleaning settings."""
+    def _settings_restoration_wait(self) -> tuple[str, datetime | None] | None:
+        """Return why terminal cleanup must not mutate settings yet.
+
+        ``None`` means the snapshot may be restored now. Otherwise the result
+        is a reason and, when no state change is guaranteed to re-evaluate
+        the wait, the time at which it should be checked again.
+        """
+        if self.active_run or self.manual_run:
+            return ("a run is active", None)
+        if not self._robot_parked_for_restore():
+            vacuum_state = normalize_state(self._state(self.vacuum_entity))
+            return (f"vacuum is {(vacuum_state or 'unknown').lower()}", None)
+        if not self._robot_settings_restore_pending():
+            # Only Home Assistant-side settings differ; nothing reaches the
+            # robot, so the dock cycle cannot be disturbed.
+            return None
+        if quiet_at := self._settings_restore_quiet_deadline():
+            return ("the dock just serviced the robot", quiet_at)
+        dock_entity = self.config.get(CONF_DOCK_STATUS_ENTITY)
+        if not dock_entity:
+            return None
+        dock_status = (normalize_state(self._state(dock_entity)) or "").lower()
+        if dock_status in _SETTINGS_RESTORE_SAFE_DOCK_STATES:
+            return None
+        if (
+            dock_status == "pause"
+            and self._dock_pause_latched()
+            and not self._dock_pause_began_with_error(dock_entity)
+        ):
+            changed = getattr(self._state_object(dock_entity), "last_changed", None)
+            if not isinstance(changed, datetime):
+                return ("dock is paused", None)
+            settled_at = changed + timedelta(
+                seconds=_SETTINGS_RESTORE_LATCHED_PAUSE_SECONDS
+            )
+            if dt_util.utcnow() < settled_at:
+                return ("dock is paused", settled_at)
+            return None
+        if dock_status == "pause":
+            return ("dock is paused", None)
+        return (f"dock is {dock_status or 'unknown'}", None)
+
+    def _dock_pause_began_with_error(self, dock_entity: str) -> bool:
+        """Return whether the error sensor changed as or after the dock paused.
+
+        Valetudo reports a dock fault such as "Mop Dock Tray full of water"
+        and then reads "No error" seconds later while the dock stays paused,
+        which otherwise looks exactly like a stale pause latch.
+        """
+        error_entity = self.config.get(CONF_ERROR_ENTITY)
+        if not error_entity:
+            return False
+        paused_at = getattr(self._state_object(dock_entity), "last_changed", None)
+        error_at = getattr(self._state_object(error_entity), "last_changed", None)
+        if not isinstance(paused_at, datetime) or not isinstance(error_at, datetime):
+            return False
+        return error_at >= paused_at - timedelta(
+            seconds=_SETTINGS_RESTORE_PAUSE_ERROR_WINDOW_SECONDS
+        )
+
+    def _robot_parked_for_restore(self) -> bool:
+        """Return whether no run is retained and the robot is not moving."""
         if self.active_run or self.manual_run:
             return False
         vacuum_state = normalize_state(self._state(self.vacuum_entity))
         vacuum_state = vacuum_state.lower() if vacuum_state else None
         return vacuum_state not in _ACTIVE_RETAINED_VACUUM_STATES
+
+    def _settings_restore_quiet_deadline(self) -> datetime | None:
+        """Return when recent dock servicing is quiet enough to restore settings."""
+        activity_at = getattr(self, "_dock_service_activity_at", None)
+        if activity_at is None:
+            return None
+        settle = max(
+            _SETTINGS_RESTORE_MIN_QUIET_SECONDS,
+            int(self.config.get(CONF_DOCK_SETTLE, DEFAULT_DOCK_SETTLE)),
+        )
+        deadline = activity_at + timedelta(seconds=settle)
+        return deadline if dt_util.utcnow() < deadline else None
+
+    def _schedule_settings_restore_check(self, when: datetime) -> None:
+        """Re-run terminal cleanup once a timed restore wait has elapsed."""
+        if (
+            getattr(self, "_settings_restore_check_cancel", None) is not None
+            and getattr(self, "_settings_restore_check_deadline", None) == when
+        ):
+            return
+        self._cancel_settings_restore_check()
+        delay = max(0.0, (when - dt_util.utcnow()).total_seconds()) + 1
+
+        def timer_finished(_now: datetime) -> None:
+            self._settings_restore_check_cancel = None
+            self._settings_restore_check_deadline = None
+            schedule_hass_task(
+                self.hass,
+                self._async_retry_terminal_cleanup_serialized(),
+            )
+
+        self._settings_restore_check_deadline = when
+        self._settings_restore_check_cancel = async_call_later(
+            self.hass,
+            delay,
+            timer_finished,
+        )
+
+    def _cancel_settings_restore_check(self) -> None:
+        """Cancel a scheduled settings-restore re-check."""
+        cancel = getattr(self, "_settings_restore_check_cancel", None)
+        if cancel is not None:
+            cancel()
+        self._settings_restore_check_cancel = None
+        self._settings_restore_check_deadline = None
 
     def _vacuum_successfully_docked(self) -> bool:
         """Return whether the robot reached the dock and is no longer resumable."""

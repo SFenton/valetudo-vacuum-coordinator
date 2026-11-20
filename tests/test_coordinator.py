@@ -5787,7 +5787,7 @@ def test_blocked_watchdog_runtime_clamps_zero_to_one_second() -> None:
     assert coordinator._blocked_session_timeout_seconds("dock busy") == 1
 
 
-def test_resource_terminal_cleanup_restores_despite_resumable() -> None:
+def test_resource_terminal_cleanup_waits_for_paused_dock_then_restores_despite_resumable() -> None:
     coordinator = _RecoverableFailureCoordinator()
     room = logic.RoomConfig(
         room_id="room_one",
@@ -5816,8 +5816,20 @@ def test_resource_terminal_cleanup_restores_despite_resumable() -> None:
 
     asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
 
+    # The summary goes out, but the mode is not switched under a paused dock
+    # cycle, and the pending restore does not mute household notifications.
     assert coordinator.session.notification_sent is True
+    assert coordinator.settings_snapshot is not None
+    assert _service_names(coordinator).count("select_option") == 0
+    assert coordinator.settings_restore_wait_reason == "dock is paused"
+    assert coordinator.auto_cleaning is False
+
+    # The dock leaves pause; the robot error and resumable flag remain.
+    coordinator.set_state("sensor.robot_dock_status", "idle")
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
     assert coordinator.settings_snapshot is None
+    assert coordinator.settings_restore_wait_reason is None
     assert _service_names(coordinator).count("select_option") == 1
 
     asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
@@ -5850,6 +5862,14 @@ def test_resource_terminal_cleanup_restores_despite_resumable() -> None:
     asyncio.run(deferred._async_maybe_send_auto_clean_summary())
 
     assert deferred.session.notification_sent is True
+    assert deferred.settings_snapshot is not None
+    assert _service_names(deferred).count("select_option") == 0
+
+    # Refilling the tank lets the dock finish; the restore follows.
+    deferred.set_state("sensor.robot_error", "No error")
+    deferred.set_state("sensor.robot_dock_status", "idle")
+    asyncio.run(deferred._async_maybe_send_auto_clean_summary())
+
     assert deferred.settings_snapshot is None
     assert _service_names(deferred).count("select_option") == 1
 
@@ -6542,7 +6562,8 @@ def test_terminal_summary_retries_settings_restore_without_duplicate_notice() ->
 
     assert coordinator.session.notification_sent is True
     assert coordinator.settings_snapshot is not None
-    assert coordinator.auto_cleaning is True
+    # The summary is out; a restore retry must not keep notifications muted.
+    assert coordinator.auto_cleaning is False
     assert _service_names(coordinator).count("household") == 1
     assert coordinator._terminal_cleanup_retry_cancel is not None
 
@@ -9405,6 +9426,8 @@ def test_v020_terminal_migration_resets_notice_and_settings_lifecycle():
     assert coordinator.started_rooms == ["room_one"]
     assert _service_names(coordinator).count("household") == 0
 
+    # The session changed the robot's mode; the restore must put it back.
+    coordinator.set_state("select.robot_mode", "vacuum")
     _finish_active_room_successfully(coordinator)
 
     assert coordinator.session.active is False
@@ -10062,3 +10085,512 @@ def test_uncertain_evidence_without_validated_error_is_not_navigation_recovery(
 
     assert coordinator.session.pending_recovery_policy is None
     assert coordinator.is_stranded is False
+
+
+# --- Dock-safe settings restore (0.3.10) -----------------------------------
+#
+# 2026-11-19: a mopping session was cancelled because someone came home. Two
+# seconds after the robot docked, terminal cleanup switched the mode back to
+# the user's ``vacuum`` setting while the dock was emptying and about to wash
+# the mop; the wash then overflowed the tray. These tests replay that shape.
+
+
+def _dispatch_state_event(
+    coordinator: _RecoverableFailureCoordinator,
+    entity_id: str,
+    state: str,
+):
+    """Deliver a state change the way Home Assistant does.
+
+    Unlike ``_handle_event``, the coordinator's event-ordered snapshot is not
+    pre-advanced, so it observes the previous -> new transition (which is
+    what dock-service activity tracking keys on).
+    """
+    observed = coordinator.hass.states.set(entity_id, state)
+    event_cls = sys.modules["homeassistant.core"].Event
+    asyncio.run(
+        coordinator._async_handle_state_change_event(
+            event_cls(entity_id, observed)
+        )
+    )
+    return observed
+
+
+class _RestoreTimers:
+    """Capture ``async_call_later`` timers so tests can fire them by hand."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.timers: list[dict] = []
+        self.tasks: list = []
+        monkeypatch.setattr(coordinator_module, "async_call_later", self._call_later)
+        monkeypatch.setattr(
+            coordinator_module,
+            "schedule_hass_task",
+            lambda hass, coroutine: self.tasks.append(coroutine),
+        )
+
+    def _call_later(self, hass, delay, callback):
+        entry = {"delay": delay, "callback": callback, "cancelled": False, "fired": False}
+        self.timers.append(entry)
+
+        def cancel() -> None:
+            entry["cancelled"] = True
+
+        return cancel
+
+    def restore_checks(self) -> list[dict]:
+        return [
+            timer
+            for timer in self.timers
+            if not timer["cancelled"]
+            and not timer["fired"]
+            and "_schedule_settings_restore_check" in timer["callback"].__qualname__
+        ]
+
+    def fire_restore_check(self, now: datetime) -> None:
+        (timer,) = self.restore_checks()
+        timer["fired"] = True
+        queued = len(self.tasks)
+        timer["callback"](now)
+        for coroutine in self.tasks[queued:]:
+            asyncio.run(coroutine)
+        del self.tasks[queued:]
+
+
+def _robot_select_calls(coordinator: _RecoverableFailureCoordinator) -> list[dict]:
+    return [
+        call["data"]
+        for call in coordinator.hass.services.calls
+        if call["domain"] == "select" and call["service"] == "select_option"
+    ]
+
+
+def _cancelled_mop_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_RecoverableFailureCoordinator, dict[str, datetime], _RestoreTimers]:
+    """Mop a room, cancel on arrival, and leave the robot returning to dock."""
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.config[const.CONF_NOTIFY_SERVICE] = "notify.household"
+    coordinator.config[const.CONF_DOCK_SETTLE] = 60
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock["now"])
+    timers = _RestoreTimers(monkeypatch)
+    # The user's own mode was vacuum-only; the session switched to mopping.
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(mode="vacuum")
+    coordinator.set_state("select.robot_mode", "vacuum_and_mop")
+    _confirm_active_room_started(coordinator)
+    coordinator.set_state(coordinator.vacuum_entity, "cleaning")
+    coordinator.set_state("sensor.robot_status_flag", "segment")
+
+    _dispatch_state_event(coordinator, "person.owner", "home")
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "returning")
+    _dispatch_state_event(coordinator, "sensor.robot_status_flag", "none")
+
+    assert coordinator.session is not None
+    assert coordinator.session.active is False
+    assert coordinator.session.terminal_reason == "returned_home"
+    assert coordinator.active_run is None
+    return coordinator, clock, timers
+
+
+def _advance(clock: dict[str, datetime], seconds: float) -> None:
+    clock["now"] += timedelta(seconds=seconds)
+
+
+def test_cancelled_mop_session_restores_mode_only_after_post_cancel_wash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _cancelled_mop_session(monkeypatch)
+
+    # Nobody was away long enough for a room to finish, so the coordinator
+    # sends no summary; Home Assistant's "Stopped Early" automation reacts to
+    # auto_cleaning turning off while the robot reads docked.
+    assert coordinator.session.notification_sent is True
+    assert _service_names(coordinator).count("household") == 0
+    assert coordinator.auto_cleaning is True
+    assert _robot_select_calls(coordinator) == []
+
+    # 20:04:07 docked; dock starts emptying in the same second.
+    _advance(clock, 56)
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    assert _robot_select_calls(coordinator) == []
+    # Same moment the old code released auto_cleaning, so automation timing
+    # is unchanged, but the dock is no longer muted for the wash that follows.
+    assert coordinator.auto_cleaning is False
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "emptying")
+    # 20:04:09 is when the old code switched the mode.
+    _advance(clock, 2)
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+    assert _robot_select_calls(coordinator) == []
+
+    # 20:04:33 the brief idle blip between emptying and washing.
+    _advance(clock, 24)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "idle")
+    assert _robot_select_calls(coordinator) == []
+
+    # 20:04:35 the post-mop wash starts; nothing may touch the robot during it.
+    _advance(clock, 2)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "cleaning")
+    for _ in range(4):
+        _advance(clock, 40)
+        _dispatch_state_event(coordinator, "sensor.robot_battery", "75")
+        assert _robot_select_calls(coordinator) == []
+    assert coordinator.settings_restore_wait_reason == "dock is cleaning"
+
+    # The wash finishes and drying starts; wait out the settle window.
+    _advance(clock, 11)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "drying")
+    assert _robot_select_calls(coordinator) == []
+    assert coordinator.settings_snapshot is not None
+    (check,) = timers.restore_checks()
+    assert 60 <= check["delay"] <= 62
+
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+
+    assert _robot_select_calls(coordinator) == [
+        {"entity_id": "select.robot_mode", "option": "vacuum"}
+    ]
+    assert coordinator.settings_snapshot is None
+    assert coordinator.settings_restore_wait_reason is None
+    assert timers.restore_checks() == []
+    assert coordinator.auto_cleaning is False
+
+
+def test_settings_restore_waits_out_a_wash_longer_than_the_settle_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _cancelled_mop_session(monkeypatch)
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "cleaning")
+
+    # The settle timer from the wash start expires while the dock still washes.
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+    assert _robot_select_calls(coordinator) == []
+    assert coordinator.settings_restore_wait_reason == "dock is cleaning"
+    # Only the dock leaving ``cleaning`` can make it safe; no blind re-poll.
+    assert timers.restore_checks() == []
+
+    _advance(clock, 120)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "drying")
+    assert _robot_select_calls(coordinator) == []
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+    assert len(_robot_select_calls(coordinator)) == 1
+
+
+def test_vacuum_only_session_end_restores_after_settle_with_no_further_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _cancelled_mop_session(monkeypatch)
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "emptying")
+    _advance(clock, 15)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "idle")
+    assert _robot_select_calls(coordinator) == []
+
+    # No wash follows; the timer alone must finish the restore.
+    _advance(clock, 30)
+    assert _robot_select_calls(coordinator) == []
+    _advance(clock, 31)
+    timers.fire_restore_check(clock["now"])
+    assert len(_robot_select_calls(coordinator)) == 1
+    assert coordinator.settings_snapshot is None
+
+
+def test_settings_restore_by_event_cancels_the_pending_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _cancelled_mop_session(monkeypatch)
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    assert len(timers.restore_checks()) == 1
+
+    _advance(clock, 61)
+    _dispatch_state_event(coordinator, "sensor.robot_battery", "80")
+
+    assert len(_robot_select_calls(coordinator)) == 1
+    assert timers.restore_checks() == []
+
+
+def test_settings_restore_settle_window_has_a_floor_when_dock_settle_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _cancelled_mop_session(monkeypatch)
+    coordinator.config[const.CONF_DOCK_SETTLE] = 0
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "emptying")
+    _advance(clock, 14)
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "idle")
+    _advance(clock, 2)
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert _robot_select_calls(coordinator) == []
+    (check,) = timers.restore_checks()
+    assert check["delay"] >= 58
+
+
+def _terminal_restore_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_RecoverableFailureCoordinator, dict[str, datetime], _RestoreTimers]:
+    """A finished session whose robot-facing mode still needs restoring."""
+    coordinator = _RecoverableFailureCoordinator()
+    coordinator.active_run = None
+    coordinator.config[const.CONF_MODE_ENTITY] = "select.robot_mode"
+    coordinator.config[const.CONF_DOCK_SETTLE] = 60
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock["now"])
+    timers = _RestoreTimers(monkeypatch)
+    coordinator.session = logic.SessionState(
+        session_id="session",
+        started_at=logic.utcnow_iso(),
+        active=False,
+        terminal_reason="complete",
+    )
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(mode="vacuum")
+    coordinator.set_state("select.robot_mode", "vacuum_and_mop")
+    coordinator.set_state(coordinator.vacuum_entity, "docked")
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    coordinator.set_state("sensor.robot_error", "No error")
+    return coordinator, clock, timers
+
+
+@pytest.mark.parametrize(
+    ("dock_status", "status_flag", "expected_reason"),
+    [
+        ("cleaning", "none", "dock is cleaning"),
+        ("emptying", "none", "dock is emptying"),
+        ("unknown", "none", "dock is unknown"),
+        ("unavailable", "none", "dock is unavailable"),
+        ("error", "none", "dock is error"),
+        # A pause with a retained task is a suspended dock cycle, not a latch.
+        ("pause", "resumable", "dock is paused"),
+    ],
+)
+def test_settings_restore_waits_while_dock_is_not_settled(
+    monkeypatch: pytest.MonkeyPatch,
+    dock_status: str,
+    status_flag: str,
+    expected_reason: str,
+) -> None:
+    coordinator, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    coordinator.set_state("sensor.robot_dock_status", dock_status)
+    coordinator.set_state("sensor.robot_status_flag", status_flag)
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert coordinator.session.notification_sent is True
+    assert coordinator.auto_cleaning is False
+    assert coordinator.settings_snapshot is not None
+    assert coordinator.settings_restore_wait_reason == expected_reason
+    assert _robot_select_calls(coordinator) == []
+    # These are left only by a state change, which re-runs terminal cleanup.
+    assert timers.restore_checks() == []
+    # The retry budget is for failed commands, not for waiting on the dock.
+    assert coordinator._terminal_cleanup_retry_attempts == 0
+
+    coordinator.set_state("sensor.robot_status_flag", "none")
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "idle")
+    if dock_status in {"cleaning", "emptying"}:
+        # Leaving a dock service starts the settle window.
+        assert _robot_select_calls(coordinator) == []
+        _advance(clock, 61)
+        timers.fire_restore_check(clock["now"])
+
+    assert _robot_select_calls(coordinator) == [
+        {"entity_id": "select.robot_mode", "option": "vacuum"}
+    ]
+    assert coordinator.settings_snapshot is None
+
+
+def test_settings_restore_proceeds_while_dock_dries_a_settled_mop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _clock, timers = _terminal_restore_coordinator(monkeypatch)
+    coordinator.set_state("sensor.robot_dock_status", "drying")
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert len(_robot_select_calls(coordinator)) == 1
+    assert coordinator.settings_snapshot is None
+    assert timers.restore_checks() == []
+
+
+def test_settings_restore_waits_for_a_latched_dock_pause_to_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    steady = coordinator.set_state("sensor.robot_error", "No error")
+    steady.last_changed = clock["now"] - timedelta(hours=1)
+    paused = coordinator.set_state("sensor.robot_dock_status", "pause")
+    paused.last_changed = clock["now"] - timedelta(seconds=30)
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert _robot_select_calls(coordinator) == []
+    assert coordinator.settings_restore_wait_reason == "dock is paused"
+    (check,) = timers.restore_checks()
+    assert 570 <= check["delay"] <= 572
+
+    _advance(clock, 571)
+    timers.fire_restore_check(clock["now"])
+    assert len(_robot_select_calls(coordinator)) == 1
+    assert coordinator.settings_snapshot is None
+
+
+def test_settings_restore_accepts_a_long_latched_dock_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, _timers = _terminal_restore_coordinator(monkeypatch)
+    steady = coordinator.set_state("sensor.robot_error", "No error")
+    steady.last_changed = clock["now"] - timedelta(hours=1)
+    paused = coordinator.set_state("sensor.robot_dock_status", "pause")
+    paused.last_changed = clock["now"] - timedelta(seconds=700)
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    assert len(_robot_select_calls(coordinator)) == 1
+
+
+def test_settings_restore_treats_a_fault_pause_as_unsettled_after_error_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-11-19 20:06:51: the dock paused with "Mop Dock Tray full of water";
+    # four seconds later the error sensor read "No error" while the dock stayed
+    # paused. That must not pass for a stale pause latch.
+    coordinator, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    steady = coordinator.set_state("sensor.robot_error", "No error")
+    steady.last_changed = clock["now"] - timedelta(hours=1)
+    paused = coordinator.set_state("sensor.robot_dock_status", "pause")
+    paused.last_changed = clock["now"]
+    fault = coordinator.set_state("sensor.robot_error", "Mop Dock Tray full of water")
+    fault.last_changed = clock["now"]
+    _advance(clock, 4)
+    cleared = coordinator.set_state("sensor.robot_error", "No error")
+    cleared.last_changed = clock["now"]
+
+    for _ in range(3):
+        _advance(clock, 600)
+        asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+        assert _robot_select_calls(coordinator) == []
+        assert coordinator.settings_restore_wait_reason == "dock is paused"
+        assert timers.restore_checks() == []
+    # Robot is parked, so automations see the session as over meanwhile.
+    assert coordinator.auto_cleaning is False
+
+    # Someone clears the tray and the dock returns to idle.
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "idle")
+    assert _robot_select_calls(coordinator) == [
+        {"entity_id": "select.robot_mode", "option": "vacuum"}
+    ]
+
+
+def test_settings_restore_with_no_robot_change_does_not_wait_for_dock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _clock, _timers = _terminal_restore_coordinator(monkeypatch)
+    coordinator.config[const.CONF_PASSES_ENTITY] = "input_select.robot_passes"
+    coordinator.config[const.CONF_FAN_ENTITY] = "select.robot_fan"
+    coordinator.settings_snapshot = logic.AutoCleanSettingsSnapshot(
+        mode="vacuum_and_mop",
+        fan="max",
+        passes="3",
+    )
+    coordinator.set_state("select.robot_fan", "max")
+    coordinator.set_state("input_select.robot_passes", "2")
+    coordinator.set_state("sensor.robot_dock_status", "cleaning")
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+
+    # Robot selects already match the snapshot: nothing is sent to the robot,
+    # mid-wash or otherwise, and the Home Assistant-side helper is restored.
+    assert _robot_select_calls(coordinator) == []
+    assert [
+        call["data"]
+        for call in coordinator.hass.services.calls
+        if call["domain"] == "input_select"
+    ] == [{"entity_id": "input_select.robot_passes", "option": "3"}]
+    assert coordinator.settings_snapshot is None
+
+
+def test_settings_restore_without_dock_sensor_still_honours_arrival_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    coordinator.config.pop(const.CONF_DOCK_STATUS_ENTITY)
+    coordinator.set_state(coordinator.vacuum_entity, "returning")
+
+    _dispatch_state_event(coordinator, coordinator.vacuum_entity, "docked")
+    assert _robot_select_calls(coordinator) == []
+
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+    assert len(_robot_select_calls(coordinator)) == 1
+
+
+def test_settings_restore_wait_is_exposed_on_the_session_sensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    coordinator.set_state("sensor.robot_dock_status", "cleaning")
+    sensor = sensor_module.ValetudoSessionStateSensor(coordinator)
+
+    asyncio.run(coordinator._async_maybe_send_auto_clean_summary())
+    attributes = sensor.extra_state_attributes
+    assert attributes["settings_restore_pending"] is True
+    assert attributes["settings_restore_wait"] == "dock is cleaning"
+
+    _dispatch_state_event(coordinator, "sensor.robot_dock_status", "drying")
+    attributes = sensor.extra_state_attributes
+    assert attributes["settings_restore_wait"] == "the dock just serviced the robot"
+
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+    attributes = sensor.extra_state_attributes
+    assert attributes["settings_restore_pending"] is False
+    assert attributes["settings_restore_wait"] is None
+
+
+def test_restart_with_pending_restore_waits_one_settle_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Home Assistant restarted mid-wash; the dock may already read idle again
+    # (or briefly, between emptying and washing) when the integration loads.
+    before_restart, _before_clock, _before_timers = _terminal_restore_coordinator(
+        monkeypatch
+    )
+    before_restart.session.notification_sent = True
+    before_restart._store = _MemoryStore()
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator._async_save_store(
+            before_restart
+        )
+    )
+
+    restarted, clock, timers = _terminal_restore_coordinator(monkeypatch)
+    restarted.session = None
+    restarted.settings_snapshot = None
+    restarted._store = _MemoryStore(before_restart._store.data)
+    restarted.set_state("sensor.robot_dock_status", "idle")
+    restarted._unsubscribers = []
+    restarted._resource_candidates = {}
+    restarted._schedule_next_day_timer_if_needed = lambda: None
+    restarted._schedule_away_timer_if_needed = lambda: None
+
+    asyncio.run(
+        coordinator_module.ValetudoVacuumCoordinator.async_setup(restarted)
+    )
+
+    assert restarted.settings_snapshot is not None
+    assert _robot_select_calls(restarted) == []
+    assert restarted.settings_restore_wait_reason == (
+        "the dock just serviced the robot"
+    )
+
+    _advance(clock, 61)
+    timers.fire_restore_check(clock["now"])
+    assert _robot_select_calls(restarted) == [
+        {"entity_id": "select.robot_mode", "option": "vacuum"}
+    ]
+    assert restarted.settings_snapshot is None
