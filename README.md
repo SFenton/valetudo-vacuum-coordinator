@@ -200,7 +200,7 @@ field or status-observer service.
 - Pause switch: toggle this on when guests are staying over or when you do not want automatic away cleaning.
 - Per-room auto-clean disabled switches: toggle a room on here to exclude it from future away auto-clean sessions without changing manual selected-room cleaning.
 - Pause binary sensor: read-only status for dashboards and automation conditions.
-- Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending.
+- Auto-cleaning binary sensor: read-only status that stays on during away auto-clean sessions and while a final summary is pending. It turns off once the summary is sent and the robot is parked, even if restoring the user's cleaning settings is still waiting for the dock.
 - Native-resume-pending binary sensor: read-only guard that stays on while a retained Valetudo task is interrupted or suspended. Use it to block manual/startup command loops.
 - Stranded binary sensor: on from the moment the coordinator stops the robot off the dock after a navigation failure (for example `Cannot reach target`) until the robot is observed docked or a new cleaning run starts. It survives the session ending and Home Assistant restarts, and exposes `room_id`, `room_name`, `since`, `error` and `return_attempts`. The session sensor repeats these as `stranded` and `stranded_details`.
 - Session sensors: state, current room, actionable queue, fallback-vacuumed rooms, deferred full-clean rooms, typed blocker disposition, recovery phase/deadline, preserved rooms, command acknowledgements, and uncertain floor outcomes.
@@ -248,6 +248,33 @@ use `resource_settle` and retain their existing degraded vacuum-only behavior.
 Valetudo robot errors, including clean-water faults, remain authoritative.
 Correlated whole-robot outages continue to use the bounded telemetry-outage
 recovery policy below.
+
+Version 0.3.10 stops terminal cleanup from changing robot settings while the
+dock is servicing the robot. Previously the user's saved mode, fan, and water
+settings were restored the moment the robot read `docked`. In six of eight
+recent session ends that command reached the robot while the dock was still
+emptying or washing; after one cancelled mopping session it switched an X40 to
+vacuum-only two seconds after docking, the robot kept its pads attached in
+vacuum mode, and that wash later faulted with a full tray. A controlled repeat
+of the same timing washed normally, so the mid-service command is not proven
+to cause overflows, but changing robot settings while the dock is working is
+avoided regardless. Robot-facing
+settings are now restored only once the robot is parked, at least
+`max(dock_settle, 60)` seconds have passed since it arrived or the dock last
+emptied or washed (which covers the brief `idle` between emptying and
+washing), and the dock reads `idle` or `drying`. A stale `pause` latch counts
+only after ten minutes, and only if the error sensor has not changed since the
+pause began: Valetudo reports a dock fault and then reads `No error` seconds
+later while the dock stays paused. `cleaning`, `emptying`, a fault `pause`, and
+unknown or unavailable dock states wait for the next dock change. A timer
+re-checks when a settle window or pause age runs out. Settings that already
+match the snapshot are not re-sent, so a restore that changes only Home
+Assistant helpers such as passes never waits and never commands the robot.
+`settings_restore_pending` and `settings_restore_wait` on the session-state
+sensor show a pending restore and why it is waiting. The auto-cleaning binary
+sensor still turns off when the robot parks, so automations keyed on it keep
+their timing, and dock-error notifications are no longer muted while a restore
+waits.
 
 Version 0.3.9 fixes a stranded robot that went unnoticed. When a room was
 only partly observed (for example 1 of 2 passes) and then hit `Cannot reach

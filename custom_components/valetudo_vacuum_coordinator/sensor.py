@@ -250,6 +250,12 @@ class ValetudoSessionStateSensor(ValetudoCoordinatorEntity, SensorEntity):
             ATTR_TERMINAL_CAUSE: session.terminal_cause if session else None,
             ATTR_NEEDS_HELP: session.needs_help if session else False,
             ATTR_NOTIFICATION_SENT: session.notification_sent if session else False,
+            "settings_restore_pending": (
+                self.coordinator.settings_snapshot is not None
+            ),
+            "settings_restore_wait": getattr(
+                self.coordinator, "settings_restore_wait_reason", None
+            ),
             "preflight_complete": (
                 session.preflight_complete if session else False
             ),
